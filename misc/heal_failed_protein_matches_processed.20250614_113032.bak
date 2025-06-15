@@ -1,0 +1,76 @@
+original_id	matched_id	similarity_score	notes	n_rows_dropped	hhfilter_rows	diversity_filtered_rows	status
+5T2A-N	5t2a_N	NA	Stage 1	0	0	0	Failed: download
+6ELZ-W	3jct_W	NA	Stage 2	0	525	269	Success
+4V3P-LI	4v3p_LI	NA	Stage 1	0	379	123	Success
+5IT7-RR	5it7_RR	NA	Stage 1	0	418	162	Success
+5XYI-G	5xyi_G	NA	Stage 1	0	577	321	Success
+5XY3-O	5xy3_O	NA	Stage 1	0	288	32	Success
+6OKK-B	3j7a_B	NA	Stage 2	0	448	192	Success
+5ZWO-W	5nrl_L	NA	Stage 2	0	355	99	Success
+5XXU-B	5xxu_B	NA	Stage 1	0	289	33	Success
+6HA8-S	3j3v_S	NA	Stage 2	0	295	39	Success
+3J92-F	3j92_F	NA	Stage 1	0	0	0	Failed: download
+4V8M-BS	4v8m_BS	NA	Stage 1	0	0	0	Failed: download
+5XY3-J	5xy3_J	NA	Stage 1	0	281	25	Success
+3JB9-J	3jb9_J	NA	Stage 1	0	276	20	Success
+6AZ1-F	6az1_F	NA	Stage 1	0	614	358	Success
+5T5H-I	5t5h_I	NA	Stage 1	0	293	37	Success
+6AZ1-C	6az1_C	NA	Stage 1	0	277	21	Success
+4V6W-CF	4v6w_CF	NA	Stage 1	0	520	264	Success
+6DZI-T	6dzi_T	NA	Stage 1	0	323	67	Success
+6HA8-D	3j3v_D	NA	Stage 2	0	510	254	Success
+6AZ1-B	6az1_B	NA	Stage 1	0	298	42	Success
+5XTI-V	5xtc_V	NA	Stage 2	0	352	96	Success
+4V7E-CU	4v7e_CU	NA	Stage 1	0	0	0	Failed: download
+4V6X-Cu	4v6x_Cu	NA	Stage 1	0	342	86	Success
+5XXB-O	5xxb_O	NA	Stage 1	0	329	73	Success
+5XY3-F	5xy3_F	NA	Stage 1	0	287	31	Success
+6AZ1-A	6az1_A	NA	Stage 1	0	290	34	Success
+4V6W-AF	4v6w_AF	NA	Stage 1	0	0	0	Failed: download
+5XXU-C	5xxu_C	NA	Stage 1	0	277	21	Success
+5GUP-B	5gpn_c	NA	Stage 2	0	873	617	Success
+6D9J-BB	6d9j_BB	NA	Stage 1	0	388	132	Success
+5MMM-I	5mmi_I	NA	Stage 2	0	669	413	Success
+4V7E-BA	4v3p_SA	NA	Stage 2	0	627	371	Success
+5NGM-AO	5nd8_o	NA	Stage 2	0	284	28	Success
+4V6W-CD	4v6w_CD	NA	Stage 1	0	702	446	Success
+5MMM-j	5mmj_j	NA	Stage 2	0	651	395	Success
+5IT7-CC	5it7_CC	NA	Stage 1	0	261	5	Success
+5IT7-EE	5it7_EE	NA	Stage 1	0	307	51	Success
+5OPT-U	5opt_U	NA	Stage 1	0	300	44	Success
+4V7E-BG	4v7e_BG	NA	Stage 1	0	0	0	Failed: download
+5OPT-P	5opt_P	NA	Stage 1	0	3381	3125	Success
+5IT7-QQ	5it7_QQ	NA	Stage 1	0	456	200	Success
+4V7E-BE	4v7e_BE	NA	Stage 1	0	518	262	Success
+5XXU-F	5xxu_F	NA	Stage 1	0	502	246	Success
+4V3P-LA	4v3p_LA	NA	Stage 1	0	0	0	Failed: download
+5V93-o	5v93_o	NA	Stage 1	0	270	14	Success
+5O31-M	5ldw_M	NA	Stage 2	0	936	680	Success
+4V3P-LB	4v3p_LB	NA	Stage 1	0	0	0	Failed: download
+5OQL-U	5oql_U	NA	Stage 1	0	326	70	Success
+5OQL-X	5oql_X	NA	Stage 1	0	330	74	Success
+6GAZ-AN	6gaw_An	NA	Stage 2	0	523	267	Success
+5U0S-f	3h0g_F	NA	Stage 2	0	528	272	Success
+4V6W-CH	4v6w_CH	NA	Stage 1	0	374	118	Success
+6GCS-J	6gcs_J	NA	Stage 1	0	287	31	Success
+6GB2-BW	4v19_W	NA	Stage 2	0	663	407	Success
+3JB9-G	3jb9_G	NA	Stage 1	0	0	0	Failed: download
+5V93-P	5v7q_P	NA	Stage 2	0	338	82	Success
+4V6W-CP	4v6w_CP	NA	Stage 1	0	349	93	Success
+6GAW-AK	5aj3_K	NA	Stage 2	0	717	461	Success
+3J9M-I	3j7y_I	NA	Stage 2	0	682	426	Success
+5V93-E	5v7q_E	NA	Stage 2	0	416	160	Success
+5AJ4-AP	5aj4_AP	NA	Stage 1	0	0	0	Failed: download
+6HIV-BB	6hiv_BB	NA	Stage 1	0	0	0	Failed: download
+4V3P-LF	4v3p_LF	NA	Stage 1	0	379	123	Success
+4V6W-AE	4v6w_AE	NA	Stage 1	0	513	257	Success
+5XXB-F	5xxb_F	NA	Stage 1	0	348	92	Success
+5V93-Q	5v7q_Q	NA	Stage 2	0	313	57	Success
+5XXB-D	5xxb_D	NA	Stage 1	0	738	482	Success
+6GAZ-AP	5aj3_p	NA	Stage 2	0	851	595	Success
+5AJ4-AK	5aj4_AK	NA	Stage 1	0	0	0	Failed: download
+4V3P-LE	4v3p_LE	NA	Stage 1	0	0	0	Failed: download
+5IT7-DD	5it7_DD	NA	Stage 1	0	588	332	Success
+3JB9-R	3jb9_R	NA	Stage 1	0	832	576	Success
+6G2J-L	6g2j_L	NA	Stage 1	0	1262	1006	Success
+6MSK-B	5gjq_I	NA	Stage 2	0	1880	1624	Success

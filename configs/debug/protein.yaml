@@ -1,0 +1,58 @@
+# @package _global_
+
+# Debug config for protein model development
+# Usage: python train.py debug=protein
+
+defaults:
+  - default
+
+# Override trainer for debugging
+trainer:
+  max_epochs: 3
+  limit_train_batches: 5  # Only 5 batches per epoch
+  limit_val_batches: 3    # Only 3 validation batches
+  limit_test_batches: 3   # Only 3 test batches
+  fast_dev_run: False     # Don't use fast_dev_run, we want actual debugging
+  detect_anomaly: True    # Enable anomaly detection
+  deterministic: True     # Ensure reproducibility
+  precision: "32-true"    # Use full precision for debugging
+  gradient_clip_val: 1.0
+  log_every_n_steps: 1    # Log every step
+  check_val_every_n_epoch: 1  # Validate every epoch
+  enable_progress_bar: True
+  enable_model_summary: True
+
+# Override model for debugging
+model:
+  debugging: True  # Enable debugging mode (disables torch.compile)
+  
+# Override data for debugging
+data:
+  batch_size: 1
+  num_workers: 0  # Single-threaded for easier debugging
+  pin_memory: False
+
+# Override callbacks for debugging
+callbacks:
+  model_checkpoint:
+    save_top_k: 1
+    every_n_epochs: 1
+  early_stopping:
+    patience: 5  # Stop early in debug mode
+    min_delta: 0.0
+
+# Enable verbose logging
+logger:
+  wandb:
+    offline: True  # Don't sync to wandb during debugging
+    tags: ["debug", "protein"]
+  aim:
+    experiment: "protein_debug"
+
+# Debugging-specific settings
+extras:
+  ignore_warnings: False  # Show all warnings during debugging
+  enforce_tags: False     # Don't enforce tags during debugging
+
+# Seed for reproducibility
+seed: 12345 

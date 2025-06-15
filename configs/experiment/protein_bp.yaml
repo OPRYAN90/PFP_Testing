@@ -1,0 +1,45 @@
+# @package _global_
+
+# to execute this experiment run:
+# python train.py experiment=protein_bp
+
+defaults:
+  - override /data: protein_bp
+  - override /model: protein
+  - override /callbacks: protein
+  - override /trainer: protein
+
+# all parameters below will be merged with parameters from default configurations set above
+# this allows you to overwrite only specified parameters
+
+tags: ["protein", "bp", "multimodal", "biological_process"]
+
+seed: 12345
+
+trainer:
+  min_epochs: 50
+  max_epochs: 200
+  gradient_clip_val: 1.0
+  check_val_every_n_epoch: 5
+  accumulate_grad_batches: 4  # Effective batch size = 4 for BP (larger label space)
+
+model:
+  optimizer:
+    lr: 0.0001  # Conservative LR for BP (1943 classes)
+    weight_decay: 1e-2
+  scheduler:
+    T_max: 200  # Match max_epochs
+  d_model: 640
+  label_smoothing: 0.05  # Slight smoothing for large label space
+
+data:
+  task_type: "bp"
+  batch_size: 1  # Keep small for now
+
+logger:
+  wandb:
+    tags: ${tags}
+    group: "protein_function"
+    name: "protein_bp_${now:%Y-%m-%d_%H-%M-%S}"
+  aim:
+    experiment: "protein_bp" 

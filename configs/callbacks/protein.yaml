@@ -1,0 +1,41 @@
+defaults:
+  - model_checkpoint
+  - early_stopping
+  - model_summary
+  - rich_progress_bar
+  - _self_
+
+model_checkpoint:
+  dirpath: ${paths.output_dir}/checkpoints
+  filename: "epoch_{epoch:03d}_auroc_{val/auroc:.4f}"
+  monitor: "val/auroc"  # Monitor AUROC for protein function prediction
+  mode: "max"
+  save_last: True
+  save_top_k: 3  # Save top 3 models
+  auto_insert_metric_name: False
+  every_n_epochs: 5  # Save less frequently for long protein training
+
+early_stopping:
+  monitor: "val/auroc"  # Monitor AUROC for protein function prediction
+  patience: 30  # More patience for protein training (slower convergence)
+  mode: "max"
+  min_delta: 0.001  # Minimum improvement threshold
+  check_finite: True
+  stopping_threshold: 0.95  # Stop if AUROC reaches 95%
+  divergence_threshold: null
+  check_on_train_epoch_end: False
+
+model_summary:
+  max_depth: 2  # Limit depth for complex protein models
+
+rich_progress_bar:
+  leave: True
+  theme:
+    description: "white"
+    progress_bar: "#6206E0"
+    progress_bar_finished: "#6206E0"
+    progress_bar_pulse: "#6206E0"
+    batch_progress: "white"
+    time: "grey54"
+    processing_speed: "grey70"
+    metrics: "white" 

@@ -1,0 +1,45 @@
+_target_: src.models.protein_module.ProteinLitModule
+
+# Model architecture parameters
+d_model: 1152          # Base model dimension (ESM-C actual embedding size)
+d_msa: 768             # MSA embedding dimension (MSA-Transformer output)
+n_seq_layers: 2        # Additional transformer layers on top of ESM-C
+n_cross_layers: 2      # Cross-modal attention layers between ESM and MSA
+n_heads: 8             # Attention heads for all transformer layers
+dropout: 0.1           # General dropout rate for model components
+
+# Training parameters  
+debugging: true        # Enable debugging mode (disables torch.compile for easier debugging)
+
+# MSA Encoder specific dropout parameters (now configurable!)
+p_row: 0.15            # Row dropout probability (drops individual MSA sequences)  
+p_chan: 0.15           # Channel dropout probability (AlphaFold-style embedding dropout)
+p_feat: 0.10           # Feature dropout after MSA projection
+
+# Optimizer configuration
+optimizer:
+  _target_: torch.optim.AdamW
+  _partial_: true
+  lr: 1e-4             # Learning rate (adjust per task: MF=1e-4, BP=8e-5, CC=1.2e-4)
+  weight_decay: 1e-2   # L2 regularization 
+  betas: [0.9, 0.999]  # AdamW momentum parameters
+  eps: 1e-8            # Numerical stability epsilon
+
+# Learning rate scheduler configuration  
+scheduler:
+  _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+  _partial_: true
+  T_max: 100           # Max epochs (override in experiments to match trainer.max_epochs)
+  eta_min: 1e-6        # Minimum learning rate at the end of annealing
+  last_epoch: -1       # Start from beginning (-1 means start fresh)
+
+# Alternative scheduler option (uncomment to use instead of CosineAnnealingLR):
+# scheduler:
+#   _target_: torch.optim.lr_scheduler.ReduceLROnPlateau  
+#   _partial_: true
+#   mode: "min"          # Reduce when validation loss stops decreasing
+#   factor: 0.5          # Multiply LR by this factor when reducing
+#   patience: 10         # Wait this many epochs without improvement
+#   threshold: 1e-4      # Minimum change to qualify as improvement
+#   min_lr: 1e-7         # Minimum learning rate
+#   verbose: true        # Print when LR is reduced 

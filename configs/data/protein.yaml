@@ -1,0 +1,26 @@
+_target_: src.data.protein_datamodule.ProteinDataModule
+# train_data_dir: ${paths.data_dir}/protein_data_pdb
+# val_data_dir: ${paths.data_dir}/protein_data_pdb_val
+data_dir: ${paths.data_dir}/protein_data_pdb
+
+# Task configuration - choose one: "mf", "bp", "cc"
+task_type: "mf"        # Molecular Function (489 classes)
+# task_type: "bp"      # Biological Process (1943 classes) 
+# task_type: "cc"      # Cellular Component (320 classes)
+
+# Batch size (recommended per task based on label space size)
+# MF (489 classes): 4-6 batch size works well
+# BP (1943 classes): 2-3 batch size (large label space needs more memory)  
+# CC (320 classes): 6-8 batch size (smaller label space, can use larger batches)
+batch_size: 4          # Default for MF task - adjust for other tasks
+
+# Data loading parameters
+num_workers: 4         # Number of subprocesses for data loading (adjust for your machine)
+pin_memory: true       # Pin memory for faster GPU transfer
+train_split: 0.8       # 80% train, 20% validation split
+
+# Task-specific batch size recommendations (uncomment when switching tasks):
+# For BP task: batch_size: 2
+# For CC task: batch_size: 6
+
+# max_sequence_length: 1024 
