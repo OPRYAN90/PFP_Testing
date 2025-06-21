@@ -7,26 +7,26 @@ defaults:
 
 model_checkpoint:
   dirpath: ${paths.output_dir}/checkpoints
-  filename: "epoch_{epoch:03d}_auroc_{val/auroc:.4f}"
-  monitor: "val/auroc"  # Monitor AUROC for protein function prediction
+  filename: "epoch_{epoch:03d}_fmax_{val/Fmax:.4f}"
+  monitor: "val/Fmax"  # Monitor Fmax for protein function prediction
   mode: "max"
-  save_last: True
-  save_top_k: 3  # Save top 3 models
+  save_last: False
+  save_top_k: 1  # Save top 1 model for early testing 
   auto_insert_metric_name: False
-  every_n_epochs: 5  # Save less frequently for long protein training
+  every_n_epochs: ${trainer.check_val_every_n_epoch}
 
 early_stopping:
-  monitor: "val/auroc"  # Monitor AUROC for protein function prediction
-  patience: 30  # More patience for protein training (slower convergence)
+  monitor: "val/Fmax"  #NOTE: Monitor Fmax for protein function prediction (higher is better)
+  patience: 3  # More patience for protein training (slower convergence)
   mode: "max"
   min_delta: 0.001  # Minimum improvement threshold
   check_finite: True
-  stopping_threshold: 0.95  # Stop if AUROC reaches 95%
+  stopping_threshold: null  # No specific stopping threshold for Fmax
   divergence_threshold: null
   check_on_train_epoch_end: False
 
 model_summary:
-  max_depth: 2  # Limit depth for complex protein models
+  max_depth: 1  # Limit depth for complex protein models
 
 rich_progress_bar:
   leave: True

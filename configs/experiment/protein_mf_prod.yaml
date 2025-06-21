@@ -52,10 +52,10 @@ callbacks:
   model_checkpoint:
     save_top_k: 3          # Save top 3 checkpoints
     save_last: true        # Always save last checkpoint
-    monitor: "val/auroc"
+    monitor: "val/Fmax"
     mode: "max"
   early_stopping:
-    monitor: "val/auroc"
+    monitor: "val/Smin"
     patience: 50           # More patience for production
-    mode: "max"
+    mode: "min"
     min_delta: 0.001 
