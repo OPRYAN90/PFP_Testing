@@ -126,7 +126,7 @@ class ProteinDataset(Dataset):
         
         assert 1 <= len(seqs) <= 256, f"Expected 1-256 sequences, got {len(seqs)} from {path}"
         return seqs
-
+    #TODO: ASSERT ESM-C PROPER FP16 # and test fp model-wise
     @torch.inference_mode()
     def _compute_msa_embeddings(self, a3m_file: Path) -> torch.Tensor:
         model, batch_converter = self._get_msa_model(compile_model=self.compile_msa_model)
