@@ -2,6 +2,15 @@ from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
+
+# -----------------------------------------------------------------------------
+# Optional FlashAttention toggle – does nothing on unsupported systems
+# -----------------------------------------------------------------------------
+
+from utils.flash_control import maybe_enable_flash_attention  # type: ignore
+maybe_enable_flash_attention(True)
+
+
 from lightning import LightningModule
 from torchmetrics import MeanMetric
 import numpy as np
@@ -26,7 +35,7 @@ class RowDropout(nn.Module):
     alignment has fewer than `min_keep` sequences.
     The query row (index 0) is always kept.
     """
-    def __init__(self, p: float = 0.15, min_keep: int = 32):
+    def __init__(self, p: float = 0.15, min_keep: int = 48):
         super().__init__()
         self.base_p   = p
         self.min_keep = min_keep
@@ -44,22 +53,6 @@ class RowDropout(nn.Module):
         mask = torch.rand(B, N_seq, 1, 1, device=x.device) > p_eff
         mask[:, 0, :, :] = 1.0                     # keep query
         return x * mask                      # no rescaling
-
-
-class RowwiseChannelDropout(nn.Module):
-    """
-    AlphaFold-style: drop embedding channels; mask shared across all rows.
-    """
-    def __init__(self, p=0.15):
-        super().__init__()
-        self.p = p
-    
-    def forward(self, x):
-        if not self.training or self.p == 0:
-            return x
-        # mask shape: [B, 1, 1, d_msa] (shared across N_seq & L)
-        mask = torch.rand(x.size(0), 1, 1, x.size(3), device=x.device) > self.p
-        return x * mask / (1.0 - self.p)  # WITH rescaling for gradient stability
 
 
 class ResidualFeedForward(nn.Module):
@@ -123,6 +116,9 @@ class SequenceEncoder(nn.Module):
     ) -> None:
         super().__init__()
         
+        # ➊ optional embedding-level dropout
+        self.embed_drop = nn.Dropout(dropout*.75) #NOTE: CONSIDER DROPOUT 
+
         # Additional transformer layers on top of ESM-C
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
@@ -144,12 +140,12 @@ class SequenceEncoder(nn.Module):
         Returns:
             Enhanced sequence representations [B, L, d_model]
         """
-        # Apply additional transformer layers with padding mask
+        x = self.embed_drop(x)                 # ➋ new dropout point
         x = self.tr(x, src_key_padding_mask=src_key_padding_mask)
         
         return x  # [B, L, d_model]
 
-
+#TODO: TEST BOTH with and without negative examples in dataset
 class MSAEncoder(nn.Module):
     """Encoder for Multiple Sequence Alignment (MSA) embeddings.
 
@@ -173,7 +169,7 @@ class MSAEncoder(nn.Module):
         d_msa: int = 768,
         d_model: int = 1152,
         p_row: float = 0.15,    # dropout prob for individual MSA rows
-        p_chan: float = 0.15,   # channel dropout prob 
+        p_chan: float = 0.10,   # channel dropout prob 
         p_feat: float = 0.10,   # feature dropout after projection
     ):
         super().__init__()
@@ -183,10 +179,10 @@ class MSAEncoder(nn.Module):
         nn.init.normal_(self.eos_token, std=0.02)
         
         # 1) Row-level dropout (zeros individual sequences)
-        self.row_dropout = RowDropout(p_row, min_keep=32)
+        self.row_dropout = RowDropout(p_row, min_keep=48)
         
-        # 2) Channel dropout (zeros embedding channels, mask shared across rows)
-        self.channel_dropout = RowwiseChannelDropout(p_chan)
+        # 2) Standard element-wise dropout on the embedding vector
+        self.channel_dropout = nn.Dropout(p_chan)
         
         # 3) Conservation scoring head
         self.conservation_head = nn.Linear(d_msa, 1, bias=False)
@@ -197,13 +193,13 @@ class MSAEncoder(nn.Module):
         self.expansion_mlp = nn.Sequential(
             nn.Linear(d_msa, d_hidden, bias=True),
             nn.GELU(),
-            nn.Dropout(p_feat * 0.5),
+            nn.Dropout(p_feat * 0.75),
             nn.Linear(d_hidden, 1280, bias=False),   # fixed width
         )
         self.post_ffn   = ResidualFeedForward(1280, expansion=4, dropout=p_feat)
         self.final_proj = nn.Linear(1280, d_model, bias=False)  
         self.feat_dropout = nn.Dropout(p_feat)
-        self.final_dropout = nn.Dropout(p_feat * 0.5)
+        self.final_dropout = nn.Dropout(p_feat * 0.75)
         self.norm = nn.LayerNorm(d_msa)
     def forward(
         self,
@@ -214,17 +210,16 @@ class MSAEncoder(nn.Module):
         # ------------------------------------------------------------
         # Insert EOS (learnable) at position L+1  — truly in-place
         # ------------------------------------------------------------
-        eos_idx = lengths + 1                      # [B]
+        B, N_seq, L_pad, D = msa.shape
+        # 0) prepare a (B × N_seq × 1 × D) tensor full of your EOS token
+        eos_tok = self.eos_token.view(1, 1, 1, D).expand(B, N_seq, 1, D)    # (B, N_seq, 1, D)
 
-        B, N_seq, _, D = msa.shape
-        # Build broadcastable index tensors
-        batch_idx = torch.arange(B,  device=msa.device)[:, None, None]
-        seq_idx   = torch.arange(N_seq, device=msa.device)[None, :, None]
-        # eos_idx already has shape [B]; add singleton dims
-        pos_idx   = eos_idx[:, None, None]
-        if torch.compiler.is_compiling():  # cheaper than .clone()
-            torch._dynamo.graph_break()   # forces eager mode for next operation
-        msa[batch_idx, seq_idx, pos_idx, :] = self.eos_token
+        # 1) build the same shape index tensor for the "length+1" position
+        idx = (lengths + 1).view(B, 1, 1, 1).expand(B, N_seq, 1, D)                # (B, N_seq, 1, D)
+
+        # 2) scatter the EOS token into the msa along dim-2
+        msa.scatter_(2, idx, eos_tok) 
+
 
         # ------------------------------------------------------------
         # 1. Row dropout  ─── 2. Channel dropout  ─── 3-5. Rest
@@ -238,8 +233,14 @@ class MSAEncoder(nn.Module):
         # pad_mask: [B, L] → expand to [B, N_seq, L]
         mask = pad_mask.unsqueeze(1).expand(-1, msa.size(1), -1)      
         scores   = scores.masked_fill(mask, -1e4)                  # never get prob-mass
-        drop_mask = (msa.abs().sum(-1) == 0)                           # [B,N_seq,L]
-        mask_logits = drop_mask & (~mask)                          # only real residues
+        
+        # Detect rows that are entirely padding (vertical padding from collate_fn)
+        # If first position (CLS token) of a row has all zeros, entire row is padding
+        row_padding_mask = (msa[:, :, 0, :].abs().sum(-1) == 0)    # [B, N_seq] - True if row is padding
+        row_padding_mask = row_padding_mask.unsqueeze(-1).expand(-1, -1, msa.size(2))  # [B, N_seq, L_pad]
+        
+        # Combine position-wise dropout mask with row padding mask
+        mask_logits = row_padding_mask & (~mask)                          # only real residues
         scores = scores.masked_fill(mask_logits, -1e4)
 
         weights = torch.softmax(scores, dim=1)                # over N_seq
@@ -405,10 +406,11 @@ class ProteinLitModule(LightningModule):
         
         # Compilation logic: Compile when NOT debugging
         if stage == "fit" and not self.hparams.debugging:
-            print("🚀  Production mode: compiling heavy encoders")
-            self.seq_encoder = torch.compile(self.seq_encoder)
-            self.msa_encoder = torch.compile(self.msa_encoder)
-            self.cross_attn = torch.compile(self.cross_attn)
+            assert any(p.is_cuda for p in self.parameters()), "Model still on CPU – compile later or move first!"
+            print(f"Compiling entire model on device: {next(self.parameters()).device}")
+            self.forward = torch.compile(self.forward,
+                                         mode='default',
+                                         dynamic=True)
         elif stage == "fit":
             print("🐛 Debugging mode: Compilation disabled for easier debugging")
 
@@ -439,7 +441,7 @@ class ProteinLitModule(LightningModule):
         valid_counts = (~pad_mask).sum(dim=1, keepdim=True).float()  # [B, 1]
 
         # zero out pad positions and do masked average
-        seq_z_masked = seq_z.masked_fill(pad_mask.unsqueeze(-1), 0.0)
+        seq_z_masked = seq_z.masked_fill(pad_mask.unsqueeze(-1), 0.0)  
         seq_pool = seq_z_masked.sum(dim=1) / valid_counts  # [B, d]
         msa_z_masked = msa_z.masked_fill(pad_mask.unsqueeze(-1), 0.0)
         msa_pool = msa_z_masked.sum(dim=1) / valid_counts  # [B, d]
@@ -476,8 +478,6 @@ class ProteinLitModule(LightningModule):
         self._val_logits.append(logits.detach().cpu())   # keep raw, no sigmoid
         self._val_labels.append(labels.detach().cpu())
         
-        return loss
-
     def test_step(self, batch: Dict[str, Any], batch_idx: int):
         logits, labels = self.forward(batch)
         loss = self.loss_fn(logits, labels)
@@ -489,7 +489,7 @@ class ProteinLitModule(LightningModule):
         self._test_logits.append(logits.detach().cpu())   # keep raw, no sigmoid
         self._test_labels.append(labels.detach().cpu())
 
-    def _heal_metrics(self, logits, labels):
+    def _heal_metrics(self, logits, labels): 
         probs = torch.sigmoid(logits).numpy()
         labels = labels.numpy().astype(int)
         goterms = list(self.trainer.datamodule._go_dicts[self.hparams.task_type].keys())
@@ -497,9 +497,9 @@ class ProteinLitModule(LightningModule):
         # Parent-child propagation
         if self.hparams.task_type == "ec": #NOTE: If ec is enabled update this
             print("EC task type detected; ENSURE UPDATE")
-            probs = propagate_ec_preds(probs.copy(), goterms)
+            probs = propagate_ec_preds(probs, goterms)
         else:
-            probs = propagate_go_preds(probs.copy(), goterms)
+            probs = propagate_go_preds(probs, goterms)
 
         macro, micro = function_centric_aupr(labels, probs)
         fmax, _      = cafa_fmax(labels, probs, goterms, self.hparams.task_type)

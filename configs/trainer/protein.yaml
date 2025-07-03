@@ -3,50 +3,28 @@ _target_: lightning.pytorch.trainer.Trainer
 default_root_dir: ${paths.output_dir}
 
 # Protein training typically needs more epochs
-min_epochs: 50
-max_epochs: 200
+min_epochs: 5
+max_epochs: 10
 
 # Use GPU if available, fallback to CPU
 accelerator: auto
 devices: auto
 
 # Mixed precision for protein models (memory intensive)
-precision: "16-mixed"
+precision: "16-mixed" #TODO: CONSIDER BF16
 
 # Validation frequency (protein training is slow)
-check_val_every_n_epoch: 5
+check_val_every_n_epoch: 1
 
 # Deterministic training for reproducibility
-deterministic: True
+deterministic: False
 
 # Gradient clipping for stability
 gradient_clip_val: 1.0
 gradient_clip_algorithm: "norm"
 
-# Enable gradient checkpointing for memory efficiency
-# Note: This is model-specific, not trainer-specific
-# enable_checkpointing: True
-
 # Accumulate gradients to simulate larger batch sizes
-accumulate_grad_batches: 2
-
-# Early stopping and checkpointing handled by callbacks
-enable_progress_bar: True
-enable_model_summary: True
-
-# Protein models can be memory intensive
-max_time: "00:12:00:00"  # 12 hours max training time
-
+# accumulate_grad_batches: 2
 # Log every N steps for monitoring
-log_every_n_steps: 50
 
-# Detect anomalies during development
-detect_anomaly: False  # Set to True during debugging
 
-# Fast dev run for quick testing (override in experiments)
-fast_dev_run: False
-
-# Limit batches for debugging (override in experiments)
-# limit_train_batches: 1.0
-# limit_val_batches: 1.0
-# limit_test_batches: 1.0 

@@ -155,3 +155,5 @@ configs/local/default.yaml
 
 # Trained models directory
 trained_models/
+
+notebooks/msa_final_covnul

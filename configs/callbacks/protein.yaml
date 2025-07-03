@@ -19,11 +19,6 @@ early_stopping:
   monitor: "val/Fmax"  #NOTE: Monitor Fmax for protein function prediction (higher is better)
   patience: 3  # More patience for protein training (slower convergence)
   mode: "max"
-  min_delta: 0.001  # Minimum improvement threshold
-  check_finite: True
-  stopping_threshold: null  # No specific stopping threshold for Fmax
-  divergence_threshold: null
-  check_on_train_epoch_end: False
 
 model_summary:
   max_depth: 1  # Limit depth for complex protein models

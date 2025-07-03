@@ -8,7 +8,7 @@ defaults:
   - model: protein
   - callbacks: protein
   - logger: wandb 
-  - trainer: default
+  - trainer: protein
   - paths: default
   - extras: default
   - hydra: default

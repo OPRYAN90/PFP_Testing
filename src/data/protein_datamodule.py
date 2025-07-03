@@ -27,17 +27,19 @@ class ProteinDataset(Dataset):
     # class-level cache so every worker only builds it once
     _go_dicts = {}
     
-    def __init__(self, data_dir: str, protein_ids: List[str], task_type: str = "mf", split: str = "train"):
+    def __init__(self, data_dir: str, protein_ids: List[str], task_type: str = "mf", split: str = "train", compile_msa_model: bool = True):
         """
         :param data_dir: Path to protein data directory (base PDBCH directory)
         :param protein_ids: List of protein IDs to include
         :param task_type: Which GO task(s) to load labels for ("mf", "bp", "cc")
         :param split: Which data split ("train", "val", "test")
+        :param compile_msa_model: Whether to compile ESM-MSA model for speed (default: True)
         """
         self.data_dir = Path(data_dir)
         self.protein_ids = protein_ids
         self.task_type = task_type
         self.split = split
+        self.compile_msa_model = compile_msa_model
         
         # Determine the specific split directory
         self.split_dir = self.data_dir / f"{split}_pdbch"
@@ -47,9 +49,11 @@ class ProteinDataset(Dataset):
     
     # --------------------------------------------------------------
     @classmethod
-    def _get_msa_model(cls):
+    def _get_msa_model(cls, compile_model: bool = True):
         """
-        Load the ESM-MSA model once per process.
+        Load the ESM-MSA model once per process with optional torch.compile optimization.
+        
+        :param compile_model: Whether to compile the model for speed optimization
         """
         
         if cls._msa_model:
@@ -57,17 +61,46 @@ class ProteinDataset(Dataset):
 
         try:
             import esm
-            cls._msa_model, alphabet = esm.pretrained.esm_msa1b_t12_100M_UR50S()
+            model, alphabet = esm.pretrained.esm_msa1b_t12_100M_UR50S()
             cls._msa_batch_conv = alphabet.get_batch_converter()
-            cls._msa_model.eval().to(cls._device)
+            
+            # Move to device and set precision before compilation
+            model.eval().to(cls._device)
             if cls._use_fp16:
-                cls._msa_model.half()
+                model.half()
+            
+            # Conditionally compile the model for significant speed improvements
+            if compile_model:
+                try:
+                    if get_worker_info() is None:  # main process only
+                        print(f"🚀 Compiling ESM-MSA model with torch.compile...")
+                    
+                    cls._msa_model = torch.compile(
+                        model, 
+                        mode='default',  
+                       dynamic=True            
+                    )
+                    
+                    if get_worker_info() is None:
+                        print(f"✅ ESM-MSA model compiled successfully")
+                        
+                except Exception as compile_error:
+                    # Fallback to uncompiled model if compilation fails
+                    if get_worker_info() is None:
+                        print(f"⚠️  Compilation failed ({compile_error}), using uncompiled model")
+                    cls._msa_model = model
+            else:
+                cls._msa_model = model
+                if get_worker_info() is None:
+                    print(f"📋 ESM-MSA model loaded without compilation (as requested)")
+                
             if get_worker_info() is None:        # main process only
                 print(
                     f"[ESM-MSA] loaded on {cls._device} "
-                    f"({'FP16' if cls._use_fp16 else 'FP32'})"
-                    f"{'ENSURE Mixed-precision is enabled' if cls._use_fp16 else 'ESSENTIAL: Single-precision is enabled'}"
+                    f"({'FP16' if cls._use_fp16 else 'FP32'}) "
+                    f"{'[COMPILED]' if hasattr(cls._msa_model, '_dynamo_compile_id') else '[EAGER]'}"
                 )
+                
         except Exception as e:
             raise RuntimeError(f"ESM-MSA load failed: {e}")
 
@@ -96,7 +129,7 @@ class ProteinDataset(Dataset):
 
     @torch.inference_mode()
     def _compute_msa_embeddings(self, a3m_file: Path) -> torch.Tensor:
-        model, batch_converter = self._get_msa_model()
+        model, batch_converter = self._get_msa_model(compile_model=self.compile_msa_model)
         seqs = self._parse_a3m(a3m_file)
         msa = [(f"seq{i}", s) for i, s in enumerate(seqs)]
 
@@ -105,15 +138,17 @@ class ProteinDataset(Dataset):
         if self._use_fp16:           # convert input only if model is FP16
             tok = tok.half()
 
-        with torch.autocast(
+        # Optimized autocast context for compiled models
+        with torch.autocast( #TODO: CONSIDER BF16
             device_type=self._device.type,
             dtype=torch.float16 if self._use_fp16 else torch.float32,
             enabled=self._use_fp16,
         ):
+            # For compiled models, this will be significantly faster
             rep = model(tok, repr_layers=[12])["representations"][12]
 
-        return rep.squeeze(0).cpu()  # (N_seq, L+1, d) TODO: CONSIDER .float() if mixed-precision is not working 
-
+        return rep.squeeze(0).cpu()  # (N_seq, L+1, d) - keep .cpu() to avoid memory issues
+        #NOTE: COMPUTATION NOT BATCH_PARALLELIZED
     def _parse_go_labels(self, go_file_path: Path) -> torch.Tensor:
         """
         Convert the GO IDs inside <ontology>_go.txt into a multi-label tensor.
@@ -200,8 +235,9 @@ class ProteinDataModule(LightningDataModule):
         data_dir: str = "data/PDBCH",  # Updated to point to PDBCH base directory
         task_type: str = "mf",  # "mf", "bp", or "cc"
         batch_size: int = 4,    # Updated to 4 as requested
-        num_workers: int = 4,
+        num_workers: int = 0,
         pin_memory: bool = True,
+        compile_msa_model: bool = True,  # Whether to compile ESM-MSA model
     ) -> None:
         """Initialize ProteinDataModule.
 
@@ -210,6 +246,7 @@ class ProteinDataModule(LightningDataModule):
         :param batch_size: Batch size for training
         :param num_workers: Number of data loading workers
         :param pin_memory: Whether to pin memory for GPU transfer
+        :param compile_msa_model: Whether to compile ESM-MSA model for speed
         """
         super().__init__()
         self.save_hyperparameters(logger=False)
@@ -264,7 +301,6 @@ class ProteinDataModule(LightningDataModule):
                 continue
                 
             protein_id = protein_dir.name
-            #TODO: CHECK PROTEIN MISMATCH IN HEAL DATASET
             # Check that all required files exist
             required_files = [
                 "L.csv",
@@ -350,7 +386,8 @@ class ProteinDataModule(LightningDataModule):
                 data_dir=self.hparams.data_dir,
                 protein_ids=self.train_protein_ids,
                 task_type=self.hparams.task_type,
-                split="train"
+                split="train",
+                compile_msa_model=self.hparams.compile_msa_model
             )
             
             # ---------------------------------------------------------
@@ -377,14 +414,16 @@ class ProteinDataModule(LightningDataModule):
                 data_dir=self.hparams.data_dir,
                 protein_ids=self.val_protein_ids,
                 task_type=self.hparams.task_type,
-                split="val"
+                split="val",
+                compile_msa_model=self.hparams.compile_msa_model
             )
             
             self.data_test = ProteinDataset(
                 data_dir=self.hparams.data_dir,
                 protein_ids=self.test_protein_ids,
                 task_type=self.hparams.task_type,
-                split="test"
+                split="test",
+                compile_msa_model=self.hparams.compile_msa_model
             )
 
     def train_dataloader(self) -> DataLoader[Any]:
