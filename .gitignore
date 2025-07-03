@@ -157,3 +157,4 @@ configs/local/default.yaml
 trained_models/
 
 notebooks/msa_final_covnul
+notebooks/uc30_filtered_seq2id.json
