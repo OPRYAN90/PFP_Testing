@@ -32,7 +32,6 @@ def maybe_enable_flash_attention(force: bool = False) -> None:
         return
 
     print("Running with Flash Attention")
-    # Enable all relevant SDPA back-ends.  We keep math as a final safety net.
     torch.backends.cuda.enable_flash_sdp(True)          # Fastest (Ampere+)
     torch.backends.cuda.enable_mem_efficient_sdp(False)  # Triton kernels
     torch.backends.cuda.enable_math_sdp(False)           # Always available 

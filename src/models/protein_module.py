@@ -117,7 +117,7 @@ class SequenceEncoder(nn.Module):
         super().__init__()
         
         # ➊ optional embedding-level dropout
-        self.embed_drop = nn.Dropout(dropout*.75) #NOTE: CONSIDER DROPOUT 
+        self.embed_drop = nn.Dropout(dropout) 
 
         # Additional transformer layers on top of ESM-C
         encoder_layer = nn.TransformerEncoderLayer(
@@ -438,7 +438,7 @@ class ProteinLitModule(LightningModule):
 
         # Do masked pooling instead of naive .mean()
         # compute length of each sequence (non-padding)
-        valid_counts = (~pad_mask).sum(dim=1, keepdim=True).float()  # [B, 1]
+        valid_counts = (~pad_mask).sum(dim=1, keepdim=True) # [B, 1]
 
         # zero out pad positions and do masked average
         seq_z_masked = seq_z.masked_fill(pad_mask.unsqueeze(-1), 0.0)  
@@ -450,7 +450,7 @@ class ProteinLitModule(LightningModule):
         fused = self.fusion_proj(fused)                   # [B, d]
         logits = self.head(fused)                         # [B, C]
         
-        return logits, batch["labels"].float()
+        return logits, batch["labels"]
 
     # ------------------------------------------------------------------
     #  Lightning hooks - compatible with Lightning-Hydra template
@@ -475,8 +475,9 @@ class ProteinLitModule(LightningModule):
         self.val_loss(loss)
 
         # Store for epoch-wise CAFA metrics computation
-        self._val_logits.append(logits.detach().cpu())   # keep raw, no sigmoid
-        self._val_labels.append(labels.detach().cpu())
+        # Convert to fp32 before CPU transfer to avoid bf16 → numpy issues
+        self._val_logits.append(logits.float().detach().cpu())   # keep raw, no sigmoid
+        self._val_labels.append(labels.float().detach().cpu())
         
     def test_step(self, batch: Dict[str, Any], batch_idx: int):
         logits, labels = self.forward(batch)
@@ -486,8 +487,9 @@ class ProteinLitModule(LightningModule):
         self.test_loss(loss)
  
         # Store for epoch-wise CAFA metrics computation
-        self._test_logits.append(logits.detach().cpu())   # keep raw, no sigmoid
-        self._test_labels.append(labels.detach().cpu())
+        # Convert to fp32 before CPU transfer to avoid bf16 → numpy issues
+        self._test_logits.append(logits.float().detach().cpu())   # keep raw, no sigmoid
+        self._test_labels.append(labels.float().detach().cpu())
 
     def _heal_metrics(self, logits, labels): 
         probs = torch.sigmoid(logits).numpy()

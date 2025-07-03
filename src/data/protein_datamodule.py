@@ -20,8 +20,8 @@ class ProteinDataset(Dataset):
 
     # static device decision: *this* process only
     _device            = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    _use_fp16          = ( #NOTE: CHANGE GPU PRECISION
-        _device.type == "cuda" and torch.cuda.get_device_capability(_device)[0] >= 7
+    _use_bf16          = ( #NOTE: CHANGE GPU PRECISION
+        _device.type == "cuda" and torch.cuda.get_device_capability(_device)[0] >= 8
     )
     
     # class-level cache so every worker only builds it once
@@ -64,10 +64,8 @@ class ProteinDataset(Dataset):
             model, alphabet = esm.pretrained.esm_msa1b_t12_100M_UR50S()
             cls._msa_batch_conv = alphabet.get_batch_converter()
             
-            # Move to device and set precision before compilation
+            # Move to device and keep master weights in FP32
             model.eval().to(cls._device)
-            if cls._use_fp16:
-                model.half()
             
             # Conditionally compile the model for significant speed improvements
             if compile_model:
@@ -97,7 +95,7 @@ class ProteinDataset(Dataset):
             if get_worker_info() is None:        # main process only
                 print(
                     f"[ESM-MSA] loaded on {cls._device} "
-                    f"({'FP16' if cls._use_fp16 else 'FP32'}) "
+                    f"({'BF16' if cls._use_bf16 else 'FP32'}) "
                     f"{'[COMPILED]' if hasattr(cls._msa_model, '_dynamo_compile_id') else '[EAGER]'}"
                 )
                 
@@ -126,7 +124,7 @@ class ProteinDataset(Dataset):
         
         assert 1 <= len(seqs) <= 256, f"Expected 1-256 sequences, got {len(seqs)} from {path}"
         return seqs
-    #TODO: ASSERT ESM-C PROPER FP16 # and test fp model-wise
+    #TODO: ASSERT ESM-C PROPER BF16 # and test bf model-wise
     @torch.inference_mode()
     def _compute_msa_embeddings(self, a3m_file: Path) -> torch.Tensor:
         model, batch_converter = self._get_msa_model(compile_model=self.compile_msa_model)
@@ -135,19 +133,16 @@ class ProteinDataset(Dataset):
 
         _, _, tok = batch_converter([msa])
         tok = tok.to(self._device)
-        if self._use_fp16:           # convert input only if model is FP16
-            tok = tok.half()
-
         # Optimized autocast context for compiled models
-        with torch.autocast( #TODO: CONSIDER BF16
+        with torch.autocast(
             device_type=self._device.type,
-            dtype=torch.float16 if self._use_fp16 else torch.float32,
-            enabled=self._use_fp16,
+            dtype=torch.bfloat16,
+            enabled=self._use_bf16,
         ):
             # For compiled models, this will be significantly faster
             rep = model(tok, repr_layers=[12])["representations"][12]
-
-        return rep.squeeze(0).cpu()  # (N_seq, L+1, d) - keep .cpu() to avoid memory issues
+        
+        return rep.to(torch.float32).squeeze(0).cpu()  # (N_seq, L+1, d) - keep .cpu() to avoid memory issues
         #NOTE: COMPUTATION NOT BATCH_PARALLELIZED
     def _parse_go_labels(self, go_file_path: Path) -> torch.Tensor:
         """
@@ -516,8 +511,8 @@ class ProteinDataModule(LightningDataModule):
             dtype=torch.bool
         )
         
-        # FIX 2: Build lengths on CPU, let Lightning move it once
-        lengths = torch.tensor(lengths)  # ← FIX: No device specified = CPU
+        # Build lengths tensor 
+        lengths = torch.tensor(lengths)   
         
         return {
             "protein_id": protein_ids,

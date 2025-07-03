@@ -146,7 +146,10 @@ dmypy.json
 
 # Lightning-Hydra-Template
 configs/local/default.yaml
-/data/
+/data/*
+!/data/go-basic.obo
+!/data/ic_count.pkl
+# !/data/PDBCH.tar.gz
 /logs/
 .env
 
@@ -155,6 +158,6 @@ configs/local/default.yaml
 
 # Trained models directory
 trained_models/
-
+    
 notebooks/msa_final_covnul
 notebooks/uc30_filtered_seq2id.json

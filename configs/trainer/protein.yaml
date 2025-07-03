@@ -11,7 +11,7 @@ accelerator: auto
 devices: auto
 
 # Mixed precision for protein models (memory intensive)
-precision: "16-mixed" #TODO: CONSIDER BF16
+precision: "bf16-mixed"
 
 # Validation frequency (protein training is slow)
 check_val_every_n_epoch: 1
