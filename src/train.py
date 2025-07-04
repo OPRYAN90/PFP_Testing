@@ -1,5 +1,9 @@
 from typing import Any, Dict, List, Optional, Tuple
 
+import multiprocessing as mp
+# Use 'spawn' start-method globally so CUDA can be initialised safely in worker
+mp.set_start_method("spawn", force=True)
+
 import hydra
 import lightning as L
 import rootutils

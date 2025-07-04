@@ -2,3 +2,6 @@
 
 rich_progress_bar:
   _target_: lightning.pytorch.callbacks.RichProgressBar
+  theme:
+    metrics_text_delimiter: " • "  # Delimiter to separate metrics in the progress bar
+    metrics_format: ".3e"

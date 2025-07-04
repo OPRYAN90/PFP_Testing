@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from torch.utils.data import get_worker_info
 import pickle as pkl
 from .go_utils import load_go_dict
-
+from torch._dynamo import OptimizedModule      
 
 class ProteinDataset(Dataset):
     """Custom Dataset for multi-modal protein function prediction."""
@@ -93,10 +93,11 @@ class ProteinDataset(Dataset):
                     print(f"📋 ESM-MSA model loaded without compilation (as requested)")
                 
             if get_worker_info() is None:        # main process only
+                is_compiled = isinstance(cls._msa_model, OptimizedModule)
                 print(
                     f"[ESM-MSA] loaded on {cls._device} "
                     f"({'BF16' if cls._use_bf16 else 'FP32'}) "
-                    f"{'[COMPILED]' if hasattr(cls._msa_model, '_dynamo_compile_id') else '[EAGER]'}"
+                    f"{'[COMPILED]' if is_compiled else '[EAGER]'}"
                 )
                 
         except Exception as e:
@@ -152,7 +153,8 @@ class ProteinDataset(Dataset):
         """
         # 1. fetch / cache mapping ------------------------------------------------
         if self.task_type not in self._go_dicts:
-            tsv_path = self.data_dir / "nrPDB-GO_2019.06.18_annot.tsv"
+            # TSV file is in the parent directory of data_dir (same as in get_num_classes)
+            tsv_path = self.data_dir.parent / "nrPDB-GO_2019.06.18_annot.tsv"
             self._go_dicts[self.task_type] = load_go_dict(tsv_path, self.task_type)
         go2idx = self._go_dicts[self.task_type]
         num_classes = len(go2idx)
@@ -182,7 +184,7 @@ class ProteinDataset(Dataset):
             sequence = f.read().strip()
             
         # Load pre-computed ESM-C embeddings (required file)
-        esmc_file = protein_dir / f"{protein_id}_esmc_emb.pt"
+        esmc_file = protein_dir / "esmc_emb.pt"
         esmc_data = torch.load(esmc_file)
         # Extract embeddings from data structures
         # ESM-C: Direct tensor (1, L+2, 1152) -> squeeze to (L+2, 1152)
@@ -199,9 +201,9 @@ class ProteinDataset(Dataset):
             # Parse GO labels from text file format
         labels = self._parse_go_labels(label_file)
             
-        # Load protein length info
-        length_df = pd.read_csv(protein_dir / "L.csv")
-        protein_length = int(length_df.iloc[0, 0])
+        # Load protein length info (L.csv just contains a single number on the first line)
+        with open(protein_dir / "L.csv", "r") as f:
+            protein_length = int(f.readline().strip())
         
         assert protein_length == esmc_emb.size(0)-2 == msa_emb.size(1)-1, "Sequence/MSA/Length mismatch"
         
@@ -266,7 +268,9 @@ class ProteinDataModule(LightningDataModule):
         expected_counts = {"mf": 489, "bp": 1943, "cc": 320}
         assert task_type_ in expected_counts, f"Unknown task_type: {task_type_}"
         
-        tsv = Path(self.hparams.data_dir) / "nrPDB-GO_2019.06.18_annot.tsv"
+        # Look for TSV file in parent directory of data_dir
+        data_base_dir = Path(self.hparams.data_dir).parent
+        tsv = data_base_dir / "nrPDB-GO_2019.06.18_annot.tsv"
         go_dict = load_go_dict(tsv, task_type_)
         actual_count = len(go_dict)
         
@@ -285,6 +289,14 @@ class ProteinDataModule(LightningDataModule):
         """Get the information content vector for Smin computation."""
         return self._ic_vector
 
+    # ------------------------------------------------------------------
+    #  GO-term mapping access (needed by ProteinLitModule._heal_metrics)
+    # ------------------------------------------------------------------
+    @property
+    def _go_dicts(self) -> Dict[str, Dict[str, int]]:
+        """Return the cached GO-term ➜ class-index mappings."""        
+        return ProteinDataset._go_dicts
+
     def _find_valid_proteins_in_split(self, split_dir: Path) -> List[str]:
         """Scan a split directory to find proteins with non-empty GO label files."""
         valid_proteins = []
@@ -301,7 +313,7 @@ class ProteinDataModule(LightningDataModule):
                 "L.csv",
                 "sequence.txt", 
                 "final_filtered_256_stripped.a3m",
-                f"{protein_id}_esmc_emb.pt",
+                "esmc_emb.pt",
                 f"{self.hparams.task_type}_go.txt"
             ]
             
@@ -389,7 +401,9 @@ class ProteinDataModule(LightningDataModule):
             # HEAL information–content vector – loaded from ic_count.pkl
             # ---------------------------------------------------------
             if not hasattr(self, "_ic_vector"):
-                ic_file = Path("data/ic_count.pkl")
+                # Use the parent directory of data_dir to find ic_count.pkl
+                data_base_dir = Path(self.hparams.data_dir).parent
+                ic_file = data_base_dir / "ic_count.pkl"
                 if ic_file.exists():
                     with ic_file.open("rb") as f:
                         ic_count = pkl.load(f)               # dict with keys 'bp','mf','cc'
@@ -401,7 +415,7 @@ class ProteinDataModule(LightningDataModule):
                     self._ic_vector = (-torch.log2(counts / 69_709)).float()
                     print(f"✅  IC vector loaded from {ic_file}")
                 else:
-                    raise FileNotFoundError("ic_count.pkl not found")
+                    raise FileNotFoundError(f"ic_count.pkl not found at {ic_file}")
             # Verify length agreement
             assert len(self._ic_vector) == self.get_num_classes(self.hparams.task_type)
             
@@ -429,7 +443,7 @@ class ProteinDataModule(LightningDataModule):
             num_workers=self.hparams.num_workers,
             pin_memory=self.hparams.pin_memory,
             shuffle=True,
-            collate_fn=self._collate_fn,
+            collate_fn=protein_collate,
         )
 
     def val_dataloader(self) -> DataLoader[Any]:
@@ -440,7 +454,7 @@ class ProteinDataModule(LightningDataModule):
             num_workers=self.hparams.num_workers,
             pin_memory=self.hparams.pin_memory,
             shuffle=False,
-            collate_fn=self._collate_fn,
+            collate_fn=protein_collate,
         )
 
     def test_dataloader(self) -> DataLoader[Any]:
@@ -451,78 +465,8 @@ class ProteinDataModule(LightningDataModule):
             num_workers=self.hparams.num_workers,
             pin_memory=self.hparams.pin_memory,
             shuffle=False,
-            collate_fn=self._collate_fn,
+            collate_fn=protein_collate,
         )
-
-    def _collate_fn(self, batch):
-        """Custom collate function to handle variable-length sequences and matrices."""
-        
-        protein_ids = [item["protein_id"] for item in batch]
-        sequences = [item["sequence"] for item in batch]
-        lengths = [item["length"] for item in batch]        # residue counts
-
-
-        # +2  (CLS + EOS)  — every sequence tensor on disk already has them
-        # +2  (CLS + EOS)  — every MSA row on disk has CLS; EOS is added later
-        max_len_seq = max(lengths) + 2        # unchanged (CLS+res+EOS)
-        assert max_len_seq <= 1024, "Sequence length must be less than or equal to 1024"
-        
-        # Pad sequence embeddings  [max_len_seq, d_model]
-        seq_embs = []
-        for item in batch:
-            seq_emb = item["sequence_emb"]  # [L, d_model]
-            if seq_emb.size(0) < max_len_seq:
-                pad_size = max_len_seq - seq_emb.size(0)
-                seq_emb = F.pad(seq_emb, (0, 0, 0, pad_size), value=0)
-            seq_embs.append(seq_emb)
-        
-        # ── NEW: row-axis padding ────────────────────────────────────
-        max_n_seq = max(item["msa_emb"].size(0) for item in batch)
-
-        msa_embs = []
-        for item in batch:
-            msa = item["msa_emb"]           # [N_seq, L, d_msa]
-
-            # pad L axis (existing code)
-            if msa.size(1) < max_len_seq:
-                pad_L = max_len_seq - msa.size(1)
-                msa = F.pad(msa, (0, 0, 0, pad_L, 0, 0), value=0)
-
-            # pad N_seq axis (row axis) **at the bottom**
-            if msa.size(0) < max_n_seq:
-                pad_rows = max_n_seq - msa.size(0)
-                msa = F.pad(msa, (0, 0, 0, 0, 0, pad_rows), value=0)
-
-            msa_embs.append(msa)
-        
-        # Stack embeddings
-        sequence_emb = torch.stack(seq_embs)    # [B, L_seq_max, d_model]
-        msa_emb      = torch.stack(msa_embs)    # [B, N_seq, L_msa_max, d_msa]
-
-
-        assert sequence_emb.size(1) == msa_emb.size(2), "Sequence and MSA lengths must be the same"
-
-        # Stack labels
-        labels = torch.stack([item["labels"] for item in batch], dim=0)
-        
-        # Masking boolean tensor [B, max_len_seq]
-        pad_mask = torch.tensor(
-            [[i >= l + 2 for i in range(max_len_seq)] for l in lengths],
-            dtype=torch.bool
-        )
-        
-        # Build lengths tensor 
-        lengths = torch.tensor(lengths)   
-        
-        return {
-            "protein_id": protein_ids,
-            "sequence": sequences,
-            "sequence_emb": sequence_emb,
-            "msa_emb": msa_emb,
-            "labels": labels,
-            "pad_mask": pad_mask,              
-            "lengths": lengths,
-        }
 
     def teardown(self, stage: Optional[str] = None) -> None:
         """Clean up resources."""
@@ -541,3 +485,82 @@ class ProteinDataModule(LightningDataModule):
         self.train_protein_ids = state_dict.get("train_protein_ids", [])
         self.val_protein_ids = state_dict.get("val_protein_ids", [])
         self.test_protein_ids = state_dict.get("test_protein_ids", [])
+
+# ======================================================================
+#  Global collate function – picklable for multiprocessing 'spawn'
+# ======================================================================
+
+def protein_collate(batch):
+    """Custom collate function to handle variable-length sequences and matrices.
+
+    This is identical to ``ProteinDataModule._collate_fn`` but defined at
+    module scope so that it can be pickled when DataLoader workers are
+    started with the *spawn* start-method.  It relies only on ``torch`` and
+    ``torch.nn.functional`` (aliased ``F``) which are already imported at the
+    top of this file.
+    """
+
+    protein_ids = [item["protein_id"] for item in batch]
+    sequences   = [item["sequence"] for item in batch]
+    lengths     = [item["length"]   for item in batch]        # residue counts
+
+    # +2  (CLS + EOS)  — every sequence tensor on disk already has them
+    # +2  (CLS + EOS)  — every MSA row on disk has CLS; EOS is added later
+    max_len_seq = max(lengths) + 2        # unchanged (CLS+res+EOS)
+    assert max_len_seq <= 1024, "Sequence length must be less than or equal to 1024"
+
+    # Pad sequence embeddings  [max_len_seq, d_model]
+    seq_embs = []
+    for item in batch:
+        seq_emb = item["sequence_emb"]  # [L, d_model]
+        if seq_emb.size(0) < max_len_seq:
+            pad_size = max_len_seq - seq_emb.size(0)
+            seq_emb = F.pad(seq_emb, (0, 0, 0, pad_size), value=0)
+        seq_embs.append(seq_emb)
+
+    # ── NEW: row-axis padding ────────────────────────────────────
+    max_n_seq = max(item["msa_emb"].size(0) for item in batch)
+
+    msa_embs = []
+    for item in batch:
+        msa = item["msa_emb"]           # [N_seq, L, d_msa]
+
+        # pad L axis (existing code)
+        if msa.size(1) < max_len_seq:
+            pad_L = max_len_seq - msa.size(1)
+            msa = F.pad(msa, (0, 0, 0, pad_L, 0, 0), value=0)
+
+        # pad N_seq axis (row axis) **at the bottom**
+        if msa.size(0) < max_n_seq:
+            pad_rows = max_n_seq - msa.size(0)
+            msa = F.pad(msa, (0, 0, 0, 0, 0, pad_rows), value=0)
+
+        msa_embs.append(msa)
+
+    # Stack embeddings
+    sequence_emb = torch.stack(seq_embs)    # [B, L_seq_max, d_model]
+    msa_emb      = torch.stack(msa_embs)    # [B, N_seq, L_msa_max, d_msa]
+
+    assert sequence_emb.size(1) == msa_emb.size(2), "Sequence and MSA lengths must be the same"
+
+    # Stack labels
+    labels = torch.stack([item["labels"] for item in batch], dim=0)
+
+    # Masking boolean tensor [B, max_len_seq]
+    pad_mask = torch.tensor(
+        [[i >= l + 2 for i in range(max_len_seq)] for l in lengths],
+        dtype=torch.bool
+    )
+
+    # Build lengths tensor 
+    lengths = torch.tensor(lengths)
+
+    return {
+        "protein_id": protein_ids,
+        "sequence": sequences,
+        "sequence_emb": sequence_emb,
+        "msa_emb": msa_emb,
+        "labels": labels,
+        "pad_mask": pad_mask,
+        "lengths": lengths,
+    }

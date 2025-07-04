@@ -16,6 +16,9 @@ precision: "bf16-mixed"
 # Validation frequency (protein training is slow)
 check_val_every_n_epoch: 1
 
+# Disable sanity check to avoid _go_dicts KeyError during initialization
+num_sanity_val_steps: 0
+
 # Deterministic training for reproducibility
 deterministic: False
 

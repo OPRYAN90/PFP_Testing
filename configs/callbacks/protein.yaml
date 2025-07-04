@@ -33,4 +33,6 @@ rich_progress_bar:
     batch_progress: "white"
     time: "grey54"
     processing_speed: "grey70"
-    metrics: "white" 
+    metrics: "white"
+    metrics_text_delimiter: " • "
+    metrics_format: ".3e" 

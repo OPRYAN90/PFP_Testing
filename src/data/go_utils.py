@@ -13,7 +13,11 @@ GO_SPLITS = {"mf": "### GO-terms (molecular_function)",
 
 
 # --- GO ontology graph (loaded once) ---------------------
-GO_GRAPH = obonet.read_obo(open("data/go-basic.obo", "r"))
+# Use absolute path relative to the project root
+_current_file = Path(__file__).resolve()
+_project_root = _current_file.parent.parent.parent  # src/data/go_utils.py -> PFP_Testing/
+_go_file_path = _project_root / "data" / "go-basic.obo"
+GO_GRAPH = obonet.read_obo(open(_go_file_path, "r"))
 
 @lru_cache(maxsize=None)
 def load_go_dict(tsv_path: Path, ontology: str):
@@ -102,7 +106,7 @@ def _cafa_go_aupr(labels, preds, goterms, ont):
 
         for t in range(1, 100):
             threshold = t/100.0
-            predictions = (preds > threshold).astype(np.int)
+            predictions = (preds > threshold).astype(int)
 
             m = 0
             precision = 0.0
@@ -163,7 +167,7 @@ def _cafa_ec_aupr(labels, preds, goterms):
 
     for t in range(1, 100):
         threshold = t/100.0
-        predictions = (preds > threshold).astype(np.int)
+        predictions = (preds > threshold).astype(int)
 
         m = 0
         precision = 0.0

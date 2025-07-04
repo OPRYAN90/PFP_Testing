@@ -10,13 +10,13 @@ task_type: "mf"        # Molecular Function (489 classes)
 # MF (489 classes): 4-6 batch size works well
 # BP (1943 classes): 2-3 batch size (large label space needs more memory)  
 # CC (320 classes): 6-8 batch size (smaller label space, can use larger batches)
-batch_size: 4          # TODO: CHANGE THIS
+batch_size: 10          # TODO: CHANGE THIS
 
 # Data loading parameters
-num_workers: 0         #NOTE CONSIDER CHANING
+num_workers: 3         #NOTE CONSIDER CHANING
 pin_memory: true       # Pin memory for faster GPU transfer
 # Task-specific batch size recommendations (uncomment when switching tasks):
 # For BP task: batch_size: 2
 # For CC task: batch_size: 6
-compile_msa_model: true
+compile_msa_model: false
 # max_sequence_length: 1024 

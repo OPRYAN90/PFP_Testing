@@ -33,5 +33,5 @@ def maybe_enable_flash_attention(force: bool = False) -> None:
 
     print("Running with Flash Attention")
     torch.backends.cuda.enable_flash_sdp(True)          # Fastest (Ampere+)
-    torch.backends.cuda.enable_mem_efficient_sdp(False)  # Triton kernels
-    torch.backends.cuda.enable_math_sdp(False)           # Always available 
+    torch.backends.cuda.enable_mem_efficient_sdp(True)  # Triton kernels
+    torch.backends.cuda.enable_math_sdp(True)           # Always available 

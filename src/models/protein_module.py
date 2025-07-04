@@ -7,7 +7,7 @@ import torch.nn as nn
 # Optional FlashAttention toggle – does nothing on unsupported systems
 # -----------------------------------------------------------------------------
 
-from utils.flash_control import maybe_enable_flash_attention  # type: ignore
+from utils.flash_control import maybe_enable_flash_attention  
 maybe_enable_flash_attention(True)
 
 
