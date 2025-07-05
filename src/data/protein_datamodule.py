@@ -10,6 +10,11 @@ from torch.utils.data import get_worker_info
 import pickle as pkl
 from .go_utils import load_go_dict
 from torch._dynamo import OptimizedModule      
+import time
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from omegaconf import DictConfig
 
 class ProteinDataset(Dataset):
     """Custom Dataset for multi-modal protein function prediction."""
@@ -127,13 +132,22 @@ class ProteinDataset(Dataset):
         return seqs
     #TODO: ASSERT ESM-C PROPER BF16 # and test bf model-wise
     @torch.inference_mode()
-    def _compute_msa_embeddings(self, a3m_file: Path) -> torch.Tensor:
+    def _compute_msa_embeddings(self, a3m_file: Path) -> Tuple[torch.Tensor, float, float]:
+        t_parse = time.perf_counter()
+
         model, batch_converter = self._get_msa_model(compile_model=self.compile_msa_model)
+        
+        # Time A3M parsing
         seqs = self._parse_a3m(a3m_file)
+        
         msa = [(f"seq{i}", s) for i, s in enumerate(seqs)]
 
-        _, _, tok = batch_converter([msa])
+        _, _, tok = batch_converter([msa])  # type: ignore[arg-type]
         tok = tok.to(self._device)
+        a3m_parse_time = time.perf_counter() - t_parse
+
+        # Time actual model computation
+        _t_compute = time.perf_counter()
         # Optimized autocast context for compiled models
         with torch.autocast(
             device_type=self._device.type,
@@ -143,7 +157,9 @@ class ProteinDataset(Dataset):
             # For compiled models, this will be significantly faster
             rep = model(tok, repr_layers=[12])["representations"][12]
         
-        return rep.to(torch.float32).squeeze(0).cpu()  # (N_seq, L+1, d) - keep .cpu() to avoid memory issues
+        embeddings = rep.to(torch.float32).squeeze(0).cpu()  # (N_seq, L+1, d) - keep .cpu() to avoid memory issues
+        msa_compute_time = time.perf_counter() - _t_compute
+        return embeddings, a3m_parse_time, msa_compute_time
         #NOTE: COMPUTATION NOT BATCH_PARALLELIZED
     def _parse_go_labels(self, go_file_path: Path) -> torch.Tensor:
         """
@@ -176,6 +192,9 @@ class ProteinDataset(Dataset):
         return labels
     
     def __getitem__(self, idx):
+        # Measure full sample preparation time
+        _t0 = time.perf_counter()
+        
         protein_id = self.protein_ids[idx]
         protein_dir = self.split_dir / protein_id
         
@@ -190,11 +209,16 @@ class ProteinDataset(Dataset):
         # ESM-C: Direct tensor (1, L+2, 1152) -> squeeze to (L+2, 1152)
         assert esmc_data.dim() == 3, "ESM-C data should be a 3D tensor"
         esmc_emb = esmc_data.squeeze(0)
-        
+        #track this starting here 
+        # ------------------------------------------------------------------
+        # Measure time spent **inside** the expensive MSA embedding routine
+        # ------------------------------------------------------------------
+        _t_msa = time.perf_counter()
         # Load MSA data from .a3m file and compute embeddings on-the-fly
         a3m_file = protein_dir / "final_filtered_256_stripped.a3m"
-        msa_emb = self._compute_msa_embeddings(a3m_file)
-        
+        msa_emb, a3m_parse_time, msa_compute_time = self._compute_msa_embeddings(a3m_file)
+        msa_time = time.perf_counter() - _t_msa
+        #track this ending here 
         # Load labels based on task type from GO text files
         label_file = protein_dir / f"{self.task_type}_go.txt"
         
@@ -207,14 +231,24 @@ class ProteinDataset(Dataset):
         
         assert protein_length == esmc_emb.size(0)-2 == msa_emb.size(1)-1, "Sequence/MSA/Length mismatch"
         
-        return {
+        sample = {
             "protein_id": protein_id,
             "sequence": sequence,
             "sequence_emb": esmc_emb,  # Shape: (L+2, d_model) 
             "msa_emb": msa_emb,        # Shape: (N_seq, L+1, d_msa)
             "labels": labels,
-            "length": protein_length
+            "length": protein_length,
+            # expose per-sample timing of the MSA embedding step so that
+            # the collate function (and perf callback) can aggregate it
+            "msa_time": msa_time,
+            "a3m_parse_time": a3m_parse_time,
+            "msa_compute_time": msa_compute_time,
         }
+
+        # attach timing (seconds) for this sample
+        sample["sample_prep_time"] = time.perf_counter() - _t0
+
+        return sample
 
 
 class ProteinDataModule(LightningDataModule):
@@ -226,6 +260,9 @@ class ProteinDataModule(LightningDataModule):
     
     Now supports three predefined splits: train, val, test from separate directories.
     """
+
+    # Help static type checkers recognise dynamically-added Hydra attribute
+    hparams: Any
 
     def __init__(
         self,
@@ -502,6 +539,7 @@ def protein_collate(batch):
     ``torch.nn.functional`` (aliased ``F``) which are already imported at the
     top of this file.
     """
+    t0 = time.perf_counter()  # start collate timing
 
     protein_ids = [item["protein_id"] for item in batch]
     sequences   = [item["sequence"] for item in batch]
@@ -558,7 +596,21 @@ def protein_collate(batch):
     # Build lengths tensor 
     lengths = torch.tensor(lengths)
 
-    return {
+    # ------------------------------------------------------------------
+    # Aggregate per-sample preparation time (from Dataset) + collate time
+    # ------------------------------------------------------------------
+    sample_prep_total = 0.0
+    msa_time_total = 0.0
+    a3m_parse_time_total = 0.0
+    msa_compute_time_total = 0.0
+    for item in batch:
+        sample_prep_total += float(item.get("sample_prep_time", 0.0))
+        msa_time_total   += float(item.get("msa_time", 0.0))
+        a3m_parse_time_total += float(item.get("a3m_parse_time", 0.0))
+        msa_compute_time_total += float(item.get("msa_compute_time", 0.0))
+
+    collate_time = time.perf_counter() - t0
+    batch_dict = {
         "protein_id": protein_ids,
         "sequence": sequences,
         "sequence_emb": sequence_emb,
@@ -566,4 +618,10 @@ def protein_collate(batch):
         "labels": labels,
         "pad_mask": pad_mask,
         "lengths": lengths,
+        "prep_time": sample_prep_total + collate_time,
+        "msa_time": msa_time_total,
+        "a3m_parse_time": a3m_parse_time_total,
+        "msa_compute_time": msa_compute_time_total,
     }
+
+    return batch_dict

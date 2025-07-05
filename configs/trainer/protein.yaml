@@ -31,3 +31,9 @@ accumulate_grad_batches: 5
 # Log every N steps for monitoring
 
 
+
+# Enable PyTorch profiler for detailed performance analysis
+profiler: pytorch
+
+# Log metrics every step to capture timing information
+log_every_n_steps: 1
