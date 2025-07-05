@@ -150,7 +150,7 @@ class BatchTimer(Callback):
         # Extract MSA compute time (if available)
         msa_compute_time = batch.get("msa_compute_time")
         if msa_compute_time is not None:
-            self.msa_compute_times.append(msa_compute_time)
+            self.msa_compute_times.append(msa_compute_time) 
             if trainer.logger:
                 trainer.logger.log_metrics({"time/msa_compute": msa_compute_time}, step=trainer.global_step)
             self._maybe_flush(trainer)
@@ -165,6 +165,22 @@ class BatchTimer(Callback):
 
         self.forward_times.append(fwd_time)
         self._maybe_flush(trainer)
+
+        # ------------------------------------------------------------------
+        # Log MSA compute time that was measured **during** the forward pass.
+        # The forward pass stores it as an attribute on the LightningModule so
+        # we can safely access it here *after* the computation is finished.
+        # ------------------------------------------------------------------
+        pl_module = trainer.lightning_module
+        msa_compute_time = getattr(pl_module, "_last_msa_compute_time", None)
+        if msa_compute_time is not None:
+            self.msa_compute_times.append(msa_compute_time)
+            if trainer.logger:
+                trainer.logger.log_metrics({"time/msa_compute": msa_compute_time}, step=trainer.global_step)
+            # Flush periodically
+            self._maybe_flush(trainer)
+            # Clear to avoid double-logging when using gradient accumulation
+            pl_module._last_msa_compute_time = None
 
     def on_train_batch_end(self, trainer, *_):
         # Mark end-of-step so next dataloader timing is correct

@@ -1,4 +1,4 @@
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Union, List
 
 import torch
 import torch.nn as nn
@@ -207,6 +207,8 @@ class MSAEncoder(nn.Module):
         lengths: torch.Tensor,   # [B]  true residue counts (no CLS/EOS)
         pad_mask: torch.Tensor,  # [B, L] True where padded
     ) -> torch.Tensor:
+        msa = msa.clone()
+
         # ------------------------------------------------------------
         # Insert EOS (learnable) at position L+1  — truly in-place
         # ------------------------------------------------------------
@@ -271,16 +273,15 @@ class CrossModalAttention(nn.Module):
         self.layers = nn.ModuleList()
         
         for _ in range(n_layers):
-            self.layers.append(
-                nn.ModuleDict({
-                    "seq_norm": nn.LayerNorm(d_model),
-                    "msa_norm": nn.LayerNorm(d_model),
-                    "seq_attn": nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True),
-                    "msa_attn": nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True),
-                    "seq_ffn": ResidualFeedForward(d_model, dropout=dropout),
-                    "msa_ffn": ResidualFeedForward(d_model, dropout=dropout),
-                })
-            )
+            layer = nn.ModuleDict({
+                "seq_norm": nn.LayerNorm(d_model),
+                "msa_norm": nn.LayerNorm(d_model),
+                "seq_attn": nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True),
+                "msa_attn": nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True),
+                "seq_ffn": ResidualFeedForward(d_model, dropout=dropout),
+                "msa_ffn": ResidualFeedForward(d_model, dropout=dropout),
+            })
+            self.layers.append(layer)
 
     def forward(
         self, 
@@ -311,38 +312,43 @@ class CrossModalAttention(nn.Module):
 
 
 ############################################################
-#  LightningModule - Adapted for Lightning-Hydra Setup
+#  LightningModule - Optimized Implementation
 ############################################################
 
 class ProteinLitModule(LightningModule):
     """LightningModule for multi-modal protein function prediction.
 
-    Adapted for Lightning-Hydra template with dynamic num_classes and 
-    Hydra-compatible optimizer/scheduler configuration.
-    
+    Optimized implementation with simplified MSA model management and removed CUDA streams.
     """
 
     def __init__(
         self,
-        task_type: str = None,        # Task type: "mf", "bp", or "cc"
-        d_model: int = 1152,           # Base model dimension
-        d_msa: int = 768,             # MSA embedding dimension
-        n_seq_layers: int = 2,        # Sequence encoder layers
-        # n_msa_layers: int = 2,        # MSA encoder layers  
-        n_cross_layers: int = 2,      # Cross-attention layers
-        n_heads: int = 8,             # Attention heads
-        dropout: float = 0.1,         # Dropout rate
+        task_type: str,                       # Task type: "mf", "bp", or "cc" - required
+        d_model: int = 1152,                  # Base model dimension
+        d_msa: int = 768,                     # MSA embedding dimension
+        n_seq_layers: int = 2,                # Sequence encoder layers
+        n_cross_layers: int = 2,              # Cross-attention layers
+        n_heads: int = 8,                     # Attention heads
+        dropout: float = 0.1,                 # Dropout rate
         # MSA Encoder dropout parameters
-        p_row: float = 0.15,          # Row dropout probability (individual MSA sequences)
-        p_chan: float = 0.15,         # Channel dropout probability (AlphaFold-style)
-        p_feat: float = 0.10,         # Feature dropout after MSA projection
-        optimizer: torch.optim.Optimizer = None,  # Hydra optimizer config
-        scheduler = None,  # Hydra scheduler config  
-        debugging: bool = True,       # Default to debugging mode (disables compilation)
-        warmup_ratio: float = 0.05,   # Warmup ratio for cosine schedule (5% of total training steps)
+        p_row: float = 0.15,                  # Row dropout probability (individual MSA sequences)
+        p_chan: float = 0.15,                 # Channel dropout probability (AlphaFold-style)
+        p_feat: float = 0.10,                 # Feature dropout after MSA projection
+        optimizer: Optional[Any] = None,      # Hydra optimizer config
+        scheduler: Optional[Any] = None,      # Hydra scheduler config  
+        debugging: bool = True,               # Default to debugging mode (disables compilation)
+        warmup_ratio: float = 0.05,           # Warmup ratio for cosine schedule (5% of total training steps)
     ) -> None:
         super().__init__()
         self.save_hyperparameters(logger=False)
+
+        # Store task type for easy access
+        self.task_type = task_type
+        
+        # Load MSA model - NO STREAM NEEDED
+        import esm
+        self.msa_model, _ = esm.pretrained.esm_msa1b_t12_100M_UR50S()
+        self.msa_model.eval()
 
         # Encoders
         self.seq_encoder = SequenceEncoder(
@@ -370,13 +376,13 @@ class ProteinLitModule(LightningModule):
         # Readout: concatenate residue-wise features (mean-pool) -> linear projection
         self.fusion_proj = nn.Linear(d_model * 2, d_model)
         
-        # Create classifier head in __init__ now that we have num_classes
-        self.head = MLPHead(d_model, get_num_classes_for_task(self.hparams.task_type), dropout)
+        # Create classifier head
+        self.head = MLPHead(d_model, get_num_classes_for_task(task_type), dropout)
 
         # For multi-label protein prediction, we use standard BCE loss
-        self.loss_fn = nn.BCEWithLogitsLoss() #TODO: Consider weighted loss by adding InfoNCE loss funciton 
+        self.loss_fn = nn.BCEWithLogitsLoss()
 
-        # Loss tracking (these don't depend on num_classes)
+        # Loss tracking
         self.train_loss = MeanMetric()
         self.val_loss = MeanMetric()
         self.test_loss = MeanMetric()
@@ -388,50 +394,52 @@ class ProteinLitModule(LightningModule):
         self._test_labels = []
 
     def setup(self, stage: str) -> None:
-        """Setup hook now only handles compilation and datamodule validation."""
-        # Validate that datamodule num_classes matches model num_classes (if available)
-        if hasattr(self.trainer, 'datamodule') and hasattr(self.trainer.datamodule, 'num_classes'):
-            datamodule_classes = self.trainer.datamodule.num_classes
-            model_classes = get_num_classes_for_task(self.hparams.task_type)
-            
-            if datamodule_classes != model_classes:
-                raise ValueError(
-                    f"Mismatch between model num_classes ({model_classes}) "
-                    f"and datamodule num_classes ({datamodule_classes})"
+        """Setup hook handles MSA model device movement and compilation."""
+        if stage == "fit":
+            # Move and compile model            
+            if not self.hparams.debugging:
+                print(f"🚀 Compiling ESM-MSA model on device: {self.device}")
+                self.msa_model = torch.compile(
+                    self.msa_model,
+                    mode='reduce-overhead',
+                    fullgraph=True,
+                    dynamic=True
                 )
-            
-            print(f"✅ Validated model-datamodule compatibility: {model_classes} classes")
-        else:
-            print("No datamodule found, skipping validation")
-        
-        # Compilation logic: Compile when NOT debugging
-        if stage == "fit" and not self.hparams.debugging:
-            assert any(p.is_cuda for p in self.parameters()), "Model still on CPU – compile later or move first!"
-            print(f"Compiling entire model on device: {next(self.parameters()).device}")
-            self.forward = torch.compile(self.forward,
-                                         mode='default',
-                                         dynamic=True)
-        elif stage == "fit":
-            print("🐛 Debugging mode: Compilation disabled for easier debugging")
+                print("✅ ESM-MSA model compiled successfully")
+            else:
+                print("🐛 Debugging mode: MSA model compilation disabled")
+                
+            print(f"✅ ESM-MSA model loaded on {self.device}")
 
     # ---------------------------------------------------------------------
-    #  Forward pass - adapted for your datamodule's batch format
+    #  Forward pass - optimized MSA computation
     # ---------------------------------------------------------------------
     def forward(self, batch: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
         """Forward pass adapted for ESM and MSA modalities only."""
         # Extract inputs - ESM-C embeddings are pre-computed
         seq_emb = batch["sequence_emb"]  # Pre-computed ESM-C: [B, L, d_model]
-        msa_emb = batch["msa_emb"]       # MSA embeddings: [B, N_seq, L, d_msa] 
+        msa_tok_list = batch["msa_tok"]   # list[Tensor] – variable [N_seq_i, L_i]
+
         pad_mask = batch["pad_mask"]     # [B, L] - True where padded
 
-        # derive an MSA‐style mask
-        # pad_mask: True at pad → key_padding_mask expects True==mask
-        msa_pad_mask = pad_mask    # keep shape [B, L]
+        # Compute MSA embeddings on-the-fly (sequential, per-sample)
+        target_len = seq_emb.shape[1]  # CLS + residues + EOS (same as pad_mask width)
+        msa_emb, msa_compute_time = self._compute_msa_embeddings(msa_tok_list, target_len)  # [B, N_seq_max, target_len, d_msa]
+        
+        # Expose timing so callbacks (e.g., BatchTimer) can log it **after** the forward pass.
+        # Storing it on `self` ensures it is available in hooks such as `on_before_backward`.
+        self._last_msa_compute_time = msa_compute_time
+
+        # Keep original behaviour for potential external use
+        batch["msa_compute_time"] = msa_compute_time
+
+        # derive an MSA-style mask  – identical to seq mask for per-residue padding
+        msa_pad_mask = pad_mask    # shape [B, L]
         seq_pad_mask = pad_mask
 
         # Encode each modality with padding masks
-        seq_z = self.seq_encoder(seq_emb, src_key_padding_mask=pad_mask)  # [B, L, d]
-        msa_z = self.msa_encoder(msa_emb, batch["lengths"], pad_mask=pad_mask)  # [B, L, d]
+        seq_z = self.seq_encoder(seq_emb, src_key_padding_mask=seq_pad_mask)  # [B, L, d]
+        msa_z = self.msa_encoder(msa_emb, batch["lengths"], pad_mask=msa_pad_mask)  # [B, L, d]
 
         # Cross-modal attention with padding masks
         seq_z, msa_z = self.cross_attn(seq_z, msa_z, seq_pad_mask, msa_pad_mask)  # each [B, L, d]
@@ -453,7 +461,64 @@ class ProteinLitModule(LightningModule):
         return logits, batch["labels"]
 
     # ------------------------------------------------------------------
-    #  Lightning hooks - compatible with Lightning-Hydra template
+    #  Simple MSA embedding computation without streams
+    # ------------------------------------------------------------------
+    @torch.inference_mode()
+    def _compute_msa_embeddings(
+        self,
+        msa_tok_list: List[torch.Tensor],
+        target_len: int,
+    ) -> Tuple[torch.Tensor, float]:
+        """Compute MSA embeddings sequentially (one sample at a time).
+
+        This avoids the huge memory spike that occurs when feeding the whole
+        batch to ESM-MSA at once.  After all representations are computed we
+        zero-pad them to a common shape so downstream code can keep treating
+        the result as a single 4-D tensor: [B, N_seq_max, L_max, d_msa].
+        """
+        import time
+        start = time.perf_counter()
+
+        reps: List[torch.Tensor] = []
+        max_n_seq = 0
+        max_L     = 0
+
+        for tok in msa_tok_list:
+            # Move single sample to device and add batch dim expected by ESM-MSA
+            tok_gpu = tok.to(self.device, non_blocking=True).unsqueeze(0)  # [1, N_seq, L]
+
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                rep = self.msa_model(tok_gpu, repr_layers=[12])["representations"][12]
+
+            rep = rep.squeeze(0)      # [N_seq, L, d_msa]
+            reps.append(rep)
+
+            # Track largest shapes for padding later
+            max_n_seq = max(max_n_seq, rep.shape[0])
+            max_L     = max(max_L, rep.shape[1])
+
+        # Ensure horizontal padding matches desired target_len
+        max_L = max(max_L, target_len)
+
+        # ---------------------------------------------------------
+        # Pad each representation to [max_n_seq, max_L, d_msa]
+        # ---------------------------------------------------------
+        padded_reps: List[torch.Tensor] = []
+        for rep in reps:
+            n_seq, L, D = rep.shape
+            if n_seq < max_n_seq or L < max_L:
+                padded = rep.new_zeros(max_n_seq, max_L, D)
+                padded[:n_seq, :L] = rep
+                rep = padded
+            padded_reps.append(rep)
+
+        msa_emb = torch.stack(padded_reps, dim=0)  # [B, N_seq_max, L_max, d_msa]
+
+        return msa_emb, time.perf_counter() - start
+
+
+    # ------------------------------------------------------------------
+    #  Lightning hooks
     # ------------------------------------------------------------------
     def training_step(self, batch: Dict[str, Any], batch_idx: int):
         logits, labels = self.forward(batch)
@@ -494,17 +559,17 @@ class ProteinLitModule(LightningModule):
     def _heal_metrics(self, logits, labels): 
         probs = torch.sigmoid(logits).numpy()
         labels = labels.numpy().astype(int)
-        goterms = list(self.trainer.datamodule._go_dicts[self.hparams.task_type].keys())
+        goterms = list(self.trainer.datamodule._go_dicts[self.task_type].keys())
 
         # Parent-child propagation
-        if self.hparams.task_type == "ec": #NOTE: If ec is enabled update this
+        if self.task_type == "ec": #NOTE: If ec is enabled update this
             print("EC task type detected; ENSURE UPDATE")
             probs = propagate_ec_preds(probs, goterms)
         else:
             probs = propagate_go_preds(probs, goterms)
 
         macro, micro = function_centric_aupr(labels, probs)
-        fmax, _      = cafa_fmax(labels, probs, goterms, self.hparams.task_type)
+        fmax, _      = cafa_fmax(labels, probs, goterms, self.task_type)
         s_min        = smin(labels, probs, self.trainer.datamodule.ic_vector.numpy())
 
         return macro, micro, fmax, s_min
@@ -514,12 +579,13 @@ class ProteinLitModule(LightningModule):
         labels = torch.cat(self._val_labels)
         macro, micro, fmax, s_min = self._heal_metrics(logits, labels)
 
+        # Convert numpy scalars to Python floats for logging
         self.log_dict({
             "val/loss": self.val_loss,
-            "val/AUPR_macro": macro,
-            "val/AUPR_micro": micro,
-            "val/Fmax": fmax,
-            "val/Smin": s_min,
+            "val/AUPR_macro": float(macro),
+            "val/AUPR_micro": float(micro), 
+            "val/Fmax": float(fmax),
+            "val/Smin": float(s_min),
         }, prog_bar=True, sync_dist=True)
 
         self.val_loss.reset(); self._val_logits.clear(); self._val_labels.clear()
@@ -532,38 +598,39 @@ class ProteinLitModule(LightningModule):
         self._val_labels.clear()
        
     def configure_optimizers(self):
-            optimizer = self.hparams.optimizer(params=self.parameters())
+        if self.hparams.optimizer is None:
+            raise ValueError("Optimizer must be provided in hparams")
+            
+        optimizer = self.hparams.optimizer(params=self.parameters())
 
-            # ---- 100 % bullet-proof step count ---------------------------
-            total_steps = self.trainer.estimated_stepping_batches  # ← 1-liner
+        # Get total steps
+        total_steps = self.trainer.estimated_stepping_batches
 
-            # 5 % warm-up, but expose it as Hydra-overridable hyper-param
-            warmup_steps = int(self.hparams.warmup_ratio * total_steps)
+        # Warmup steps
+        warmup_steps = int(self.hparams.warmup_ratio * total_steps)
 
-            if self.hparams.scheduler is not None:
-                # `get_cosine_schedule_with_warmup` signature:
-                # (optimizer, num_warmup_steps, num_training_steps, …)  :contentReference[oaicite:1]{index=1}
-                scheduler_fn = self.hparams.scheduler
-                scheduler = scheduler_fn(
-                    optimizer=optimizer,
-                    num_warmup_steps=warmup_steps,
-                    num_training_steps=total_steps,
-                )
+        if self.hparams.scheduler is not None:
+            scheduler_fn = self.hparams.scheduler
+            scheduler = scheduler_fn(
+                optimizer=optimizer,
+                num_warmup_steps=warmup_steps,
+                num_training_steps=total_steps,
+            )
 
-                return {
-                    "optimizer": optimizer,
-                    "lr_scheduler": {
-                        "scheduler": scheduler,
-                        "interval": "step",      # step every optimizer.step()
-                        "frequency": 1,
-                    },
-                }
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "interval": "step",
+                    "frequency": 1,
+                },
+            }
 
-            return {"optimizer": optimizer}
+        return {"optimizer": optimizer}
 
     def on_train_epoch_end(self) -> None:
         """Lightning hook that is called when a training epoch ends."""
-        self.train_loss.reset()  # Explicit reset for consistency
+        self.train_loss.reset()
 
     def on_test_epoch_end(self) -> None:
         """Lightning hook that is called when a test epoch ends."""
@@ -571,12 +638,13 @@ class ProteinLitModule(LightningModule):
         labels = torch.cat(self._test_labels)
         macro, micro, fmax, s_min = self._heal_metrics(logits, labels)
 
+        # Convert numpy scalars to Python floats for logging
         self.log_dict({
             "test/loss": self.test_loss,
-            "test/AUPR_macro": macro,
-            "test/AUPR_micro": micro,
-            "test/Fmax": fmax,
-            "test/Smin": s_min,
+            "test/AUPR_macro": float(macro),
+            "test/AUPR_micro": float(micro),
+            "test/Fmax": float(fmax),
+            "test/Smin": float(s_min),
         }, prog_bar=True, sync_dist=True)
 
         self.test_loss.reset(); self._test_logits.clear(); self._test_labels.clear()

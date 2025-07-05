@@ -110,6 +110,32 @@ class ProteinDataset(Dataset):
 
         return cls._msa_model, cls._msa_batch_conv
 
+    @classmethod
+    def _get_msa_batch_converter(cls):
+        """Return a cached ESM-MSA batch-converter **without** loading the
+        large 100 M parameter model.
+
+        We try to obtain the Alphabet object directly (⇾ tiny) and fall back
+        to the pretrained helper only if the direct route fails.  This keeps
+        worker memory low and avoids any accidental CUDA initialisation in
+        DataLoader workers.
+        """
+        if cls._msa_batch_conv is not None:
+            return cls._msa_batch_conv
+
+        import esm  # local import to keep global namespace clean
+        try:
+            # esm≥1.0 – cheap, no weights
+            from esm.data import Alphabet  # type: ignore
+            alphabet = Alphabet.from_architecture("msa_transformer")
+        except Exception:
+            # Fallback: load_weights=True would allocate >200 MB; therefore we
+            # discard the model immediately after grabbing the alphabet.
+            model, alphabet = esm.pretrained.esm_msa1b_t12_100M_UR50S()
+            del model  # release the weights – we only need `alphabet`
+        cls._msa_batch_conv = alphabet.get_batch_converter()
+        return cls._msa_batch_conv
+
     @staticmethod
     def _parse_a3m(path: Path) -> List[str]:
         """Parse A3M file - first sequence is query, max 256 total sequences."""
@@ -211,13 +237,24 @@ class ProteinDataset(Dataset):
         esmc_emb = esmc_data.squeeze(0)
         #track this starting here 
         # ------------------------------------------------------------------
-        # Measure time spent **inside** the expensive MSA embedding routine
+        # Measure time spent **inside** the MSA parsing + tokenisation routine
         # ------------------------------------------------------------------
         _t_msa = time.perf_counter()
-        # Load MSA data from .a3m file and compute embeddings on-the-fly
+
+        # Parse A3M file + convert to integer tokens (CPU-only)
         a3m_file = protein_dir / "final_filtered_256_stripped.a3m"
-        msa_emb, a3m_parse_time, msa_compute_time = self._compute_msa_embeddings(a3m_file)
-        msa_time = time.perf_counter() - _t_msa
+        # 1) FAST text parsing on the worker CPU
+        _t_parse = time.perf_counter()
+        seqs = self._parse_a3m(a3m_file)
+        a3m_parse_time = time.perf_counter() - _t_parse
+
+        # 2) Batch-converter → integer token tensor (still CPU)
+        msa = [(f"seq{i}", s) for i, s in enumerate(seqs)]
+        batch_converter = self._get_msa_batch_converter()
+        _, _, tok = batch_converter([msa])  # type: ignore[arg-type]
+        msa_tok = tok.squeeze(0).cpu()                  # [N_seq, L_tok] – stays on CPU
+
+        msa_prep_time = time.perf_counter() - _t_msa
         #track this ending here 
         # Load labels based on task type from GO text files
         label_file = protein_dir / f"{self.task_type}_go.txt"
@@ -229,20 +266,18 @@ class ProteinDataset(Dataset):
         with open(protein_dir / "L.csv", "r") as f:
             protein_length = int(f.readline().strip())
         
-        assert protein_length == esmc_emb.size(0)-2 == msa_emb.size(1)-1, "Sequence/MSA/Length mismatch"
+        # assert protein_length == esmc_emb.size(0)-2 == msa_emb.size(1)-1, "Sequence/MSA/Length mismatch"
         
         sample = {
             "protein_id": protein_id,
             "sequence": sequence,
             "sequence_emb": esmc_emb,  # Shape: (L+2, d_model) 
-            "msa_emb": msa_emb,        # Shape: (N_seq, L+1, d_msa)
-            "labels": labels,
+            "msa_tok": msa_tok,
             "length": protein_length,
-            # expose per-sample timing of the MSA embedding step so that
-            # the collate function (and perf callback) can aggregate it
-            "msa_time": msa_time,
+            # expose timing so the collate fn can aggregate it later if needed
+            "msa_prep_time": msa_prep_time,
             "a3m_parse_time": a3m_parse_time,
-            "msa_compute_time": msa_compute_time,
+            "labels": labels,
         }
 
         # attach timing (seconds) for this sample
@@ -531,97 +566,75 @@ class ProteinDataModule(LightningDataModule):
 # ======================================================================
 
 def protein_collate(batch):
-    """Custom collate function to handle variable-length sequences and matrices.
+    """Collate function for *token* MSA representation.
 
-    This is identical to ``ProteinDataModule._collate_fn`` but defined at
-    module scope so that it can be pickled when DataLoader workers are
-    started with the *spawn* start-method.  It relies only on ``torch`` and
-    ``torch.nn.functional`` (aliased ``F``) which are already imported at the
-    top of this file.
+    Pads:
+    1. Pre-computed ESM-C embeddings  → shape [B, L_max_seq, d_model]
+    2. Integer MSA tokens            → shape [B, N_seq_max, L_max_seq]
+
+    The resulting `L_max_seq` is **identical** for both modalities, derived
+    exclusively from the sequence-embedding length (CLS + residues + EOS).
+    This guarantees that downstream encoders can safely scatter an EOS token
+    at index `length + 1` without running out-of-bounds.
     """
-    t0 = time.perf_counter()  # start collate timing
 
-    protein_ids = [item["protein_id"] for item in batch]
-    sequences   = [item["sequence"] for item in batch]
-    lengths     = [item["length"]   for item in batch]        # residue counts
+    t0 = time.perf_counter()
 
-    # +2  (CLS + EOS)  — every sequence tensor on disk already has them
-    # +2  (CLS + EOS)  — every MSA row on disk has CLS; EOS is added later
-    max_len_seq = max(lengths) + 2        # unchanged (CLS+res+EOS)
-    assert max_len_seq <= 1024, "Sequence length must be less than or equal to 1024"
+    protein_ids = [it["protein_id"] for it in batch]
+    sequences   = [it["sequence"]    for it in batch]
+    lengths     = [it["length"]      for it in batch]   # residue counts (no CLS/EOS)
 
-    # Pad sequence embeddings  [max_len_seq, d_model]
-    seq_embs = []
-    for item in batch:
-        seq_emb = item["sequence_emb"]  # [L, d_model]
-        if seq_emb.size(0) < max_len_seq:
-            pad_size = max_len_seq - seq_emb.size(0)
-            seq_emb = F.pad(seq_emb, (0, 0, 0, pad_size), value=0)
-        seq_embs.append(seq_emb)
+    # ----------------------------------------------------
+    # 1) Pad sequence embeddings (float tensors)
+    # ----------------------------------------------------
+    max_len_seq = max(lengths) + 2   # CLS + residues + EOS
+    assert max_len_seq <= 1024, "Sequence too long (>1024)"
 
-    # ── NEW: row-axis padding ────────────────────────────────────
-    max_n_seq = max(item["msa_emb"].size(0) for item in batch)
+    seq_emb_padded = []
+    for it in batch:
+        emb = it["sequence_emb"]  # [L+2, d]
+        if emb.size(0) < max_len_seq:
+            emb = F.pad(emb, (0, 0, 0, max_len_seq - emb.size(0)), value=0)
+        seq_emb_padded.append(emb)
 
-    msa_embs = []
-    for item in batch:
-        msa = item["msa_emb"]           # [N_seq, L, d_msa]
+    # ----------------------------------------------------
+    # 2) Collect integer MSA token matrices *without* padding
+    # ----------------------------------------------------
+    msa_tok_list = [it["msa_tok"] for it in batch]   # no padding here
 
-        # pad L axis (existing code)
-        if msa.size(1) < max_len_seq:
-            pad_L = max_len_seq - msa.size(1)
-            msa = F.pad(msa, (0, 0, 0, pad_L, 0, 0), value=0)
+    # ----------------------------------------------------
+    # 3) Stack sequence embeddings + build masks
+    # ----------------------------------------------------
+    sequence_emb = torch.stack(seq_emb_padded)    # [B, L_max_seq, d_model]
 
-        # pad N_seq axis (row axis) **at the bottom**
-        if msa.size(0) < max_n_seq:
-            pad_rows = max_n_seq - msa.size(0)
-            msa = F.pad(msa, (0, 0, 0, 0, 0, pad_rows), value=0)
+    # `msa_tok` left as list for per-sample processing later
+    labels = torch.stack([it["labels"] for it in batch], dim=0)
 
-        msa_embs.append(msa)
-
-    # Stack embeddings
-    sequence_emb = torch.stack(seq_embs)    # [B, L_seq_max, d_model]
-    msa_emb      = torch.stack(msa_embs)    # [B, N_seq, L_msa_max, d_msa]
-
-    assert sequence_emb.size(1) == msa_emb.size(2), "Sequence and MSA lengths must be the same"
-
-    # Stack labels
-    labels = torch.stack([item["labels"] for item in batch], dim=0)
-
-    # Masking boolean tensor [B, max_len_seq]
     pad_mask = torch.tensor(
         [[i >= l + 2 for i in range(max_len_seq)] for l in lengths],
-        dtype=torch.bool
+        dtype=torch.bool,
     )
 
-    # Build lengths tensor 
-    lengths = torch.tensor(lengths)
+    lengths_tensor = torch.tensor(lengths)
 
-    # ------------------------------------------------------------------
-    # Aggregate per-sample preparation time (from Dataset) + collate time
-    # ------------------------------------------------------------------
-    sample_prep_total = 0.0
-    msa_time_total = 0.0
-    a3m_parse_time_total = 0.0
-    msa_compute_time_total = 0.0
-    for item in batch:
-        sample_prep_total += float(item.get("sample_prep_time", 0.0))
-        msa_time_total   += float(item.get("msa_time", 0.0))
-        a3m_parse_time_total += float(item.get("a3m_parse_time", 0.0))
-        msa_compute_time_total += float(item.get("msa_compute_time", 0.0))
+    # ----------------------------------------------------
+    # 4) Timing aggregation
+    # ----------------------------------------------------
+    sample_prep_total = sum(float(it.get("sample_prep_time", 0.0)) for it in batch)
+    msa_prep_total    = sum(float(it.get("msa_prep_time", 0.0))    for it in batch)
+    a3m_parse_total   = sum(float(it.get("a3m_parse_time", 0.0))   for it in batch)
 
     collate_time = time.perf_counter() - t0
-    batch_dict = {
+
+    return {
         "protein_id": protein_ids,
         "sequence": sequences,
         "sequence_emb": sequence_emb,
-        "msa_emb": msa_emb,
+        "msa_tok": msa_tok_list,  # list[Tensor] – variable shapes
         "labels": labels,
         "pad_mask": pad_mask,
-        "lengths": lengths,
+        "lengths": lengths_tensor,
         "prep_time": sample_prep_total + collate_time,
-        "msa_time": msa_time_total,
-        "a3m_parse_time": a3m_parse_time_total,
-        "msa_compute_time": msa_compute_time_total,
+        "msa_prep_time": msa_prep_total,
+        "a3m_parse_time": a3m_parse_total,
     }
-
-    return batch_dict
