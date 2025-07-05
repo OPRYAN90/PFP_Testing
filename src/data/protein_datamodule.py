@@ -444,6 +444,7 @@ class ProteinDataModule(LightningDataModule):
             pin_memory=self.hparams.pin_memory,
             shuffle=True,
             collate_fn=protein_collate,
+            persistent_workers=True if self.hparams.num_workers > 0 else False,
         )
 
     def val_dataloader(self) -> DataLoader[Any]:
@@ -455,6 +456,7 @@ class ProteinDataModule(LightningDataModule):
             pin_memory=self.hparams.pin_memory,
             shuffle=False,
             collate_fn=protein_collate,
+            persistent_workers=True if self.hparams.num_workers > 0 else False,
         )
 
     def test_dataloader(self) -> DataLoader[Any]:
@@ -466,6 +468,7 @@ class ProteinDataModule(LightningDataModule):
             pin_memory=self.hparams.pin_memory,
             shuffle=False,
             collate_fn=protein_collate,
+            persistent_workers=True if self.hparams.num_workers > 0 else False,
         )
 
     def teardown(self, stage: Optional[str] = None) -> None:
