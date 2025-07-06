@@ -10,7 +10,7 @@ task_type: "mf"        # Molecular Function (489 classes)
 # MF (489 classes): 4-6 batch size works well
 # BP (1943 classes): 2-3 batch size (large label space needs more memory)  
 # CC (320 classes): 6-8 batch size (smaller label space, can use larger batches)
-batch_size: 16          # TODO: CHANGE THIS
+batch_size: 32          # TODO: CHANGE THIS
 msa_sample_size: 32
 # Data loading parameters
 num_workers: 16         #NOTE CONSIDER CHANING

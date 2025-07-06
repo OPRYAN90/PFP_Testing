@@ -6,7 +6,6 @@ from torch.utils.data import DataLoader, Dataset
 import pandas as pd
 from pathlib import Path
 import torch.nn.functional as F
-from torch.utils.data import get_worker_info
 import pickle as pkl
 from .go_utils import load_go_dict
 import random  # For MSA subsampling
@@ -56,15 +55,8 @@ class ProteinDataset(Dataset):
             return cls._msa_batch_conv
 
         import esm  # local import to keep global namespace clean
-        try:
-            # esm≥1.0 – cheap, no weights
-            from esm.data import Alphabet  # type: ignore
-            alphabet = Alphabet.from_architecture("msa_transformer")
-        except Exception:
-            # Fallback: load_weights=True would allocate >200 MB; therefore we
-            # discard the model immediately after grabbing the alphabet.
-            model, alphabet = esm.pretrained.esm_msa1b_t12_100M_UR50S()
-            del model  # release the weights – we only need `alphabet`
+        from esm.data import Alphabet  # type: ignore
+        alphabet = Alphabet.from_architecture("msa_transformer")
         cls._msa_batch_conv = alphabet.get_batch_converter()
         return cls._msa_batch_conv
 

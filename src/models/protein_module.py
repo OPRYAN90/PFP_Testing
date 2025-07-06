@@ -88,7 +88,7 @@ class SequenceEncoder(nn.Module):
         super().__init__()
         
         # ➊ optional embedding-level dropout
-        self.embed_drop = nn.Dropout(dropout) 
+        self.embed_drop = nn.Dropout(dropout*0.75) 
 
         # Additional transformer layers on top of ESM-C
         encoder_layer = nn.TransformerEncoderLayer(
@@ -540,7 +540,7 @@ class ProteinLitModule(LightningModule):
 
         # Get total steps
         total_steps = self.trainer.estimated_stepping_batches
-
+        print(f"Total steps: {total_steps}")
         # Warmup steps
         warmup_steps = int(self.hparams.warmup_ratio * total_steps)
 
@@ -548,7 +548,7 @@ class ProteinLitModule(LightningModule):
             scheduler_fn = self.hparams.scheduler 
             scheduler = scheduler_fn(
                 optimizer=optimizer,
-                num_warmup_steps=warmup_steps, #TODO: ACCUMILATE GRAD
+                num_warmup_steps=warmup_steps, 
                 num_training_steps=total_steps,
             )
 
