@@ -9,106 +9,38 @@ import torch.nn.functional as F
 from torch.utils.data import get_worker_info
 import pickle as pkl
 from .go_utils import load_go_dict
-from torch._dynamo import OptimizedModule      
-import time
-from typing import TYPE_CHECKING
+import random  # For MSA subsampling
 
-if TYPE_CHECKING:
-    from omegaconf import DictConfig
 
 class ProteinDataset(Dataset):
     """Custom Dataset for multi-modal protein function prediction."""
     
-    # ── GLOBAL CACHES (per-process, not per-thread) ────────────────
-    _msa_model         = None
-    _msa_batch_conv    = None
-
-    # static device decision: *this* process only
-    _device            = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    _use_bf16          = ( #NOTE: CHANGE GPU PRECISION
-        _device.type == "cuda" and torch.cuda.get_device_capability(_device)[0] >= 8
-    )
+    # class-level cache for MSA batch converter only
+    _msa_batch_conv = None
     
     # class-level cache so every worker only builds it once
     _go_dicts = {}
     
-    def __init__(self, data_dir: str, protein_ids: List[str], task_type: str = "mf", split: str = "train", compile_msa_model: bool = True):
+    def __init__(self, data_dir: str, protein_ids: List[str], task_type: str = "mf", split: str = "train", msa_sample_size: Optional[int] = None):
         """
         :param data_dir: Path to protein data directory (base PDBCH directory)
         :param protein_ids: List of protein IDs to include
         :param task_type: Which GO task(s) to load labels for ("mf", "bp", "cc")
         :param split: Which data split ("train", "val", "test")
-        :param compile_msa_model: Whether to compile ESM-MSA model for speed (default: True)
+        :param msa_sample_size: Maximum number of MSA sequences to keep (including query). None ➜ keep all.
         """
         self.data_dir = Path(data_dir)
         self.protein_ids = protein_ids
         self.task_type = task_type
         self.split = split
-        self.compile_msa_model = compile_msa_model
+        # Maximum number of MSA sequences to keep (including query). None ➜ keep all.
+        self.msa_sample_size = msa_sample_size
         
         # Determine the specific split directory
         self.split_dir = self.data_dir / f"{split}_pdbch"
         
     def __len__(self):
         return len(self.protein_ids)
-    
-    # --------------------------------------------------------------
-    @classmethod
-    def _get_msa_model(cls, compile_model: bool = True):
-        """
-        Load the ESM-MSA model once per process with optional torch.compile optimization.
-        
-        :param compile_model: Whether to compile the model for speed optimization
-        """
-        
-        if cls._msa_model:
-            return cls._msa_model, cls._msa_batch_conv
-
-        try:
-            import esm
-            model, alphabet = esm.pretrained.esm_msa1b_t12_100M_UR50S()
-            cls._msa_batch_conv = alphabet.get_batch_converter()
-            
-            # Move to device and keep master weights in FP32
-            model.eval().to(cls._device)
-            
-            # Conditionally compile the model for significant speed improvements
-            if compile_model:
-                try:
-                    if get_worker_info() is None:  # main process only
-                        print(f"🚀 Compiling ESM-MSA model with torch.compile...")
-                    
-                    cls._msa_model = torch.compile(
-                        model, 
-                        mode='default',  
-                       dynamic=True            
-                    )
-                    
-                    if get_worker_info() is None:
-                        print(f"✅ ESM-MSA model compiled successfully")
-                        
-                except Exception as compile_error:
-                    # Fallback to uncompiled model if compilation fails
-                    if get_worker_info() is None:
-                        print(f"⚠️  Compilation failed ({compile_error}), using uncompiled model")
-                    cls._msa_model = model
-            else:
-                cls._msa_model = model
-                if get_worker_info() is None:
-                    print(f"📋 ESM-MSA model loaded without compilation (as requested)")
-                
-            if get_worker_info() is None:        # main process only
-                is_compiled = isinstance(cls._msa_model, OptimizedModule)
-                print(
-                    f"[ESM-MSA] loaded on {cls._device} "
-                    f"({'BF16' if cls._use_bf16 else 'FP32'}) "
-                    f"{'[COMPILED]' if is_compiled else '[EAGER]'}"
-                )
-                
-        except Exception as e:
-            raise RuntimeError(f"ESM-MSA load failed: {e}")
-
-        return cls._msa_model, cls._msa_batch_conv
 
     @classmethod
     def _get_msa_batch_converter(cls):
@@ -136,8 +68,7 @@ class ProteinDataset(Dataset):
         cls._msa_batch_conv = alphabet.get_batch_converter()
         return cls._msa_batch_conv
 
-    @staticmethod
-    def _parse_a3m(path: Path) -> List[str]:
+    def _parse_a3m(self, path: Path) -> List[str]:
         """Parse A3M file - first sequence is query, max 256 total sequences."""
         seqs, seq = [], []
         with open(path, "r", encoding="utf-8") as fh:
@@ -156,37 +87,7 @@ class ProteinDataset(Dataset):
         
         assert 1 <= len(seqs) <= 256, f"Expected 1-256 sequences, got {len(seqs)} from {path}"
         return seqs
-    #TODO: ASSERT ESM-C PROPER BF16 # and test bf model-wise
-    @torch.inference_mode()
-    def _compute_msa_embeddings(self, a3m_file: Path) -> Tuple[torch.Tensor, float, float]:
-        t_parse = time.perf_counter()
 
-        model, batch_converter = self._get_msa_model(compile_model=self.compile_msa_model)
-        
-        # Time A3M parsing
-        seqs = self._parse_a3m(a3m_file)
-        
-        msa = [(f"seq{i}", s) for i, s in enumerate(seqs)]
-
-        _, _, tok = batch_converter([msa])  # type: ignore[arg-type]
-        tok = tok.to(self._device)
-        a3m_parse_time = time.perf_counter() - t_parse
-
-        # Time actual model computation
-        _t_compute = time.perf_counter()
-        # Optimized autocast context for compiled models
-        with torch.autocast(
-            device_type=self._device.type,
-            dtype=torch.bfloat16,
-            enabled=self._use_bf16,
-        ):
-            # For compiled models, this will be significantly faster
-            rep = model(tok, repr_layers=[12])["representations"][12]
-        
-        embeddings = rep.to(torch.float32).squeeze(0).cpu()  # (N_seq, L+1, d) - keep .cpu() to avoid memory issues
-        msa_compute_time = time.perf_counter() - _t_compute
-        return embeddings, a3m_parse_time, msa_compute_time
-        #NOTE: COMPUTATION NOT BATCH_PARALLELIZED
     def _parse_go_labels(self, go_file_path: Path) -> torch.Tensor:
         """
         Convert the GO IDs inside <ontology>_go.txt into a multi-label tensor.
@@ -218,9 +119,6 @@ class ProteinDataset(Dataset):
         return labels
     
     def __getitem__(self, idx):
-        # Measure full sample preparation time
-        _t0 = time.perf_counter()
-        
         protein_id = self.protein_ids[idx]
         protein_dir = self.split_dir / protein_id
         
@@ -235,31 +133,33 @@ class ProteinDataset(Dataset):
         # ESM-C: Direct tensor (1, L+2, 1152) -> squeeze to (L+2, 1152)
         assert esmc_data.dim() == 3, "ESM-C data should be a 3D tensor"
         esmc_emb = esmc_data.squeeze(0)
-        #track this starting here 
-        # ------------------------------------------------------------------
-        # Measure time spent **inside** the MSA parsing + tokenisation routine
-        # ------------------------------------------------------------------
-        _t_msa = time.perf_counter()
-
+        
+        # Prepare MSA tokens (CPU-only, no embedding computation)
         # Parse A3M file + convert to integer tokens (CPU-only)
         a3m_file = protein_dir / "final_filtered_256_stripped.a3m"
         # 1) FAST text parsing on the worker CPU
-        _t_parse = time.perf_counter()
         seqs = self._parse_a3m(a3m_file)
-        a3m_parse_time = time.perf_counter() - _t_parse
+
+        # ----------------------------------------------------
+        # Optional random subsampling of MSA depth
+        # ----------------------------------------------------
+        if self.msa_sample_size is not None and len(seqs) > self.msa_sample_size:
+            # Always keep the query sequence (first entry) and sample the rest.
+            query_seq = seqs[0]
+            # Randomly sample without replacement from the remaining sequences.
+            sampled_rest = random.sample(seqs[1:], k=self.msa_sample_size - 1)
+            seqs = [query_seq] + sampled_rest
 
         # 2) Batch-converter → integer token tensor (still CPU)
         msa = [(f"seq{i}", s) for i, s in enumerate(seqs)]
         batch_converter = self._get_msa_batch_converter()
         _, _, tok = batch_converter([msa])  # type: ignore[arg-type]
-        msa_tok = tok.squeeze(0).cpu()                  # [N_seq, L_tok] – stays on CPU
-
-        msa_prep_time = time.perf_counter() - _t_msa
-        #track this ending here 
+        msa_tok = tok.squeeze(0)                  # [N_seq, L_tok] – stays on CPU
+        
         # Load labels based on task type from GO text files
         label_file = protein_dir / f"{self.task_type}_go.txt"
         
-            # Parse GO labels from text file format
+        # Parse GO labels from text file format
         labels = self._parse_go_labels(label_file)
             
         # Load protein length info (L.csv just contains a single number on the first line)
@@ -274,14 +174,8 @@ class ProteinDataset(Dataset):
             "sequence_emb": esmc_emb,  # Shape: (L+2, d_model) 
             "msa_tok": msa_tok,
             "length": protein_length,
-            # expose timing so the collate fn can aggregate it later if needed
-            "msa_prep_time": msa_prep_time,
-            "a3m_parse_time": a3m_parse_time,
             "labels": labels,
         }
-
-        # attach timing (seconds) for this sample
-        sample["sample_prep_time"] = time.perf_counter() - _t0
 
         return sample
 
@@ -291,7 +185,7 @@ class ProteinDataModule(LightningDataModule):
     
     Handles two input modalities:
     1. ESM-C embeddings (pre-computed, required as .pt files)
-    2. MSA embeddings (computed on-the-fly from .a3m files)
+    2. MSA tokens (prepared on-the-fly, embeddings computed in model)
     
     Now supports three predefined splits: train, val, test from separate directories.
     """
@@ -306,7 +200,7 @@ class ProteinDataModule(LightningDataModule):
         batch_size: int = 4,    # Updated to 4 as requested
         num_workers: int = 0,
         pin_memory: bool = True,
-        compile_msa_model: bool = True,  # Whether to compile ESM-MSA model
+        msa_sample_size: Optional[int] = None,
     ) -> None:
         """Initialize ProteinDataModule.
 
@@ -315,16 +209,18 @@ class ProteinDataModule(LightningDataModule):
         :param batch_size: Batch size for training
         :param num_workers: Number of data loading workers
         :param pin_memory: Whether to pin memory for GPU transfer
-        :param compile_msa_model: Whether to compile ESM-MSA model for speed
+        :param msa_sample_size: Maximum number of MSA sequences to keep (including query). None ➜ keep all.
         """
         super().__init__()
-        self.save_hyperparameters(logger=False)
+        self.save_hyperparameters(logger=True)
 
         self.data_train: Optional[Dataset] = None
         self.data_val: Optional[Dataset] = None
         self.data_test: Optional[Dataset] = None
 
         self.batch_size_per_device = batch_size
+        # Expose requested MSA subsampling size in hyperparameters
+        self.hparams.msa_sample_size = msa_sample_size
         
         # Store protein IDs for each split
         self.train_protein_ids: List[str] = []
@@ -466,7 +362,7 @@ class ProteinDataModule(LightningDataModule):
                 protein_ids=self.train_protein_ids,
                 task_type=self.hparams.task_type,
                 split="train",
-                compile_msa_model=self.hparams.compile_msa_model
+                msa_sample_size=self.hparams.msa_sample_size,
             )
             
             # ---------------------------------------------------------
@@ -496,7 +392,7 @@ class ProteinDataModule(LightningDataModule):
                 protein_ids=self.val_protein_ids,
                 task_type=self.hparams.task_type,
                 split="val",
-                compile_msa_model=self.hparams.compile_msa_model
+                msa_sample_size=self.hparams.msa_sample_size,
             )
             
             self.data_test = ProteinDataset(
@@ -504,7 +400,7 @@ class ProteinDataModule(LightningDataModule):
                 protein_ids=self.test_protein_ids,
                 task_type=self.hparams.task_type,
                 split="test",
-                compile_msa_model=self.hparams.compile_msa_model
+                msa_sample_size=self.hparams.msa_sample_size,
             )
 
     def train_dataloader(self) -> DataLoader[Any]:
@@ -578,8 +474,6 @@ def protein_collate(batch):
     at index `length + 1` without running out-of-bounds.
     """
 
-    t0 = time.perf_counter()
-
     protein_ids = [it["protein_id"] for it in batch]
     sequences   = [it["sequence"]    for it in batch]
     lengths     = [it["length"]      for it in batch]   # residue counts (no CLS/EOS)
@@ -608,7 +502,7 @@ def protein_collate(batch):
     sequence_emb = torch.stack(seq_emb_padded)    # [B, L_max_seq, d_model]
 
     # `msa_tok` left as list for per-sample processing later
-    labels = torch.stack([it["labels"] for it in batch], dim=0)
+    labels = torch.stack([it["labels"] for it in batch])
 
     pad_mask = torch.tensor(
         [[i >= l + 2 for i in range(max_len_seq)] for l in lengths],
@@ -620,11 +514,6 @@ def protein_collate(batch):
     # ----------------------------------------------------
     # 4) Timing aggregation
     # ----------------------------------------------------
-    sample_prep_total = sum(float(it.get("sample_prep_time", 0.0)) for it in batch)
-    msa_prep_total    = sum(float(it.get("msa_prep_time", 0.0))    for it in batch)
-    a3m_parse_total   = sum(float(it.get("a3m_parse_time", 0.0))   for it in batch)
-
-    collate_time = time.perf_counter() - t0
 
     return {
         "protein_id": protein_ids,
@@ -634,7 +523,4 @@ def protein_collate(batch):
         "labels": labels,
         "pad_mask": pad_mask,
         "lengths": lengths_tensor,
-        "prep_time": sample_prep_total + collate_time,
-        "msa_prep_time": msa_prep_total,
-        "a3m_parse_time": a3m_parse_total,
     }

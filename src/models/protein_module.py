@@ -25,35 +25,6 @@ def get_num_classes_for_task(task_type: str) -> int:
     class_counts = {"mf": 489, "bp": 1943, "cc": 320}
     return class_counts[task_type]
 
-############################################################
-#  Low-level building blocks
-############################################################
-
-class RowDropout(nn.Module):
-    """
-    Zero out entire MSA rows.  Probability decays to zero when the
-    alignment has fewer than `min_keep` sequences.
-    The query row (index 0) is always kept.
-    """
-    def __init__(self, p: float = 0.15, min_keep: int = 48):
-        super().__init__()
-        self.base_p   = p
-        self.min_keep = min_keep
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if not self.training:
-            return x
-
-        B, N_seq, _, _ = x.shape
-        # linear annealing: p → 0 as N_seq ↓
-        p_eff = self.base_p * min(1.0, N_seq / self.min_keep)
-        if p_eff == 0:
-            return x
-
-        mask = torch.rand(B, N_seq, 1, 1, device=x.device) > p_eff
-        mask[:, 0, :, :] = 1.0                     # keep query
-        return x * mask                      # no rescaling
-
 
 class ResidualFeedForward(nn.Module):
     """Transformer-style position-wise FFN with residual + layer norm."""
@@ -130,18 +101,18 @@ class SequenceEncoder(nn.Module):
         )
         self.tr = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
 
-    def forward(self, x: torch.Tensor, src_key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, pad_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Forward pass with pre-computed ESM-C embeddings.
         
         Args:
             x: Pre-computed ESM-C embeddings [B, L, d_model]
-            src_key_padding_mask: [B, L] True where padded
+            pad_mask: [B, L] True where padded
             
         Returns:
             Enhanced sequence representations [B, L, d_model]
         """
         x = self.embed_drop(x)                 # ➋ new dropout point
-        x = self.tr(x, src_key_padding_mask=src_key_padding_mask)
+        x = self.tr(x, src_key_padding_mask=pad_mask)
         
         return x  # [B, L, d_model]
 
@@ -168,7 +139,6 @@ class MSAEncoder(nn.Module):
         self,
         d_msa: int = 768,
         d_model: int = 1152,
-        p_row: float = 0.15,    # dropout prob for individual MSA rows
         p_chan: float = 0.10,   # channel dropout prob 
         p_feat: float = 0.10,   # feature dropout after projection
     ):
@@ -177,9 +147,6 @@ class MSAEncoder(nn.Module):
         # 0) Learnable EOS token shared across rows
         self.eos_token = nn.Parameter(torch.zeros(1, 1, 1, d_msa))
         nn.init.normal_(self.eos_token, std=0.02)
-        
-        # 1) Row-level dropout (zeros individual sequences)
-        self.row_dropout = RowDropout(p_row, min_keep=48)
         
         # 2) Standard element-wise dropout on the embedding vector
         self.channel_dropout = nn.Dropout(p_chan)
@@ -207,8 +174,6 @@ class MSAEncoder(nn.Module):
         lengths: torch.Tensor,   # [B]  true residue counts (no CLS/EOS)
         pad_mask: torch.Tensor,  # [B, L] True where padded
     ) -> torch.Tensor:
-        msa = msa.clone()
-
         # ------------------------------------------------------------
         # Insert EOS (learnable) at position L+1  — truly in-place
         # ------------------------------------------------------------
@@ -222,11 +187,6 @@ class MSAEncoder(nn.Module):
         # 2) scatter the EOS token into the msa along dim-2
         msa.scatter_(2, idx, eos_tok) 
 
-
-        # ------------------------------------------------------------
-        # 1. Row dropout  ─── 2. Channel dropout  ─── 3-5. Rest
-        # ------------------------------------------------------------
-        msa     = self.row_dropout(msa)
         msa     = self.channel_dropout(msa)
 
         scores  = self.conservation_head(msa).squeeze(-1)     # [B, N_seq, L_pad]
@@ -262,12 +222,6 @@ class MSAEncoder(nn.Module):
 ############################################################
 
 class CrossModalAttention(nn.Module):
-    """Attend each modality to the other modality.
-
-    This is a simple stacked MultiHeadAttention mechanism for ESM and MSA modalities only.
-    Uses Pre-LN for better gradient stability and bi-directional cross-attention.
-    """
-
     def __init__(self, d_model: int = 1152, n_heads: int = 8, n_layers: int = 2, dropout: float = 0.1):
         super().__init__()
         self.layers = nn.ModuleList()
@@ -316,11 +270,6 @@ class CrossModalAttention(nn.Module):
 ############################################################
 
 class ProteinLitModule(LightningModule):
-    """LightningModule for multi-modal protein function prediction.
-
-    Optimized implementation with simplified MSA model management and removed CUDA streams.
-    """
-
     def __init__(
         self,
         task_type: str,                       # Task type: "mf", "bp", or "cc" - required
@@ -331,16 +280,14 @@ class ProteinLitModule(LightningModule):
         n_heads: int = 8,                     # Attention heads
         dropout: float = 0.1,                 # Dropout rate
         # MSA Encoder dropout parameters
-        p_row: float = 0.15,                  # Row dropout probability (individual MSA sequences)
         p_chan: float = 0.15,                 # Channel dropout probability (AlphaFold-style)
         p_feat: float = 0.10,                 # Feature dropout after MSA projection
         optimizer: Optional[Any] = None,      # Hydra optimizer config
         scheduler: Optional[Any] = None,      # Hydra scheduler config  
-        debugging: bool = True,               # Default to debugging mode (disables compilation)
         warmup_ratio: float = 0.05,           # Warmup ratio for cosine schedule (5% of total training steps)
     ) -> None:
         super().__init__()
-        self.save_hyperparameters(logger=False)
+        self.save_hyperparameters(logger=True)
 
         # Store task type for easy access
         self.task_type = task_type
@@ -348,8 +295,8 @@ class ProteinLitModule(LightningModule):
         # Load MSA model - NO STREAM NEEDED
         import esm
         self.msa_model, _ = esm.pretrained.esm_msa1b_t12_100M_UR50S()
-        self.msa_model.eval()
-
+        self.msa_model.eval().requires_grad_(False)
+        
         # Encoders
         self.seq_encoder = SequenceEncoder(
             d_model=d_model,
@@ -360,7 +307,6 @@ class ProteinLitModule(LightningModule):
         self.msa_encoder = MSAEncoder(
             d_msa=d_msa,
             d_model=d_model,
-            p_row=p_row,
             p_chan=p_chan,
             p_feat=p_feat
         )
@@ -396,19 +342,8 @@ class ProteinLitModule(LightningModule):
     def setup(self, stage: str) -> None:
         """Setup hook handles MSA model device movement and compilation."""
         if stage == "fit":
-            # Move and compile model            
-            if not self.hparams.debugging:
-                print(f"🚀 Compiling ESM-MSA model on device: {self.device}")
-                self.msa_model = torch.compile(
-                    self.msa_model,
-                    mode='reduce-overhead',
-                    fullgraph=True,
-                    dynamic=True
-                )
-                print("✅ ESM-MSA model compiled successfully")
-            else:
-                print("🐛 Debugging mode: MSA model compilation disabled")
-                
+            # MSA model compilation disabled by default for easier debugging
+            print("🐛 MSA model compilation disabled for easier debugging and development")
             print(f"✅ ESM-MSA model loaded on {self.device}")
 
     # ---------------------------------------------------------------------
@@ -425,7 +360,7 @@ class ProteinLitModule(LightningModule):
         # Compute MSA embeddings on-the-fly (sequential, per-sample)
         target_len = seq_emb.shape[1]  # CLS + residues + EOS (same as pad_mask width)
         msa_emb, msa_compute_time = self._compute_msa_embeddings(msa_tok_list, target_len)  # [B, N_seq_max, target_len, d_msa]
-        
+        msa_emb = msa_emb.clone()
         # Expose timing so callbacks (e.g., BatchTimer) can log it **after** the forward pass.
         # Storing it on `self` ensures it is available in hooks such as `on_before_backward`.
         self._last_msa_compute_time = msa_compute_time
@@ -438,7 +373,7 @@ class ProteinLitModule(LightningModule):
         seq_pad_mask = pad_mask
 
         # Encode each modality with padding masks
-        seq_z = self.seq_encoder(seq_emb, src_key_padding_mask=seq_pad_mask)  # [B, L, d]
+        seq_z = self.seq_encoder(seq_emb, pad_mask=seq_pad_mask)  # [B, L, d]
         msa_z = self.msa_encoder(msa_emb, batch["lengths"], pad_mask=msa_pad_mask)  # [B, L, d]
 
         # Cross-modal attention with padding masks
@@ -485,20 +420,18 @@ class ProteinLitModule(LightningModule):
 
         for tok in msa_tok_list:
             # Move single sample to device and add batch dim expected by ESM-MSA
-            tok_gpu = tok.to(self.device, non_blocking=True).unsqueeze(0)  # [1, N_seq, L]
+            tok = tok.unsqueeze(0)  # [1, N_seq, L]
 
-            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                rep = self.msa_model(tok_gpu, repr_layers=[12])["representations"][12]
+            rep = self.msa_model(tok, repr_layers=[12])["representations"][12]
 
             rep = rep.squeeze(0)      # [N_seq, L, d_msa]
             reps.append(rep)
 
             # Track largest shapes for padding later
             max_n_seq = max(max_n_seq, rep.shape[0])
-            max_L     = max(max_L, rep.shape[1])
 
         # Ensure horizontal padding matches desired target_len
-        max_L = max(max_L, target_len)
+        max_L = target_len
 
         # ---------------------------------------------------------
         # Pad each representation to [max_n_seq, max_L, d_msa]
@@ -507,7 +440,7 @@ class ProteinLitModule(LightningModule):
         for rep in reps:
             n_seq, L, D = rep.shape
             if n_seq < max_n_seq or L < max_L:
-                padded = rep.new_zeros(max_n_seq, max_L, D)
+                padded = rep.new_zeros(max_n_seq, max_L, D) #TODO: CONSIDER PADDING TOKEN
                 padded[:n_seq, :L] = rep
                 rep = padded
             padded_reps.append(rep)
@@ -541,8 +474,8 @@ class ProteinLitModule(LightningModule):
 
         # Store for epoch-wise CAFA metrics computation
         # Convert to fp32 before CPU transfer to avoid bf16 → numpy issues
-        self._val_logits.append(logits.float().detach().cpu())   # keep raw, no sigmoid
-        self._val_labels.append(labels.float().detach().cpu())
+        self._val_logits.append(logits.detach().cpu())   # keep raw, no sigmoid
+        self._val_labels.append(labels.detach().cpu())
         
     def test_step(self, batch: Dict[str, Any], batch_idx: int):
         logits, labels = self.forward(batch)
@@ -553,8 +486,8 @@ class ProteinLitModule(LightningModule):
  
         # Store for epoch-wise CAFA metrics computation
         # Convert to fp32 before CPU transfer to avoid bf16 → numpy issues
-        self._test_logits.append(logits.float().detach().cpu())   # keep raw, no sigmoid
-        self._test_labels.append(labels.float().detach().cpu())
+        self._test_logits.append(logits.detach().cpu())   # keep raw, no sigmoid
+        self._test_labels.append(labels.detach().cpu())
 
     def _heal_metrics(self, logits, labels): 
         probs = torch.sigmoid(logits).numpy()
@@ -600,8 +533,10 @@ class ProteinLitModule(LightningModule):
     def configure_optimizers(self):
         if self.hparams.optimizer is None:
             raise ValueError("Optimizer must be provided in hparams")
-            
-        optimizer = self.hparams.optimizer(params=self.parameters())
+
+        trainable_params = [p for p in self.parameters() if p.requires_grad]
+
+        optimizer = self.hparams.optimizer(params=trainable_params)
 
         # Get total steps
         total_steps = self.trainer.estimated_stepping_batches
@@ -610,10 +545,10 @@ class ProteinLitModule(LightningModule):
         warmup_steps = int(self.hparams.warmup_ratio * total_steps)
 
         if self.hparams.scheduler is not None:
-            scheduler_fn = self.hparams.scheduler
+            scheduler_fn = self.hparams.scheduler 
             scheduler = scheduler_fn(
                 optimizer=optimizer,
-                num_warmup_steps=warmup_steps,
+                num_warmup_steps=warmup_steps, #TODO: ACCUMILATE GRAD
                 num_training_steps=total_steps,
             )
 

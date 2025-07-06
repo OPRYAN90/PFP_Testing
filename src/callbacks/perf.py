@@ -45,7 +45,7 @@ class BatchTimer(Callback):
         Parameters
         ----------
         json_path: str
-            Path to the JSON file that will hold two keys: ``dataloader_times`` and ``forward_times``.
+            Path to the JSON file that will hold three keys: ``dataloader_times``, ``forward_times``, and ``msa_compute_times``.
             The file is (re)written after every ``flush_every_n`` updates.
         flush_every_n: int
             Frequency (in number of recorded values) at which the JSON file is rewritten.
@@ -57,11 +57,7 @@ class BatchTimer(Callback):
         # In-memory storage
         self.dataloader_times = []
         self.forward_times = []
-        self.prep_times = []  # complete batch-prep (dataset + collate)
-        # New: time spent on the MSA embedding step for each batch
-        self.msa_times = []
-        # New: detailed timing for A3M parsing and MSA computation
-        self.a3m_parse_times = []
+        # Time spent on the MSA embedding step for each batch
         self.msa_compute_times = []
 
         # Internal timers (initialize as floats to avoid Optional complaints)
@@ -78,9 +74,6 @@ class BatchTimer(Callback):
             tmp = {
                 "dataloader_times": self.dataloader_times,
                 "forward_times": self.forward_times,
-                "prep_times": self.prep_times,
-                "msa_times": self.msa_times,
-                "a3m_parse_times": self.a3m_parse_times,
                 "msa_compute_times": self.msa_compute_times,
             }
             # We overwrite the whole file each time to keep a valid JSON at all times.
@@ -96,17 +89,11 @@ class BatchTimer(Callback):
                 data = json.loads(self.json_path.read_text())
                 self.dataloader_times = data.get("dataloader_times", [])
                 self.forward_times = data.get("forward_times", [])
-                self.prep_times = data.get("prep_times", [])
-                self.msa_times = data.get("msa_times", [])
-                self.a3m_parse_times = data.get("a3m_parse_times", [])
                 self.msa_compute_times = data.get("msa_compute_times", [])
             except Exception:
                 # Any corruption → start fresh (don't crash training)
                 self.dataloader_times = []
                 self.forward_times = []
-                self.prep_times = []
-                self.msa_times = []
-                self.a3m_parse_times = []
                 self.msa_compute_times = []
 
         self.prev_batch_end = time.perf_counter()  # t = 0
@@ -122,38 +109,6 @@ class BatchTimer(Callback):
         # Persist
         self.dataloader_times.append(dl_time)
         self._maybe_flush(trainer)
-
-        # Extract prep time (if available) and log it
-        prep_time = batch.get("prep_time")
-        if prep_time is not None:
-            self.prep_times.append(prep_time)
-            if trainer.logger:
-                trainer.logger.log_metrics({"time/prep": prep_time}, step=trainer.global_step)
-            self._maybe_flush(trainer)
-
-        # Extract MSA embedding time (if available)
-        msa_time = batch.get("msa_time")
-        if msa_time is not None:
-            self.msa_times.append(msa_time)
-            if trainer.logger:
-                trainer.logger.log_metrics({"time/msa": msa_time}, step=trainer.global_step)
-            self._maybe_flush(trainer)
-
-        # Extract A3M parsing time (if available)
-        a3m_parse_time = batch.get("a3m_parse_time")
-        if a3m_parse_time is not None:
-            self.a3m_parse_times.append(a3m_parse_time)
-            if trainer.logger:
-                trainer.logger.log_metrics({"time/a3m_parse": a3m_parse_time}, step=trainer.global_step)
-            self._maybe_flush(trainer)
-
-        # Extract MSA compute time (if available)
-        msa_compute_time = batch.get("msa_compute_time")
-        if msa_compute_time is not None:
-            self.msa_compute_times.append(msa_compute_time) 
-            if trainer.logger:
-                trainer.logger.log_metrics({"time/msa_compute": msa_compute_time}, step=trainer.global_step)
-            self._maybe_flush(trainer)
 
         # Start forward timer
         self._t0 = now

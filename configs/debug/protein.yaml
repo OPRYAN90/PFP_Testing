@@ -24,7 +24,7 @@ trainer:
 
 # Override model for debugging
 model:
-  debugging: True  # Enable debugging mode (disables torch.compile)
+  # Compilation disabled by default for easier debugging and development
   
 # Override data for debugging
 data:

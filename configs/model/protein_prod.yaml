@@ -14,8 +14,7 @@ label_smoothing: 0.1  # Slightly higher for production robustness
 # p_chan: 0.15     # Channel dropout probability (AlphaFold-style) - hardcoded in MSAEncoder  
 # p_feat: 0.10     # Feature dropout after projection - hardcoded in MSAEncoder
 
-# Compilation setting (consistent naming)
-debugging: false  # Production mode (enables torch.compile for speed)
+# Compilation disabled by default for easier debugging and development
 
 # Optimizer configuration - more aggressive for production
 optimizer:

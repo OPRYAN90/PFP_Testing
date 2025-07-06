@@ -9,11 +9,9 @@ n_heads: 8             # Attention heads for all transformer layers
 dropout: 0.15           # General dropout rate for model components
 task_type: ${data.task_type}         # Task type: "mf", "bp", or "cc" - automatically from data config
 # Training parameters  
-debugging: true       # Enable debugging mode (disables torch.compile for easier debugging)
 warmup_ratio: 0.05     # Warmup ratio for cosine schedule (5% of total training steps)
 
 # MSA Encoder specific dropout parameters (now configurable!)
-p_row: 0.15            # Row dropout probability (drops individual MSA sequences)  
 p_chan: 0.10           # Channel dropout probability (AlphaFold-style embedding dropout)
 p_feat: 0.10           # Feature dropout after MSA projection
 
