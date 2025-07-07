@@ -457,11 +457,11 @@ class ProteinLitModule(LightningModule):
         logits, labels = self.forward(batch)
         loss = self.loss_fn(logits, labels)
         
-        # Update metrics
+        # Update running mean metric
         self.train_loss(loss)
-        
-        # Log metrics
-        self.log("train/loss", self.train_loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
+
+        # Log the raw loss for the current step (avoid computing MeanMetric prematurely)
+        self.log("train/loss_step", loss, on_step=True, prog_bar=True, sync_dist=True)
 
         return loss
 
@@ -474,8 +474,8 @@ class ProteinLitModule(LightningModule):
 
         # Store for epoch-wise CAFA metrics computation
         # Convert to fp32 before CPU transfer to avoid bf16 → numpy issues
-        self._val_logits.append(logits.detach().cpu())   # keep raw, no sigmoid
-        self._val_labels.append(labels.detach().cpu())
+        self._val_logits.append(logits.detach().float().cpu())   # keep raw, no sigmoid
+        self._val_labels.append(labels.detach().float().cpu())
         
     def test_step(self, batch: Dict[str, Any], batch_idx: int):
         logits, labels = self.forward(batch)
@@ -486,8 +486,8 @@ class ProteinLitModule(LightningModule):
  
         # Store for epoch-wise CAFA metrics computation
         # Convert to fp32 before CPU transfer to avoid bf16 → numpy issues
-        self._test_logits.append(logits.detach().cpu())   # keep raw, no sigmoid
-        self._test_labels.append(labels.detach().cpu())
+        self._test_logits.append(logits.detach().float().cpu())   # keep raw, no sigmoid
+        self._test_labels.append(labels.detach().float().cpu())
 
     def _heal_metrics(self, logits, labels): 
         probs = torch.sigmoid(logits).numpy()
@@ -514,7 +514,7 @@ class ProteinLitModule(LightningModule):
 
         # Convert numpy scalars to Python floats for logging
         self.log_dict({
-            "val/loss": self.val_loss,
+            "val/loss": float(self.val_loss.compute()),
             "val/AUPR_macro": float(macro),
             "val/AUPR_micro": float(micro), 
             "val/Fmax": float(fmax),
@@ -565,6 +565,9 @@ class ProteinLitModule(LightningModule):
 
     def on_train_epoch_end(self) -> None:
         """Lightning hook that is called when a training epoch ends."""
+        # Log aggregated training loss _after_ all updates have occurred this epoch
+        self.log("train/loss_epoch", self.train_loss.compute(), prog_bar=True, sync_dist=True)
+        # Reset for next epoch
         self.train_loss.reset()
 
     def on_test_epoch_end(self) -> None:
@@ -575,7 +578,7 @@ class ProteinLitModule(LightningModule):
 
         # Convert numpy scalars to Python floats for logging
         self.log_dict({
-            "test/loss": self.test_loss,
+            "test/loss": float(self.test_loss.compute()),
             "test/AUPR_macro": float(macro),
             "test/AUPR_micro": float(micro),
             "test/Fmax": float(fmax),

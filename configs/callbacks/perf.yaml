@@ -2,11 +2,11 @@
 perf_timer:
   _target_: callbacks.perf.BatchTimer
 
-device_stats:
-  _target_: lightning.pytorch.callbacks.DeviceStatsMonitor
-  cpu_stats: true          # also track host CPU util
+# device_stats:
+#   _target_: lightning.pytorch.callbacks.DeviceStatsMonitor
+#   cpu_stats: true          # also track host CPU util
 
-throughput:
-  _target_: lightning.pytorch.callbacks.throughput_monitor.ThroughputMonitor
-  batch_size_fn:
-    _target_: callbacks.perf.BatchSizeFn 
+# throughput:
+#   _target_: lightning.pytorch.callbacks.throughput_monitor.ThroughputMonitor
+#   batch_size_fn:
+#     _target_: callbacks.perf.BatchSizeFn 

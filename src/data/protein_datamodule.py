@@ -88,6 +88,7 @@ class ProteinDataset(Dataset):
         """
         # 1. fetch / cache mapping ------------------------------------------------
         if self.task_type not in self._go_dicts:
+            print(f"🔧 Populating GO mapping for '{self.task_type}' in process...")
             # TSV file is in the parent directory of data_dir (same as in get_num_classes)
             tsv_path = self.data_dir.parent / "nrPDB-GO_2019.06.18_annot.tsv"
             self._go_dicts[self.task_type] = load_go_dict(tsv_path, self.task_type)
@@ -340,6 +341,16 @@ class ProteinDataModule(LightningDataModule):
                     f"Batch size ({self.hparams.batch_size}) is not divisible by the number of devices ({self.trainer.world_size})."
                 )
             self.batch_size_per_device = self.hparams.batch_size // self.trainer.world_size
+
+        from src.data.protein_datamodule import load_go_dict
+        
+        # Ensure _go_dicts is populated for the current task_type in main process
+        if self.hparams.task_type not in ProteinDataset._go_dicts:
+            print(f"🔧 Populating GO mapping for '{self.hparams.task_type}' in main process...")
+            data_base_dir = Path(self.hparams.data_dir).parent
+            tsv_path = data_base_dir / "nrPDB-GO_2019.06.18_annot.tsv"
+            ProteinDataset._go_dicts[self.hparams.task_type] = load_go_dict(tsv_path, self.hparams.task_type)
+            print(f"✅ GO mapping loaded: {len(ProteinDataset._go_dicts[self.hparams.task_type])} terms")
 
         # Load datasets only if not already loaded
         if not self.data_train and not self.data_val and not self.data_test:
