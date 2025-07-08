@@ -44,12 +44,7 @@ class ProteinDataset(Dataset):
     @classmethod
     def _get_msa_batch_converter(cls):
         """Return a cached ESM-MSA batch-converter **without** loading the
-        large 100 M parameter model.
-
-        We try to obtain the Alphabet object directly (⇾ tiny) and fall back
-        to the pretrained helper only if the direct route fails.  This keeps
-        worker memory low and avoids any accidental CUDA initialisation in
-        DataLoader workers.
+        large model.
         """
         if cls._msa_batch_conv is not None:
             return cls._msa_batch_conv
@@ -88,7 +83,6 @@ class ProteinDataset(Dataset):
         """
         # 1. fetch / cache mapping ------------------------------------------------
         if self.task_type not in self._go_dicts:
-            print(f"🔧 Populating GO mapping for '{self.task_type}' in process...")
             # TSV file is in the parent directory of data_dir (same as in get_num_classes)
             tsv_path = self.data_dir.parent / "nrPDB-GO_2019.06.18_annot.tsv"
             self._go_dicts[self.task_type] = load_go_dict(tsv_path, self.task_type)
@@ -465,18 +459,11 @@ class ProteinDataModule(LightningDataModule):
 # ======================================================================
 
 def protein_collate(batch):
-    """Collate function for *token* MSA representation.
-
+    """Collate function for protein data.
     Pads:
     1. Pre-computed ESM-C embeddings  → shape [B, L_max_seq, d_model]
-    2. Integer MSA tokens            → shape [B, N_seq_max, L_max_seq]
-
-    The resulting `L_max_seq` is **identical** for both modalities, derived
-    exclusively from the sequence-embedding length (CLS + residues + EOS).
-    This guarantees that downstream encoders can safely scatter an EOS token
-    at index `length + 1` without running out-of-bounds.
+    2. Integer MSA tokens            → shape [B, N_seq_max, L_max_seq] 
     """
-
     protein_ids = [it["protein_id"] for it in batch]
     sequences   = [it["sequence"]    for it in batch]
     lengths     = [it["length"]      for it in batch]   # residue counts (no CLS/EOS)

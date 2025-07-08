@@ -2,19 +2,14 @@ _target_: src.data.protein_datamodule.ProteinDataModule
 data_dir: ${paths.data_dir}/PDBCH
 
 # Task configuration - choose one: "mf", "bp", "cc"
-task_type: "mf"        # Molecular Function (489 classes)
-# task_type: "bp"      # Biological Process (1943 classes) 
-# task_type: "cc"      # Cellular Component (320 classes)
+task_type: "mf"       
 
-# Batch size (recommended per task based on label space size)
-# MF (489 classes): 4-6 batch size works well
-# BP (1943 classes): 2-3 batch size (large label space needs more memory)  
-# CC (320 classes): 6-8 batch size (smaller label space, can use larger batches)
+# MF (489 classes):
+# BP (1943 classes):
+# CC (320 classes): 
 batch_size: 32          # TODO: CHANGE THIS
 msa_sample_size: 32
 # Data loading parameters
 num_workers: 16         #NOTE CONSIDER CHANING
 pin_memory: true       # Pin memory for faster GPU transfer
-# Task-specific batch size recommendations (uncomment when switching tasks):
-# For BP task: batch_size: 2
-# For CC task: batch_size: 6
+

@@ -119,20 +119,11 @@ class SequenceEncoder(nn.Module):
 #TODO: TEST BOTH with and without negative examples in dataset
 class MSAEncoder(nn.Module):
     """Encoder for Multiple Sequence Alignment (MSA) embeddings.
-
     Expected input: msa [B, N_seq, L_cls+res, d_msa] (already includes CLS at col 0)
     - B: batch size
     - N_seq: alignment depth (≈256) 
     - L_cls+res: CLS token + residue length
     - d_msa: embedding dim from MSA-Transformer (≈768)
-
-    Processing steps:
-    0. Append learnable EOS token → [B, N_seq, L_cls+res+eos, d_msa]
-    1. Row-dropout – randomly drop individual homologous sequences
-    2. Channel dropout – AlphaFold-style embedding channel dropout
-    3. Learn conservation scores over the alignment depth  
-    4. Softmax-weighted average → [B, L_cls+res+eos, d_msa]
-    5. MLP-->Post-FFN-->Final-Projection
     """
     
     def __init__(
@@ -538,13 +529,12 @@ class ProteinLitModule(LightningModule):
 
         optimizer = self.hparams.optimizer(params=trainable_params)
 
-        # Get total steps
-        total_steps = self.trainer.estimated_stepping_batches
-        print(f"Total steps: {total_steps}")
-        # Warmup steps
-        warmup_steps = int(self.hparams.warmup_ratio * total_steps)
-
         if self.hparams.scheduler is not None:
+            # Get total steps
+            total_steps = self.trainer.estimated_stepping_batches
+            print(f"Total steps: {total_steps}")
+            # Warmup steps
+            warmup_steps = int(self.hparams.warmup_ratio * total_steps)
             scheduler_fn = self.hparams.scheduler 
             scheduler = scheduler_fn(
                 optimizer=optimizer,

@@ -24,7 +24,7 @@ optimizer:
   betas: [0.9, 0.999]  # AdamW momentum parameters
   eps: 1e-8            # Numerical stability epsilon
 
-# Learning rate scheduler configuration  
+# # Learning rate scheduler configuration  
 scheduler:
   _target_: src.utils.lr_schedulers.get_cosine_schedule_with_warmup
   _partial_: true      # Hydra will provide missing arguments (optimizer, num_training_steps, num_warmup_steps)
