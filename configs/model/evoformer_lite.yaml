@@ -1,0 +1,33 @@
+_target_: src.models.evoformer_lite_msa_seq.ProteinLitModule
+
+# Model architecture parameters
+d_model: 1152            # Base model dimension (ESM embeddings size)
+d_msa: 768               # MSA embedding dimension (ESM-MSA output)
+n_blocks: 2              # Number of Evoformer-Lite blocks
+n_heads: 8               # Attention heads for all attention layers
+dropout: 0.125           # General dropout rate for model components
+in_dropout: 0.10          # Dropout applied to inputs before Evoformer-Lite
+row_attn_dropout: 0.10    # Dropout for row self-attention
+rowwise_dropout: 0.15     # Row-wise dropout mask (shared across sequences)
+col_attn_dropout: 0.10    # Dropout for column self-attention
+columnwise_dropout: 0.15  # Column-wise dropout mask (shared across residues)
+
+# Task and training parameters
+task_type: ${data.task_type}   # Task type: "mf", "bp", or "cc" (inferred from data config)
+warmup_ratio: 0.075            # Warm-up ratio for cosine LR schedule
+
+# Optimizer configuration (identical to protein.yaml)
+optimizer:
+  _target_: torch.optim.AdamW
+  _partial_: true
+  lr: 1e-4          # Learning rate – tune per task if necessary
+  weight_decay: 1e-2  # L2 regularisation
+  betas: [0.9, 0.999]
+  eps: 1e-8
+
+# Learning-rate scheduler configuration (identical to protein.yaml)
+scheduler:
+  _target_: src.utils.lr_schedulers.get_cosine_schedule_with_warmup
+  _partial_: true      # Hydra will inject (optimizer, num_training_steps, num_warmup_steps)
+  num_cycles: 0.5      # Single half-cosine cycle
+  last_epoch: -1       # Start fresh (-1) 

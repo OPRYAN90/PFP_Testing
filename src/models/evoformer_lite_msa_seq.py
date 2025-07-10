@@ -62,42 +62,154 @@ class MLPHead(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
 
+# -----------------------------------------------------------------------------
+#  AlphaFold-style dropout helpers (faithful to original Evoformer)
+# -----------------------------------------------------------------------------
+class RowwiseDropout(nn.Module):
+    """Dropout whose mask is broadcast along the N_seq dimension."""
+    def __init__(self, p: float):
+        super().__init__()
+        self.p = p
+        self._drop = nn.Dropout(p)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # x: [B, N_seq, L_res, D]
+        if (not self.training) or self.p == 0.0:
+            return x
+        # Share mask over sequences (axis-1)
+        mask = torch.ones_like(x[:, :1, :, :])
+        return x * self._drop(mask)
+
+class ColumnwiseDropout(nn.Module):
+    """Dropout whose mask is broadcast along the L_res dimension."""
+    def __init__(self, p: float):
+        super().__init__()
+        self.p = p
+        self._drop = nn.Dropout(p)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # x: [B, N_seq, L_res, D]
+        if (not self.training) or self.p == 0.0:
+            return x
+        # Share mask over residues (axis-2)
+        mask = torch.ones_like(x[:, :, :1, :])
+        return x * self._drop(mask)
 
 ############################################################
 #  Canonical Evoformer-Lite Implementation
 ############################################################
 
 class _RowSelfAttention(nn.Module):
-    """Self-attention along the **residue** dimension for every MSA row."""
+    """AlphaFold-faithful row self-attention (gated, row-wise dropout)."""
 
-    def __init__(self, d_model: int, n_heads: int, dropout: float):
+    def __init__(self, d_model: int, n_heads: int, attn_dropout: float, rowwise_dropout: float):
         super().__init__()
         self.norm = nn.LayerNorm(d_model)
-        self.attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
 
-    def forward(self, x: torch.Tensor, pad_mask: Optional[torch.Tensor]):
+        # Bias-less QKV projection, disable default out-proj
+        # Keep bias terms in Q/K/V projection for strict AlphaFold parity
+        self.attn = nn.MultiheadAttention(
+            d_model, n_heads, dropout=attn_dropout, batch_first=True, bias=False
+        )
+        W = torch.eye(
+            self.attn.embed_dim,
+            dtype=self.attn.out_proj.weight.dtype,
+            device=self.attn.out_proj.weight.device,
+        )
+        with torch.no_grad():
+            self.attn.out_proj.weight.copy_(W)
+            if self.attn.out_proj.bias is not None:
+                self.attn.out_proj.bias.zero_()
+        self.attn.out_proj.weight.requires_grad_(False)
+        if self.attn.out_proj.bias is not None:
+            self.attn.out_proj.bias.requires_grad_(False)
+
+        # AlphaFold initialisation
+        # Gated linear projections
+        self.out_proj  = nn.Linear(d_model, d_model, bias=True)
+        self.gate_proj = nn.Linear(d_model, d_model, bias=True)
+        nn.init.zeros_(self.out_proj.bias)
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.gate_proj.weight)
+        nn.init.constant_(self.gate_proj.bias, 1.0)
+
+        # Row-wise dropout (mask shared across sequences)
+        self.dropout = RowwiseDropout(rowwise_dropout)
+
+    def forward(
+        self,
+        x: torch.Tensor,                       # [B, N, L, D]
+        seq_pad_mask: torch.Tensor,            # sequence PAD (columns)
+    ):
+        """Row attention; masks sequences using seq_pad_mask (True → PAD)."""
         B, N, L, D = x.shape
-        x_flat = x.reshape(B * N, L, D)
-        pad_flat = None if pad_mask is None else pad_mask.unsqueeze(1).expand(B, N, L).reshape(B * N, L)
-        y, _ = self.attn(self.norm(x_flat), self.norm(x_flat), self.norm(x_flat), key_padding_mask=pad_flat)
-        return x + y.reshape(B, N, L, D)
+        x_norm = self.norm(x)
 
+        # Fold rows into batch so attention is across sequence rows per residue
+        qkv = x_norm.permute(0, 2, 1, 3).reshape(B * L, N, D)  # [B·L, N, D]
+
+        # Build key-padding mask for padded sequence rows (True → PAD)
+        key_pad = seq_pad_mask.unsqueeze(1).expand(-1, L, -1).reshape(B * L, N)
+
+        attn_out, _ = self.attn(
+            qkv, qkv, qkv,
+            key_padding_mask=key_pad,
+            need_weights=False,
+        )
+        attn_out = attn_out.reshape(B, L, N, D).permute(0, 2, 1, 3)            # [B,N,L,D]
+
+        h    = self.out_proj(attn_out)
+        gate = torch.sigmoid(self.gate_proj(x_norm))
+        return x + self.dropout(gate * h)
 
 class _ColSelfAttention(nn.Module):
-    """Self-attention along the **sequence-row** dimension for every residue column."""
+    """AlphaFold-faithful column self-attention (gated, column-wise dropout)."""
 
-    def __init__(self, d_model: int, n_heads: int, dropout: float):
+    def __init__(self, d_model: int, n_heads: int, attn_dropout: float, columnwise_dropout: float):
         super().__init__()
         self.norm = nn.LayerNorm(d_model)
-        self.attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
 
-    def forward(self, x: torch.Tensor):
+        # Bias-less QKV projection, disable default out-proj
+        # Keep bias terms in Q/K/V projection for strict AlphaFold parity
+        self.attn = nn.MultiheadAttention(
+            d_model, n_heads, dropout=attn_dropout, batch_first=True, bias=False
+        )
+        W = torch.eye(
+            self.attn.embed_dim,
+            dtype=self.attn.out_proj.weight.dtype,
+            device=self.attn.out_proj.weight.device,
+        )
+        with torch.no_grad():
+            self.attn.out_proj.weight.copy_(W)
+            if self.attn.out_proj.bias is not None:
+                self.attn.out_proj.bias.zero_()
+        self.attn.out_proj.weight.requires_grad_(False)
+        if self.attn.out_proj.bias is not None:
+            self.attn.out_proj.bias.requires_grad_(False)
+
+        self.out_proj  = nn.Linear(d_model, d_model, bias=True)
+        self.gate_proj = nn.Linear(d_model, d_model, bias=True)
+        nn.init.zeros_(self.out_proj.bias)
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.gate_proj.weight)
+        nn.init.constant_(self.gate_proj.bias, 1.0)
+
+        # Column-wise dropout (mask shared across residues)
+        self.dropout = ColumnwiseDropout(columnwise_dropout)
+
+    def forward(self, x: torch.Tensor, pad_mask: torch.Tensor):
+        """x: [B, N_seq, L_res, D]; pad_mask: [B, L_res] with True → PAD"""
         B, N, L, D = x.shape
-        x_t = x.permute(0, 2, 1, 3).contiguous().view(B * L, N, D)
-        y, _ = self.attn(self.norm(x_t), self.norm(x_t), self.norm(x_t))
-        y = y.view(B, L, N, D).permute(0, 2, 1, 3)
-        return x + y
+        x_norm = self.norm(x)
 
+        # Fold sequences into batch so attention is across residues per sequence
+        qkv = x_norm.reshape(B * N, L, D)                                       # [B·N, L, D]
+        key_pad = pad_mask.repeat_interleave(N, dim=0)  # [B·N, L]
+
+        attn_out, _ = self.attn(qkv, qkv, qkv, key_padding_mask=key_pad, need_weights=False)
+        attn_out = attn_out.reshape(B, N, L, D)
+
+        h    = self.out_proj(attn_out)
+        gate = torch.sigmoid(self.gate_proj(x_norm))
+        return x + self.dropout(gate * h)
 
 class _ResidueSelfAttention(nn.Module):
     """Self-attention + FFN for residue track, with padding mask."""
@@ -108,33 +220,55 @@ class _ResidueSelfAttention(nn.Module):
         self.attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
         self.ffn = ResidualFeedForward(d_model, 4, dropout)
 
-    def forward(self, x: torch.Tensor, pad_mask: Optional[torch.Tensor]):
-        y, _ = self.attn(self.norm(x), self.norm(x), self.norm(x), key_padding_mask=pad_mask)
-        x = x + y
+    def forward(self, x: torch.Tensor, pad_mask: torch.Tensor):
+        x = self.norm(x)
+        attn_out, _ = self.attn(x, x, x, key_padding_mask=pad_mask, need_weights=False)
+        x = x + attn_out
         return self.ffn(x)
 
-
+# -----------------------------------------------
+# EvoformerLite Block
+# -----------------------------------------------
 class EvoformerLiteBlock(nn.Module):
     """Canonical Evoformer-Lite block (row-attn, col-attn, residue self-attn)"""
     
-    def __init__(self, d_model: int, n_heads: int, dropout: float):
+    def __init__(self, d_model: int, n_heads: int, dropout: float, row_attn_dropout: float, rowwise_dropout: float, col_attn_dropout: float, columnwise_dropout: float):
         super().__init__()
-        self.row = _RowSelfAttention(d_model, n_heads, dropout)
-        self.col = _ColSelfAttention(d_model, n_heads, dropout)
+        
+        self.row = _RowSelfAttention(d_model, n_heads, row_attn_dropout, rowwise_dropout)
+        self.col = _ColSelfAttention(d_model, n_heads, col_attn_dropout, columnwise_dropout)
         self.msa_transition = ResidualFeedForward(d_model, 4, dropout)
+        # --- NEW: MSA→residue fuse module ---------------------------------
+        self.seq_norm      = nn.LayerNorm(d_model)
+        self.seq_out_proj  = nn.Linear(d_model, d_model, bias=True)
+        self.seq_gate_proj = nn.Linear(d_model, d_model, bias=True)
+        nn.init.zeros_(self.seq_out_proj.weight);  nn.init.zeros_(self.seq_out_proj.bias)
+        nn.init.zeros_(self.seq_gate_proj.weight); nn.init.constant_(self.seq_gate_proj.bias, 1.0)
+        self.seq_dropout   = nn.Dropout(dropout)
+        # ------------------------------------------------------------------
         self.res_attn = _ResidueSelfAttention(d_model, n_heads, dropout)
 
     def forward(
         self,
         msa: torch.Tensor,           # [B,N,L,d]
         residue: torch.Tensor,       # [B,L,d]
-        pad_mask: Optional[torch.Tensor],
+        pad_mask: torch.Tensor,
+        seq_pad_mask: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        msa = self.row(msa, pad_mask)
-        msa = self.col(msa)
+        msa = self.row(msa, seq_pad_mask)
+        msa = self.col(msa, pad_mask)
         msa = self.msa_transition(msa)
-        # Pool & fuse
-        residue = residue + msa.mean(dim=1)
+        # ---- MSA → residue ------------------------------------------------
+        seq_mask   = (~seq_pad_mask).unsqueeze(-1).unsqueeze(-1).type_as(msa) 
+        seq_valid  = seq_mask.sum(dim=1)
+        seq_mean   = (msa * seq_mask).sum(dim=1) / seq_valid     # [B, L, D]
+        seq_mean   = self.seq_norm(seq_mean)
+        update     = self.seq_out_proj(seq_mean)
+        gate       = torch.sigmoid(self.seq_gate_proj(seq_mean))
+        update     = self.seq_dropout(gate * update)
+        residue    = residue + update
+        # ------------------------------------------------------------------
+
         residue = self.res_attn(residue, pad_mask)
         return msa, residue
 
@@ -142,15 +276,29 @@ class EvoformerLiteBlock(nn.Module):
 class EvoformerLiteMSASeq(nn.Module):
     """Canonical Evoformer-Lite stack with MSA and residue tracks."""
 
-    def __init__(self, d_msa: int, d_model: int, n_blocks: int, n_heads: int, dropout: float):
+    def __init__(self, d_msa: int, d_model: int, n_blocks: int, n_heads: int, dropout: float, in_dropout: float, 
+    row_attn_dropout: float, rowwise_dropout: float, col_attn_dropout: float, columnwise_dropout: float):
         super().__init__()
-        self.msa_proj = nn.Linear(d_msa, d_model, bias=False)
-        self.blocks = nn.ModuleList([EvoformerLiteBlock(d_model, n_heads, dropout) for _ in range(n_blocks)])
 
-    def forward(self, msa: torch.Tensor, residue: torch.Tensor, pad_mask: Optional[torch.Tensor]):
-        msa = self.msa_proj(msa)
+        self.msa_proj = nn.Linear(d_msa, d_model, bias=True)
+
+        self.in_drop = nn.Dropout(in_dropout)
+
+        # Evoformer-Lite tower (unchanged)
+        self.blocks = nn.ModuleList([
+            EvoformerLiteBlock(d_model, n_heads, dropout, row_attn_dropout, 
+            rowwise_dropout, col_attn_dropout, columnwise_dropout) 
+            for _ in range(n_blocks)
+        ])
+
+    def forward(self, msa, residue, pad_mask, seq_pad_mask):
+        # MSA path
+        msa = self.in_drop(self.msa_proj(msa))
+        # Residue path (ESM-C already has correct dim; leave untouched)
+        residue = self.in_drop(residue)
+
         for blk in self.blocks:
-            msa, residue = blk(msa, residue, pad_mask)
+            msa, residue = blk(msa, residue, pad_mask, seq_pad_mask)
         return residue
 
 
@@ -167,6 +315,11 @@ class ProteinLitModule(LightningModule):
         n_blocks: int = 4,                    # Number of Evoformer-Lite blocks
         n_heads: int = 8,                     # Attention heads
         dropout: float = 0.1,                 # Dropout rate
+        in_dropout: float = 0.1,              # Input dropout rate
+        row_attn_dropout: float = 0.1,              # Row attention dropout rate
+        rowwise_dropout: float = 0.1,               # Row-wise dropout rate
+        col_attn_dropout: float = 0.1,              # Column attention dropout rate
+        columnwise_dropout: float = 0.1,            # Column-wise dropout rate
         optimizer: Optional[Any] = None,      # Hydra optimizer config
         scheduler: Optional[Any] = None,      # Hydra scheduler config  
         warmup_ratio: float = 0.05,           # Warmup ratio for cosine schedule (5% of total training steps)
@@ -187,7 +340,7 @@ class ProteinLitModule(LightningModule):
         nn.init.normal_(self.eos_token, std=0.02)
         
         # Canonical Evoformer-Lite stack
-        self.evo_stack = EvoformerLiteMSASeq(d_msa, d_model, n_blocks, n_heads, dropout)
+        self.evo_stack = EvoformerLiteMSASeq(d_msa, d_model, n_blocks, n_heads, dropout, in_dropout, row_attn_dropout, rowwise_dropout, col_attn_dropout, columnwise_dropout)
         
         # Create classifier head
         self.head = MLPHead(d_model, get_num_classes_for_task(task_type), dropout)
@@ -219,7 +372,8 @@ class ProteinLitModule(LightningModule):
     def forward(self, batch: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
         """Forward pass with canonical Evoformer-Lite and EOS token scatter."""
         seq_emb = batch["sequence_emb"]          # [B,L+2,d_model]
-        pad_mask = batch["pad_mask"]             # [B,L+2]
+        pad_mask   = batch["pad_mask"]          # [B, L+2]  (True → PAD)
+        seq_pad    = batch["seq_pad_mask"]  # [B, N_max]
         lengths = batch["lengths"]               # [B] – residues (no CLS/EOS)
         msa_tok = batch["msa_tok"]               # list[Tensor]
         
@@ -234,8 +388,11 @@ class ProteinLitModule(LightningModule):
         self._last_msa_compute_time = msa_compute_time
         batch["msa_compute_time"] = msa_compute_time
         
-        # Canonical Evoformer-Lite stack
-        residue = self.evo_stack(msa_emb, seq_emb, pad_mask)
+        # sanity: ensure N_seq dims still agree after ESM-MSA padding
+        assert msa_emb.shape[1] == seq_pad.shape[1], "N_seq mismatch after _compute_msa"
+
+        # Canonical Evoformer-Lite stack with sequence padding mask
+        residue = self.evo_stack(msa_emb, seq_emb, pad_mask, seq_pad)
         
         # Masked mean-pool over length
         valid = (~pad_mask).sum(dim=1, keepdim=True)

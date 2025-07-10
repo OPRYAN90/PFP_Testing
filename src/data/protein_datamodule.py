@@ -462,7 +462,8 @@ def protein_collate(batch):
     """Collate function for protein data.
     Pads:
     1. Pre-computed ESM-C embeddings  → shape [B, L_max_seq, d_model]
-    2. Integer MSA tokens            → shape [B, N_seq_max, L_max_seq] 
+    2. Integer MSA tokens            → shape [B, N_seq_max, L_max_seq]
+    3. Sequence padding mask         → shape [B, N_seq_max]
     """
     protein_ids = [it["protein_id"] for it in batch]
     sequences   = [it["sequence"]    for it in batch]
@@ -483,8 +484,17 @@ def protein_collate(batch):
 
     # ----------------------------------------------------
     # 2) Collect integer MSA token matrices *without* padding
+    #    + build per-sample sequence padding masks
     # ----------------------------------------------------
     msa_tok_list = [it["msa_tok"] for it in batch]   # no padding here
+
+    # Determine maximum number of sequences across the batch
+    max_n_seq = max(tok.shape[0] for tok in msa_tok_list)
+
+    # Build boolean mask where True means a padding (absent) sequence
+    seq_pad_mask = torch.tensor([
+        [i >= tok.shape[0] for i in range(max_n_seq)] for tok in msa_tok_list
+    ], dtype=torch.bool)
 
     # ----------------------------------------------------
     # 3) Stack sequence embeddings + build masks
@@ -510,6 +520,7 @@ def protein_collate(batch):
         "sequence": sequences,
         "sequence_emb": sequence_emb,
         "msa_tok": msa_tok_list,  # list[Tensor] – variable shapes
+        "seq_pad_mask": seq_pad_mask,  # [B, N_seq_max] (True → PAD)
         "labels": labels,
         "pad_mask": pad_mask,
         "lengths": lengths_tensor,
