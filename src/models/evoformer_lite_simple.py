@@ -63,53 +63,41 @@ class MLPHead(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
 
+from afno import AFNO2D         # provided by the repo above
 
-class FourierMix2D(nn.Module):
-    """Fourier token mixer with masking support.
-
-    Notes/assumptions based on calling code:
-      • *pad* will **always** be supplied (boolean where True ⇒ PAD).
-      • Complex projection is **always** enabled, so the real & imag
-        parts are concatenated and linearly projected back to *d_model*.
-
-    Args:
-        d_model: embedding dimension (last dimension of *x*)
-        dropout: dropout probability applied to Fourier update
+class AFNOMix2D(nn.Module):
     """
-
-    def __init__(self, d_model: int, dropout: float = 0.1):
+    Adaptive Fourier Neural Operator mixer for (N_seq × L) MSA tokens.
+    Expects x: [B, N_seq, L, D] and pad: [B, N_seq, L] (True ⇒ PAD).
+    """
+    def __init__(
+        self,
+        d_model: int,
+        num_blocks: int = 8,
+        dropout: float = 0.1,
+        sparsity_thresh: float = 1e-2,
+        hard_frac: float = 1.0,
+    ):
         super().__init__()
-        self.norm = nn.LayerNorm(d_model)
-        self.drop = nn.Dropout(dropout)
-
-        # Always use complex projection (real + imag → d_model)
-        self.proj = nn.Linear(d_model * 2, d_model, bias=False)
+        self.norm  = nn.LayerNorm(d_model)
+        self.afno  = AFNO2D(
+            hidden_size=d_model,
+            num_blocks=num_blocks,
+            sparsity_threshold=sparsity_thresh,
+            hard_thresholding_fraction=int(hard_frac),
+        )
+        self.drop  = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor, pad: torch.Tensor) -> torch.Tensor:
-        """Apply 2-D FFT mixing with padding support.
+        # x: [B, N_seq, L, D]; pad: [B, N_seq, L]
+        x = x.masked_fill(pad.unsqueeze(-1), 0.)
 
-        Args:
-            x:   Tensor of shape [B, S, L, D]
-            pad: Boolean mask [B, S, L] where True indicates padded tokens.
-        """
-        # Zero-out padded tokens before normalisation so they do not
-        # pollute statistics or the FFT.
-        x = x.masked_fill(pad.unsqueeze(-1), 0.0)
+        B, N, L, D = x.shape
+        y = self.norm(x).reshape(B, N * L, D)          # → [B, N*L, D]
+        y = self.afno(y, spatial_size=(N, L))          # AFNO mixes in Fourier domain
+        y = y.reshape(B, N, L, D)
 
-        # (1) Layer norm on the last dimension
-        x_n = self.norm(x)
-
-        # (2) 2-D FFT across sequence (S) and residue (L) axes
-        z = torch.fft.fft2(x_n, dim=(-3, -2), norm="ortho")  # complex
-
-        # (3) Concatenate real & imag parts and project back to d_model
-        y = torch.view_as_real(z).movedim(-1, -2)             # [..., 2, D]
-        y = self.proj(y.flatten(-2))                          # [B,S,L,D]
-
-        # Ensure padded positions remain zero after projection
-        y = y.masked_fill(pad.unsqueeze(-1), 0.0)
-
-        # (4) Residual connection + dropout
+        y = y.masked_fill(pad.unsqueeze(-1), 0.)
         return x + self.drop(y)
 
 
@@ -132,12 +120,12 @@ class _ResidueSelfAttention(nn.Module):
 # EvoformerLite Block
 # -----------------------------------------------
 class EvoformerLiteBlock(nn.Module):
-    """Canonical Evoformer-Lite block with FourierMix2D"""
+    """Canonical Evoformer-Lite block with ConvMix2D"""
     
     def __init__(self, d_model: int, n_heads: int, dropout: float, *_):
         super().__init__()
         
-        self.mix = FourierMix2D(d_model, dropout)   # NEW
+        self.mix = AFNOMix2D(d_model)   # NEW
         self.msa_transition = ResidualFeedForward(d_model, 4, dropout)
 
         # --- MSA → residue fuse & residue self-attn remain unchanged ---
@@ -155,7 +143,7 @@ class EvoformerLiteBlock(nn.Module):
         #   pad_mask     : [B, L]
         pad = seq_pad_mask.unsqueeze(-1) | pad_mask.unsqueeze(1)  # [B,N,L]
 
-        msa = self.mix(msa, pad)          # ① Fourier mixing with mask
+        msa = self.mix(msa, pad)          # ① Conv mixing with mask
         msa = self.msa_transition(msa)    # ② Position-wise FFN
         # ③ MSA → residue projection (unchanged)
         seq_mask   = (~seq_pad_mask).unsqueeze(-1).unsqueeze(-1).type_as(msa)
@@ -180,7 +168,7 @@ class EvoformerLiteMSASeq(nn.Module):
         self.esm_proj = nn.Linear(1152, d_model, bias=True)
         self.in_drop = nn.Dropout(in_dropout)
 
-        # Evoformer-Lite tower (updated to use FourierMix2D)
+        # Evoformer-Lite tower (updated to use ConvMix2D)
         self.blocks = nn.ModuleList([
             EvoformerLiteBlock(d_model, n_heads, dropout) 
             for _ in range(n_blocks)
@@ -230,7 +218,7 @@ class ProteinLitModule(LightningModule):
         self.eos_token = nn.Parameter(torch.zeros(1, 1, 1, d_msa))
         nn.init.normal_(self.eos_token, std=0.02)
         
-        # Canonical Evoformer-Lite stack (updated to remove rowwise_dropout parameter)
+        # Canonical Evoformer-Lite stack with ConvMix2D
         self.evo_stack = EvoformerLiteMSASeq(d_msa, d_model, n_blocks, n_heads, dropout, in_dropout)
         
         # Create classifier head
@@ -282,7 +270,7 @@ class ProteinLitModule(LightningModule):
         # sanity: ensure N_seq dims still agree after ESM-MSA padding
         assert msa_emb.shape[1] == seq_pad.shape[1], "N_seq mismatch after _compute_msa"
 
-        # Canonical Evoformer-Lite stack with sequence padding mask
+        # Canonical Evoformer-Lite stack with ConvMix2D and sequence padding mask
         residue = self.evo_stack(msa_emb, seq_emb, pad_mask, seq_pad)
         
         # Masked mean-pool over length
