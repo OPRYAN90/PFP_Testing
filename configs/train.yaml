@@ -5,7 +5,7 @@
 defaults:
   - _self_
   - data: protein
-  - model: evoformer_lite
+  - model: ecoformer_lite
   - callbacks: protein
   - logger: wandb 
   - trainer: protein

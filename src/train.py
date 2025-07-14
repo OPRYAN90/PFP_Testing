@@ -1,9 +1,4 @@
 from typing import Any, Dict, List, Optional, Tuple
-
-import multiprocessing as mp
-# Use 'spawn' start-method globally so CUDA can be initialised safely in worker
-mp.set_start_method("spawn", force=True)
-
 import hydra
 import lightning as L
 import rootutils
@@ -11,6 +6,9 @@ import torch
 from lightning import Callback, LightningDataModule, LightningModule, Trainer
 from lightning.pytorch.loggers import Logger
 from omegaconf import DictConfig
+# import os, pathlib, subprocess
+# cutlass_dir = pathlib.Path.home() / "cutlass"        # ~/.cutlass also fine
+# os.environ["CUTLASS_PATH"] = str(cutlass_dir)        # inherit to all children
 
 rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 # ------------------------------------------------------------------------------------ #

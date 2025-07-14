@@ -1,9 +1,9 @@
 from typing import Any, Dict, Optional, Tuple, Union, List
+import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from deepspeed.ops.deepspeed4science import DS4Sci_EvoformerAttention
 
 # -----------------------------------------------------------------------------
 # Optional FlashAttention toggle – does nothing on unsupported systems
@@ -26,17 +26,6 @@ def get_num_classes_for_task(task_type: str) -> int:
     """Get number of classes for a task type."""
     class_counts = {"mf": 489, "bp": 1943, "cc": 320}
     return class_counts[task_type]
-
-
-def _pad_to_multiple(x: torch.Tensor, multiple: int, dim: int) -> torch.Tensor:
-    size = x.size(dim)
-    if size % multiple == 0:
-        return x
-    pad_len = multiple - size % multiple
-    pad_shape = list(x.shape)
-    pad_shape[dim] = pad_len
-    pad = x.new_zeros(pad_shape)
-    return torch.cat([x, pad], dim=dim)
 
 
 class ResidualFeedForward(nn.Module):
@@ -74,173 +63,55 @@ class MLPHead(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
 
-# -----------------------------------------------------------------------------
-#  AlphaFold-style dropout helpers (faithful to original Evoformer)
-# -----------------------------------------------------------------------------
-class RowwiseDropout(nn.Module):
-    """Dropout whose mask is broadcast along the N_seq dimension."""
-    def __init__(self, p: float):
+
+class FourierMix2D(nn.Module):
+    """Fourier token mixer with masking support.
+
+    Notes/assumptions based on calling code:
+      • *pad* will **always** be supplied (boolean where True ⇒ PAD).
+      • Complex projection is **always** enabled, so the real & imag
+        parts are concatenated and linearly projected back to *d_model*.
+
+    Args:
+        d_model: embedding dimension (last dimension of *x*)
+        dropout: dropout probability applied to Fourier update
+    """
+
+    def __init__(self, d_model: int, dropout: float = 0.1):
         super().__init__()
-        self.p = p
-        self._drop = nn.Dropout(p)
+        self.norm = nn.LayerNorm(d_model)
+        self.drop = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:  # x: [B, N_seq, L_res, D]
-        if (not self.training) or self.p == 0.0:
-            return x
-        # Share mask over sequences (axis-1)
-        mask = torch.ones_like(x[:, :1, :, :])
-        return x * self._drop(mask)
+        # Always use complex projection (real + imag → d_model)
+        self.proj = nn.Linear(d_model * 2, d_model, bias=False)
 
-class ColumnwiseDropout(nn.Module):
-    """Dropout whose mask is broadcast along the L_res dimension."""
-    def __init__(self, p: float):
-        super().__init__()
-        self.p = p
-        self._drop = nn.Dropout(p)
+    def forward(self, x: torch.Tensor, pad: torch.Tensor) -> torch.Tensor:
+        """Apply 2-D FFT mixing with padding support.
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:  # x: [B, N_seq, L_res, D]
-        if (not self.training) or self.p == 0.0:
-            return x
-        # Share mask over residues (axis-2)
-        mask = torch.ones_like(x[:, :, :1, :])
-        return x * self._drop(mask)
+        Args:
+            x:   Tensor of shape [B, S, L, D]
+            pad: Boolean mask [B, S, L] where True indicates padded tokens.
+        """
+        # Zero-out padded tokens before normalisation so they do not
+        # pollute statistics or the FFT.
+        x = x.masked_fill(pad.unsqueeze(-1), 0.0)
 
+        # (1) Layer norm on the last dimension
+        x_n = self.norm(x)
 
+        # (2) 2-D FFT across sequence (S) and residue (L) axes
+        z = torch.fft.fft2(x_n, dim=(-3, -2), norm="ortho")  # complex
 
-class DSRowSelfAttention(nn.Module):
-    def __init__(self, dim: int, heads: int, rowwise_dropout: float = 0.0):
-        super().__init__()
-        self.h = heads
-        self.dh = dim // heads
-        self.norm = nn.LayerNorm(dim)
-        # Shared projections
-        self.q_proj = nn.Linear(dim, dim, bias=False)
-        self.k_proj = nn.Linear(dim, dim, bias=False)
-        self.v_proj = nn.Linear(dim, dim, bias=False)
-        self.out_proj = nn.Linear(dim, dim, bias=True)
-        # AlphaFold/OpenFold "final" & "gating" inits -----------------
-        nn.init.zeros_(self.out_proj.weight)      # weight = 0
-        nn.init.zeros_(self.out_proj.bias)        # bias   = 0   (keeps block at identity)
+        # (3) Concatenate real & imag parts and project back to d_model
+        y = torch.view_as_real(z).movedim(-1, -2)             # [..., 2, D]
+        y = self.proj(y.flatten(-2))                          # [B,S,L,D]
 
-        # AlphaFold-style gating (per-head)
-        self.gate = nn.Linear(dim, dim)
-        nn.init.zeros_(self.gate.weight)          # weight = 0
-        nn.init.constant_(self.gate.bias, 1.0)    # bias   = 1   (σ(1)=0.73 → mild gating)
+        # Ensure padded positions remain zero after projection
+        y = y.masked_fill(pad.unsqueeze(-1), 0.0)
 
-        self.dropout = RowwiseDropout(rowwise_dropout)
+        # (4) Residual connection + dropout
+        return x + self.drop(y)
 
-    def forward(
-        self,
-        x: torch.Tensor,            # [B, N_seq, L_res, D]
-        seq_pad: torch.Tensor,      # [B, N_seq]  (True → PAD seq)
-        res_pad: torch.Tensor,      # [B, L_res]  (True → PAD residue)
-        pair_bias: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        B, N, L, D = x.shape
-        x_norm = self.norm(x)
-
-        # Kernel requires seq_len (L) % 32 == 0
-        q = self.q_proj(x_norm).reshape(B, N, L, self.h, self.dh)
-        k = self.k_proj(x_norm).reshape(B, N, L, self.h, self.dh)
-        v = self.v_proj(x_norm).reshape(B, N, L, self.h, self.dh)
-        q = _pad_to_multiple(q, 32, dim=2).contiguous()
-        k = _pad_to_multiple(k, 32, dim=2).contiguous()
-        v = _pad_to_multiple(v, 32, dim=2).contiguous()
-
-        # ------------------------------------------------------------------
-        # Build additive bias #0 combining sequence *and* residue padding
-        # Shape required: [B, N_seq, 1, 1, N_res]
-        pad_bool = seq_pad.unsqueeze(-1) | res_pad.unsqueeze(1)          # [B,N,L]
-        pad_bool = _pad_to_multiple(pad_bool, 32, dim=2)                 # [B,N,L_pad]
-        pad_bias = pad_bool.unsqueeze(2).unsqueeze(2).float() * -1e4     # [B,N,1,1,L_pad]
-        pad_bias = pad_bias.to(torch.bfloat16).contiguous()
-
-        # Pair bias (all-zeros if not provided)
-        if pair_bias is None:
-            pair_bias = x_norm.new_zeros(B, 1, self.h, L, L)
-        # pad pair_bias symmetrically to L_pad
-        pair_bias = _pad_to_multiple(pair_bias, 32, dim=-1)              # last dim
-        pair_bias = _pad_to_multiple(pair_bias, 32, dim=-2)              # second-last
-        pair_bias = pair_bias.to(torch.bfloat16).contiguous()
-
-        # ---------------- NEW: per-head gating then mix heads ----------------
-        # kernel expects a list with ≤ 2 tensors
-        out = DS4Sci_EvoformerAttention(q, k, v, [pad_bias, pair_bias])
-
-        # remove the padding we just added so gating & projection match
-        out = out[:, :, :L, :, :].contiguous()                            # [B,N,L,H,dh]
-
-        # ❶ Per-head gate (W=0, b=1) broadcast over dh dimension
-        g = torch.sigmoid(self.gate(x_norm))                                      # [B,N,L,D]
-        g = g.reshape(B, N, L, self.h, self.dh)                                   # [B,N,L,H,dh]
-        out = out * g                                                             # gate before mixing
-
-        # ❷ Mix heads → model dim
-        out = self.out_proj(out.reshape(B, N, L, D))                # [B,N,L,D]
-
-        return x + self.dropout(out)
-
-
-class DSColSelfAttention(nn.Module):
-    def __init__(self, dim: int, heads: int, columnwise_dropout: float = 0.0):
-        super().__init__()
-        self.h = heads
-        self.dh = dim // heads
-        self.norm = nn.LayerNorm(dim)
-        self.q_proj = nn.Linear(dim, dim, bias=False)
-        self.k_proj = nn.Linear(dim, dim, bias=False)
-        self.v_proj = nn.Linear(dim, dim, bias=False)
-        self.out_proj = nn.Linear(dim, dim, bias=True)
-        nn.init.zeros_(self.out_proj.weight)      # weight = 0
-        nn.init.zeros_(self.out_proj.bias)        # bias   = 0   (keeps block at identity)
-
-        self.gate = nn.Linear(dim, dim)
-        nn.init.zeros_(self.gate.weight)          # weight = 0
-        nn.init.constant_(self.gate.bias, 1.0)    # bias   = 1   (σ(1)=0.73 → mild gating)
-        # Column-wise dropout (mask shared across L_res)
-        self.dropout = ColumnwiseDropout(columnwise_dropout)
-
-    def forward(
-        self,
-        x: torch.Tensor,        # [B, N_seq, L_res, D]
-        seq_pad: torch.Tensor,  # [B, N_seq] (True → PAD sequences)
-        res_pad: torch.Tensor,  # [B, L_res] (True → PAD residues)
-    ) -> torch.Tensor:
-        B, N, L, D = x.shape
-        x_norm = self.norm(x)
-        q = self.q_proj(x_norm).reshape(B, N, L, self.h, self.dh)\
-                                .permute(0, 2, 1, 3, 4)
-        k = self.k_proj(x_norm).reshape(B, N, L, self.h, self.dh)\
-                                .permute(0, 2, 1, 3, 4)
-        v = self.v_proj(x_norm).reshape(B, N, L, self.h, self.dh)\
-                                .permute(0, 2, 1, 3, 4)
-
-        # Here the "sequence" dimension is N_seq (now axis-2 after permute)
-        q = _pad_to_multiple(q, 32, dim=2).contiguous()
-        k = _pad_to_multiple(k, 32, dim=2).contiguous()
-        v = _pad_to_multiple(v, 32, dim=2).contiguous()
-
-        # ------------------------------------------------------------------
-        # build additive bias in axis order expected by kernel: [B,L,N]
-        pad_bool = seq_pad.unsqueeze(1) | res_pad.unsqueeze(2)            # [B,L,N]
-        pad_bool = _pad_to_multiple(pad_bool, 32, dim=2)                  # ✅ pad N_seq (dim 2)
-        pad_bias = pad_bool.unsqueeze(2).unsqueeze(2).float() * -1e4      # [B,L_pad,1,1,N]
-        pad_bias = pad_bias.to(torch.bfloat16).contiguous()
-
-        # only the sequence-residue padding bias is needed for column attention
-        out = DS4Sci_EvoformerAttention(q, k, v, [pad_bias])
-        out = out[:, :, :N, :, :]                                             # trim pad on residue axis
-        out = out.permute(0, 2, 1, 3, 4).contiguous()                     # [B,N,L,H,dh]
-
-        # ❶ Per-head gate (W=0, b=1)
-        g = torch.sigmoid(self.gate(x_norm))                                       # [B,N,L,D]
-        g = g.reshape(B, N, L, self.h, self.dh)                                    # [B,N,L,H,dh]
-        out = out * g
-
-        # ❷ Mix heads → model dim
-        out = self.out_proj(out.reshape(B, N, L, D))                 # [B,N,L,D]
-
-        return x + self.dropout(out)
 
 class _ResidueSelfAttention(nn.Module):
     """Self-attention + FFN for residue track, with padding mask."""
@@ -261,64 +132,57 @@ class _ResidueSelfAttention(nn.Module):
 # EvoformerLite Block
 # -----------------------------------------------
 class EvoformerLiteBlock(nn.Module):
-    """Canonical Evoformer-Lite block (row-attn, col-attn, residue self-attn)"""
+    """Canonical Evoformer-Lite block with FourierMix2D"""
     
-    def __init__(self, d_model: int, n_heads: int, dropout: float, rowwise_dropout: float, columnwise_dropout: float):
+    def __init__(self, d_model: int, n_heads: int, dropout: float, *_):
         super().__init__()
         
-        self.row = DSRowSelfAttention(d_model, n_heads, rowwise_dropout)
-        self.col = DSColSelfAttention(d_model, n_heads, columnwise_dropout)
+        self.mix = FourierMix2D(d_model, dropout)   # NEW
         self.msa_transition = ResidualFeedForward(d_model, 4, dropout)
-        # --- NEW: MSA→residue fuse module ---------------------------------
+
+        # --- MSA → residue fuse & residue self-attn remain unchanged ---
         self.seq_norm      = nn.LayerNorm(d_model)
         self.seq_out_proj  = nn.Linear(d_model, d_model, bias=True)
         self.seq_gate_proj = nn.Linear(d_model, d_model, bias=True)
         nn.init.zeros_(self.seq_out_proj.weight);  nn.init.zeros_(self.seq_out_proj.bias)
         nn.init.zeros_(self.seq_gate_proj.weight); nn.init.constant_(self.seq_gate_proj.bias, 1.0)
         self.seq_dropout   = nn.Dropout(dropout)
-        # ------------------------------------------------------------------
-        self.res_attn = _ResidueSelfAttention(d_model, n_heads, dropout)
+        self.res_attn      = _ResidueSelfAttention(d_model, n_heads, dropout)
 
-    def forward(
-        self,
-        msa: torch.Tensor,           # [B,N,L,d]
-        residue: torch.Tensor,       # [B,L,d]
-        pad_mask: torch.Tensor,
-        seq_pad_mask: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        msa = self.row(msa, seq_pad_mask, pad_mask)
-        msa = self.col(msa, seq_pad_mask, pad_mask)
-        msa = self.msa_transition(msa)
-        # ---- MSA → residue ------------------------------------------------
-        seq_mask   = (~seq_pad_mask).unsqueeze(-1).unsqueeze(-1).type_as(msa) 
+    def forward(self, msa, residue, pad_mask, seq_pad_mask):
+        # Build 3-D padding mask for MSA tokens: True ⇢ PAD
+        #   seq_pad_mask : [B, N]
+        #   pad_mask     : [B, L]
+        pad = seq_pad_mask.unsqueeze(-1) | pad_mask.unsqueeze(1)  # [B,N,L]
+
+        msa = self.mix(msa, pad)          # ① Fourier mixing with mask
+        msa = self.msa_transition(msa)    # ② Position-wise FFN
+        # ③ MSA → residue projection (unchanged)
+        seq_mask   = (~seq_pad_mask).unsqueeze(-1).unsqueeze(-1).type_as(msa)
         seq_valid  = seq_mask.sum(dim=1)
         seq_mean   = (msa * seq_mask).sum(dim=1) / seq_valid     # [B, L, D]
         seq_mean   = self.seq_norm(seq_mean)
         update     = self.seq_out_proj(seq_mean)
         gate       = torch.sigmoid(self.seq_gate_proj(seq_mean))
-        update     = self.seq_dropout(gate * update)
-        residue    = residue + update
-        # ------------------------------------------------------------------
-
-        residue = self.res_attn(residue, pad_mask)
+        residue    = residue + self.seq_dropout(gate * update)
+        # ④ Residue self-attention (unchanged)
+        residue    = self.res_attn(residue, pad_mask)
         return msa, residue
 
 
 class EvoformerLiteMSASeq(nn.Module):
     """Canonical Evoformer-Lite stack with MSA and residue tracks."""
 
-    def __init__(self, d_msa: int, d_model: int, n_blocks: int, n_heads: int, dropout: float, in_dropout: float, 
-    rowwise_dropout: float, columnwise_dropout: float):
+    def __init__(self, d_msa: int, d_model: int, n_blocks: int, n_heads: int, dropout: float, in_dropout: float):
         super().__init__()
 
         self.msa_proj = nn.Linear(d_msa, d_model, bias=True)
         self.esm_proj = nn.Linear(1152, d_model, bias=True)
         self.in_drop = nn.Dropout(in_dropout)
 
-        # Evoformer-Lite tower (unchanged)
+        # Evoformer-Lite tower (updated to use FourierMix2D)
         self.blocks = nn.ModuleList([
-            EvoformerLiteBlock(d_model, n_heads, dropout, 
-            rowwise_dropout, columnwise_dropout) 
+            EvoformerLiteBlock(d_model, n_heads, dropout) 
             for _ in range(n_blocks)
         ])
 
@@ -347,8 +211,6 @@ class ProteinLitModule(LightningModule):
         n_heads: int = 8,                     # Attention heads
         dropout: float = 0.1,                 # Dropout rate
         in_dropout: float = 0.1,              # Input dropout rate
-        rowwise_dropout: float = 0.1,               # Row-wise dropout rate
-        columnwise_dropout: float = 0.1,            # Column-wise dropout rate
         optimizer: Optional[Any] = None,      # Hydra optimizer config
         scheduler: Optional[Any] = None,      # Hydra scheduler config  
         warmup_ratio: float = 0.05,           # Warmup ratio for cosine schedule (5% of total training steps)
@@ -368,8 +230,8 @@ class ProteinLitModule(LightningModule):
         self.eos_token = nn.Parameter(torch.zeros(1, 1, 1, d_msa))
         nn.init.normal_(self.eos_token, std=0.02)
         
-        # Canonical Evoformer-Lite stack
-        self.evo_stack = EvoformerLiteMSASeq(d_msa, d_model, n_blocks, n_heads, dropout, in_dropout, rowwise_dropout, columnwise_dropout)
+        # Canonical Evoformer-Lite stack (updated to remove rowwise_dropout parameter)
+        self.evo_stack = EvoformerLiteMSASeq(d_msa, d_model, n_blocks, n_heads, dropout, in_dropout)
         
         # Create classifier head
         self.head = MLPHead(d_model, get_num_classes_for_task(task_type), dropout)

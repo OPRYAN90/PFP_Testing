@@ -1,15 +1,13 @@
 _target_: src.models.evoformer_lite_msa_seq.ProteinLitModule
 
 # Model architecture parameters
-d_model: 1152            # Base model dimension (ESM embeddings size)
+d_model: 768            # Base model dimension (ESM embeddings size)
 d_msa: 768               # MSA embedding dimension (ESM-MSA output)
-n_blocks: 2              # Number of Evoformer-Lite blocks
+n_blocks: 8             # Number of Evoformer-Lite blocks
 n_heads: 8               # Attention heads for all attention layers
 dropout: 0.125           # General dropout rate for model components
 in_dropout: 0.10          # Dropout applied to inputs before Evoformer-Lite
-row_attn_dropout: 0.10    # Dropout for row self-attention
 rowwise_dropout: 0.15     # Row-wise dropout mask (shared across sequences)
-col_attn_dropout: 0.10    # Dropout for column self-attention
 columnwise_dropout: 0.15  # Column-wise dropout mask (shared across residues)
 
 # Task and training parameters

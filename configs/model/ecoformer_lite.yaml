@@ -1,0 +1,49 @@
+_target_: src.models.ecoformer_lite_msa_seq_attention.ProteinLitModule
+
+# Model architecture parameters
+d_model: 768            # Base model dimension (ESM embeddings size)
+d_msa: 768               # MSA embedding dimension (ESM-MSA output)
+n_blocks: 3              # Number of Evoformer-Lite blocks
+n_heads: 8               # Attention heads for all attention layers
+dropout: 0.1             # General dropout rate for model components
+in_dropout: 0.1          # Dropout applied to inputs before Evoformer-Lite
+rowwise_dropout: 0.15     # Row-wise dropout mask (shared across sequences)
+# columnwise_dropout: 0.1  # Column-wise dropout mask - REMOVED for consistency
+
+# Task and training parameters
+task_type: ${data.task_type}   # Task type: "mf", "bp", or "cc" (inferred from data config)
+warmup_ratio: 0.05             # Warm-up ratio for cosine LR schedule (5% of total training steps)
+
+# Optimizer configuration
+optimizer:
+  _target_: torch.optim.AdamW
+  _partial_: true
+  lr: 1e-4          # Learning rate – tune per task if necessary
+  weight_decay: 1e-2  # L2 regularisation
+  betas: [0.9, 0.999]
+  eps: 1e-8
+
+# Learning-rate scheduler configuration
+scheduler:
+  _target_: src.utils.lr_schedulers.get_cosine_schedule_with_warmup
+  _partial_: true      # Hydra will inject (optimizer, num_training_steps, num_warmup_steps)
+  num_cycles: 0.5      # Single half-cosine cycle
+  last_epoch: -1       # Start fresh (-1)
+
+# Alternative scheduler options (uncomment to use instead):
+# scheduler:
+#   _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+#   _partial_: true
+#   T_max: 100           # Max epochs (override in experiments to match trainer.max_epochs)
+#   eta_min: 1e-6        # Minimum learning rate at the end of annealing
+#   last_epoch: -1       # Start from beginning (-1 means start fresh)
+
+# scheduler:
+#   _target_: torch.optim.lr_scheduler.ReduceLROnPlateau  
+#   _partial_: true
+#   mode: "min"          # Reduce when validation loss stops decreasing
+#   factor: 0.5          # Multiply LR by this factor when reducing
+#   patience: 10         # Wait this many epochs without improvement
+#   threshold: 1e-4      # Minimum change to qualify as improvement
+#   min_lr: 1e-7         # Minimum learning rate
+#   verbose: true        # Print when LR is reduced 
