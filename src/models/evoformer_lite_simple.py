@@ -63,43 +63,100 @@ class MLPHead(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
 
-from afno import AFNO2D         # provided by the repo above
 
-class AFNOMix2D(nn.Module):
+
+class AFF2D(nn.Module):
     """
-    Adaptive Fourier Neural Operator mixer for (N_seq × L) MSA tokens.
-    Expects x: [B, N_seq, L, D] and pad: [B, N_seq, L] (True ⇒ PAD).
+    Adaptive‑Frequency‑Filter token mixer (channel–last).
+    Args
+    ----
+    hidden_size : C  – number of channels coming from the previous block
+    num_groups  : G  – number of groups for the group‑wise 1×1 “mask MLP”
+    mask_hidden : r  – expansion ratio for the hidden layer inside the mask MLP
+    Forward
+    -------
+    x : (B, H*W, C)     – flattened tokens
+    spatial_size : (H, W)
+    returns : (B, H*W, C)   – filtered tokens (residual added)
     """
-    def __init__(
-        self,
-        d_model: int,
-        num_blocks: int = 8,
-        dropout: float = 0.1,
-        sparsity_thresh: float = 1e-2,
-        hard_frac: float = 1.0,
-    ):
+    def __init__(self,
+                 hidden_size: int,
+                 num_groups: int = 8,
+                 mask_hidden: int = 4):
         super().__init__()
-        self.norm  = nn.LayerNorm(d_model)
-        self.afno  = AFNO2D(
-            hidden_size=d_model,
-            num_blocks=num_blocks,
-            sparsity_threshold=sparsity_thresh,
-            hard_thresholding_fraction=int(hard_frac),
+        if hidden_size % num_groups:
+            raise ValueError('hidden_size must be divisible by num_groups')
+
+        self.hidden_size   = hidden_size             # C
+        self.num_groups    = num_groups              # G
+        self.freq_channels = 2 * hidden_size         # real ⊕ imag ⇒ 2C
+
+        # Group‑wise 1×1‑MLP that predicts the complex mask  M  in Eq.(4):contentReference[oaicite:0]{index=0}
+        self.mask_fc1 = nn.Conv2d(
+            in_channels  = self.freq_channels,
+            out_channels = mask_hidden * self.freq_channels,
+            kernel_size  = 1,
+            groups       = num_groups,
+            bias         = True,
         )
-        self.drop  = nn.Dropout(dropout)
+        self.act = nn.ReLU(inplace=True)
+        self.mask_fc2 = nn.Conv2d(
+            in_channels  = mask_hidden * self.freq_channels,
+            out_channels = self.freq_channels,
+            kernel_size  = 1,
+            groups       = num_groups,
+            bias         = True,
+        )
 
-    def forward(self, x: torch.Tensor, pad: torch.Tensor) -> torch.Tensor:
-        # x: [B, N_seq, L, D]; pad: [B, N_seq, L]
+    # keep FFTs in fp32 for numerical stability (paper uses the same precaution)
+    # @torch.cuda.amp.autocast(enabled=False)
+    def forward(self, x: torch.Tensor, spatial_size: tuple[int, int]):
+        B, HW, C = x.shape
+        H, W     = spatial_size
+        if HW != H * W or C != self.hidden_size:
+            raise ValueError('`spatial_size` inconsistent with input')
+
+        # -> (B, C, H, W)
+        x_img = x.transpose(1, 2).reshape(B, C, H, W)
+
+        # 2‑D real FFT  (orthonormal scaling keeps energy unchanged)
+        Xf = torch.fft.rfft2(x_img, dim=(-2, -1), norm='ortho')
+
+        # split into real/imag and stack along channel dim  → (B, 2C, H, W//2+1)
+        Xf_cat = torch.cat([Xf.real, Xf.imag], dim=1)
+
+        # learn instance‑adaptive mask  M(F(X))  (same shape as Xf_cat)
+        M = self.mask_fc2(self.act(self.mask_fc1(Xf_cat)))
+
+        # complex multiplication — Eq.(4) Hadamard product in frequency domain
+        M_real, M_imag = M.chunk(2, dim=1)
+        Yf = torch.complex(
+            M_real * Xf.real - M_imag * Xf.imag,
+            M_real * Xf.imag + M_imag * Xf.real,
+        )
+
+        # inverse FFT  (B, C, H, W)  — gives F⁻¹[M⊙F(X)]
+        y_img = torch.fft.irfft2(Yf, s=(H, W), dim=(-2, -1), norm='ortho')
+
+        # reshape back & add residual
+        y = y_img.reshape(B, C, HW).transpose(1, 2)
+        return y + x
+
+
+class AFFMix2D(nn.Module):     # mirrors your AFNOMix2D
+    def __init__(self, d_model, num_groups=8, dropout=0.1):
+        super().__init__()
+        self.norm = nn.LayerNorm(d_model)
+        self.aff  = AFF2D(hidden_size=d_model, num_groups=num_groups)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x, pad):
         x = x.masked_fill(pad.unsqueeze(-1), 0.)
-
-        B, N, L, D = x.shape
-        y = self.norm(x).reshape(B, N * L, D)          # → [B, N*L, D]
-        y = self.afno(y, spatial_size=(N, L))          # AFNO mixes in Fourier domain
-        y = y.reshape(B, N, L, D)
-
-        y = y.masked_fill(pad.unsqueeze(-1), 0.)
+        B,N,L,D = x.shape
+        y = self.norm(x).reshape(B, N*L, D)          # [B, N*L, D]
+        y = self.aff(y, spatial_size=(N, L))
+        y = y.reshape(B, N, L, D).masked_fill(pad.unsqueeze(-1), 0.)
         return x + self.drop(y)
-
 
 class _ResidueSelfAttention(nn.Module):
     """Self-attention + FFN for residue track, with padding mask."""
@@ -125,7 +182,7 @@ class EvoformerLiteBlock(nn.Module):
     def __init__(self, d_model: int, n_heads: int, dropout: float, *_):
         super().__init__()
         
-        self.mix = AFNOMix2D(d_model)   # NEW
+        # self.mix = AFFMix2D(d_model)   # NEW
         self.msa_transition = ResidualFeedForward(d_model, 4, dropout)
 
         # --- MSA → residue fuse & residue self-attn remain unchanged ---
@@ -143,7 +200,7 @@ class EvoformerLiteBlock(nn.Module):
         #   pad_mask     : [B, L]
         pad = seq_pad_mask.unsqueeze(-1) | pad_mask.unsqueeze(1)  # [B,N,L]
 
-        msa = self.mix(msa, pad)          # ① Conv mixing with mask
+        # msa = self.mix(msa, pad)          # ① Conv mixing with mask
         msa = self.msa_transition(msa)    # ② Position-wise FFN
         # ③ MSA → residue projection (unchanged)
         seq_mask   = (~seq_pad_mask).unsqueeze(-1).unsqueeze(-1).type_as(msa)
