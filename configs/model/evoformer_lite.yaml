@@ -1,7 +1,7 @@
-_target_: src.models.evoformer_lite_msa_seq.ProteinLitModule
+_target_: src.models.ecoformer_lite_msa_seq_attention.ProteinLitModule
 
 # Model architecture parameters
-d_model: 768           # Base model dimension (ESM-C embeddings size)
+d_model: 1152           # Base model dimension (ESM-C embeddings size)
 d_msa: 768              # MSA embedding dimension (ESM-MSA output)
 n_blocks: 4             # Number of Evoformer-Lite blocks
 n_heads: 8              # Attention heads for all attention layers

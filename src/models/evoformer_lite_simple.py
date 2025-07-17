@@ -54,10 +54,10 @@ class MLPHead(nn.Module):
         # assert d_in == 1152, "d_in must be 1152"
         self.net = nn.Sequential(
             nn.LayerNorm(d_in),
-            nn.Linear(d_in, d_in // 2),
+            nn.Linear(d_in, 602),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(d_in // 2, d_out), #EXTREME WARNING NOTE: DIMS DEPEDNING ON TASK AND D_MSA
+            nn.Linear(602, d_out), #EXTREME WARNING NOTE: DIMS DEPEDNING ON TASK AND D_MSA
         ) 
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -140,7 +140,7 @@ class AFF2D(nn.Module):
 
         # reshape back & add residual
         y = y_img.reshape(B, C, HW).transpose(1, 2)
-        return y + x
+        return y
 
 
 class AFFMix2D(nn.Module):     # mirrors your AFNOMix2D
@@ -182,7 +182,7 @@ class EvoformerLiteBlock(nn.Module):
     def __init__(self, d_model: int, n_heads: int, dropout: float, *_):
         super().__init__()
         
-        # self.mix = AFFMix2D(d_model)   # NEW
+        self.mix = AFFMix2D(d_model)   # NEW
         self.msa_transition = ResidualFeedForward(d_model, 4, dropout)
 
         # --- MSA → residue fuse & residue self-attn remain unchanged ---
@@ -200,7 +200,7 @@ class EvoformerLiteBlock(nn.Module):
         #   pad_mask     : [B, L]
         pad = seq_pad_mask.unsqueeze(-1) | pad_mask.unsqueeze(1)  # [B,N,L]
 
-        # msa = self.mix(msa, pad)          # ① Conv mixing with mask
+        msa = self.mix(msa, pad)          # ① Conv mixing with mask
         msa = self.msa_transition(msa)    # ② Position-wise FFN
         # ③ MSA → residue projection (unchanged)
         seq_mask   = (~seq_pad_mask).unsqueeze(-1).unsqueeze(-1).type_as(msa)

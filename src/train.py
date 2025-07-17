@@ -6,6 +6,8 @@ import torch
 from lightning import Callback, LightningDataModule, LightningModule, Trainer
 from lightning.pytorch.loggers import Logger
 from omegaconf import DictConfig
+# import os
+# os.environ['PYTHONHASHSEED'] = '0'
 # import os, pathlib, subprocess
 # cutlass_dir = pathlib.Path.home() / "cutlass"        # ~/.cutlass also fine
 # os.environ["CUTLASS_PATH"] = str(cutlass_dir)        # inherit to all children

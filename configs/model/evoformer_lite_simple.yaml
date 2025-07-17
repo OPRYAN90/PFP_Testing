@@ -10,7 +10,7 @@ in_dropout: 0.1         # Dropout applied to inputs before Evoformer-Lite
 
 # Task and training parameters
 task_type: ${data.task_type}   # Task type: "mf", "bp", or "cc" (inferred from data config)
-warmup_ratio: 0.05             # Warm-up ratio for cosine LR schedule (5% of total training steps)
+warmup_ratio: 0.05             # Warm-up ratio for cosine LR schedule 
 
 # Optimizer configuration
 optimizer:
