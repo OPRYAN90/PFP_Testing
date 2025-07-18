@@ -49,13 +49,13 @@ class MLPHead(nn.Module):
     
     def __init__(self, d_in: int, d_out: int, dropout: float = 0.1): 
         super().__init__()
-        assert d_in == 1152, "d_in must be 1152"
+        assert d_in == 768, "d_in must be 768"
         self.net = nn.Sequential(
             nn.LayerNorm(d_in),
-            nn.Linear(d_in, d_in // 2),
+            nn.Linear(d_in, 602),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(d_in // 2, d_out), #EXTREME WARNING NOTE: DIMS DEPEDNING ON TASK AND D_MSA
+            nn.Linear(602, d_out), #EXTREME WARNING NOTE: DIMS DEPEDNING ON TASK AND D_MSA
         ) 
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -100,6 +100,7 @@ class SequenceEncoder(nn.Module):
             norm_first=True
         )
         self.tr = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.proj = nn.Linear(d_model, 768)
 
     def forward(self, x: torch.Tensor, pad_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Forward pass with pre-computed ESM-C embeddings.
@@ -113,7 +114,7 @@ class SequenceEncoder(nn.Module):
         """
         x = self.embed_drop(x)                 # ➋ new dropout point
         x = self.tr(x, src_key_padding_mask=pad_mask)
-        
+        x = self.proj(x)
         return x  # [B, L, d_model]
 
 #TODO: TEST BOTH with and without negative examples in dataset
@@ -155,7 +156,7 @@ class MSAEncoder(nn.Module):
             nn.Linear(d_hidden, 1280, bias=False),   # fixed width
         )
         self.post_ffn   = ResidualFeedForward(1280, expansion=4, dropout=p_feat)
-        self.final_proj = nn.Linear(1280, d_model, bias=False)  
+        self.final_proj = nn.Linear(1280, 768, bias=False)  
         self.feat_dropout = nn.Dropout(p_feat)
         self.final_dropout = nn.Dropout(p_feat * 0.75)
         self.norm = nn.LayerNorm(d_msa)
@@ -216,7 +217,7 @@ class CrossModalAttention(nn.Module):
     def __init__(self, d_model: int = 1152, n_heads: int = 8, n_layers: int = 2, dropout: float = 0.1):
         super().__init__()
         self.layers = nn.ModuleList()
-        
+        print(d_model)
         for _ in range(n_layers):
             layer = nn.ModuleDict({
                 "seq_norm": nn.LayerNorm(d_model),
@@ -304,17 +305,17 @@ class ProteinLitModule(LightningModule):
 
         # Fusion / Cross-attention
         self.cross_attn = CrossModalAttention(
-            d_model=d_model,
+            d_model=768,
             n_heads=n_heads,
             n_layers=n_cross_layers,
             dropout=dropout
         )
 
         # Readout: concatenate residue-wise features (mean-pool) -> linear projection
-        self.fusion_proj = nn.Linear(d_model * 2, d_model)
+        self.fusion_proj = nn.Linear(768 * 2, 768)
         
         # Create classifier head
-        self.head = MLPHead(d_model, get_num_classes_for_task(task_type), dropout)
+        self.head = MLPHead(768, get_num_classes_for_task(task_type), dropout)
 
         # For multi-label protein prediction, we use standard BCE loss
         self.loss_fn = nn.BCEWithLogitsLoss()

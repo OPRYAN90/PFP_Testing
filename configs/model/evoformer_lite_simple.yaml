@@ -5,6 +5,8 @@ d_model: 768           # Base model dimension (ESM-C embeddings size)
 d_msa: 768              # MSA embedding dimension (ESM-MSA output)
 n_blocks: 4             # Number of Evoformer-Lite blocks
 n_heads: 8              # Attention heads for all attention layers
+n_res_blocks: 1         # Number of residue self-attention blocks per Evoformer block
+n_xattn_layers: 1       # Number of bidirectional cross-attention layers per Evoformer block
 dropout: 0.1            # General dropout rate for model components
 in_dropout: 0.1         # Dropout applied to inputs before Evoformer-Lite
 

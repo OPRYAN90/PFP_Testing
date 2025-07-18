@@ -51,7 +51,7 @@ class MLPHead(nn.Module):
     
     def __init__(self, d_in: int, d_out: int, dropout: float = 0.1): 
         super().__init__()
-        # assert d_in == 1152, "d_in must be 1152"
+        # assert d_in == 768, "d_in must be 768"
         self.net = nn.Sequential(
             nn.LayerNorm(d_in),
             nn.Linear(d_in, 602),
@@ -179,20 +179,44 @@ class _ResidueSelfAttention(nn.Module):
 class EvoformerLiteBlock(nn.Module):
     """Canonical Evoformer-Lite block with ConvMix2D"""
     
-    def __init__(self, d_model: int, n_heads: int, dropout: float, *_):
+    def __init__(self, d_model: int, n_heads: int, dropout: float,
+                 n_res_blocks: int = 1, n_xattn_layers: int = 1, *_):
         super().__init__()
         
         self.mix = AFFMix2D(d_model)   # NEW
         self.msa_transition = ResidualFeedForward(d_model, 4, dropout)
 
-        # --- MSA → residue fuse & residue self-attn remain unchanged ---
-        self.seq_norm      = nn.LayerNorm(d_model)
-        self.seq_out_proj  = nn.Linear(d_model, d_model, bias=True)
-        self.seq_gate_proj = nn.Linear(d_model, d_model, bias=True)
-        nn.init.zeros_(self.seq_out_proj.weight);  nn.init.zeros_(self.seq_out_proj.bias)
-        nn.init.zeros_(self.seq_gate_proj.weight); nn.init.constant_(self.seq_gate_proj.bias, 1.0)
-        self.seq_dropout   = nn.Dropout(dropout)
-        self.res_attn      = _ResidueSelfAttention(d_model, n_heads, dropout)
+        # ------------------------------------------------------------------
+        # Seq⇄MSA *cross* attention stack (lightweight; token dim = L only).
+        # We pool MSA across sequences (masked mean) to get an [B,L,C] view,
+        # then run bidirectional cross-attention between residue & pooled MSA.
+        # ------------------------------------------------------------------
+        self.seq_norms = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(n_xattn_layers)])
+        self.msa_norms = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(n_xattn_layers)])
+        self.seq_attns = nn.ModuleList([
+            nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True) 
+            for _ in range(n_xattn_layers)
+        ])
+        self.msa_attns = nn.ModuleList([
+            nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True) 
+            for _ in range(n_xattn_layers)
+        ])
+        self.seq_ffns = nn.ModuleList([
+            ResidualFeedForward(d_model, 4, dropout) for _ in range(n_xattn_layers)
+        ])
+        self.msa_ffns = nn.ModuleList([
+            ResidualFeedForward(d_model, 4, dropout) for _ in range(n_xattn_layers)
+        ])
+
+        # Fuse (concat seq ⊕ msa_ctx → project back to C)
+        self.x_fuse = nn.Linear(2 * d_model, d_model, bias=True)
+        self.x_drop = nn.Dropout(dropout)
+
+        # Multiple residue self-attention blocks
+        self.res_attn_blocks = nn.ModuleList([
+            _ResidueSelfAttention(d_model, n_heads, dropout) 
+            for _ in range(n_res_blocks)
+        ])
 
     def forward(self, msa, residue, pad_mask, seq_pad_mask):
         # Build 3-D padding mask for MSA tokens: True ⇢ PAD
@@ -205,20 +229,49 @@ class EvoformerLiteBlock(nn.Module):
         # ③ MSA → residue projection (unchanged)
         seq_mask   = (~seq_pad_mask).unsqueeze(-1).unsqueeze(-1).type_as(msa)
         seq_valid  = seq_mask.sum(dim=1)
-        seq_mean   = (msa * seq_mask).sum(dim=1) / seq_valid     # [B, L, D]
-        seq_mean   = self.seq_norm(seq_mean)
-        update     = self.seq_out_proj(seq_mean)
-        gate       = torch.sigmoid(self.seq_gate_proj(seq_mean))
-        residue    = residue + self.seq_dropout(gate * update)
-        # ④ Residue self-attention (unchanged)
-        residue    = self.res_attn(residue, pad_mask)
+        msa_mean   = (msa * seq_mask).sum(dim=1) / seq_valid     # [B, L, D]
+                      # [B,L,C]
+    
+        # ④ Bidirectional cross-attention between residue & pooled MSA.
+        # Masks for nn.MultiheadAttention: key_padding_mask is [B,L] True→ignore.
+        # We use residue pad for both directions (msa_mean shares same L mask).
+        msa_pad_L = pad_mask  # [B,L]
+        seq_pad_L = pad_mask  # residue uses same length mask
+        for i in range(len(self.seq_norms)):
+            seq_norm = self.seq_norms[i](residue)
+            msa_norm = self.msa_norms[i](msa_mean)
+
+            # seq queries msa summary
+            seq_ctx, _ = self.seq_attns[i](
+                seq_norm, msa_norm, msa_norm, key_padding_mask=msa_pad_L, need_weights=False
+            )
+            # msa summary queries seq
+            msa_ctx, _ = self.msa_attns[i](
+                msa_norm, seq_norm, seq_norm, key_padding_mask=seq_pad_L, need_weights=False
+            )
+
+            residue  = residue  + seq_ctx
+            msa_mean = msa_mean + msa_ctx
+
+            residue  = self.seq_ffns[i](residue)
+            msa_mean = self.msa_ffns[i](msa_mean)
+
+        # ⑤ Fuse seq ⊕ msa_mean → project back to C (residual to seq)
+        fused   = torch.cat([residue, msa_mean], dim=-1)  # [B,L,2C]
+        fused   = self.x_drop(self.x_fuse(fused))         # [B,L,C]
+        residue = residue + fused                         # residual add
+
+        for res_attn in self.res_attn_blocks:
+            residue = res_attn(residue, pad_mask)
         return msa, residue
 
 
 class EvoformerLiteMSASeq(nn.Module):
     """Canonical Evoformer-Lite stack with MSA and residue tracks."""
 
-    def __init__(self, d_msa: int, d_model: int, n_blocks: int, n_heads: int, dropout: float, in_dropout: float):
+    def __init__(self, d_msa: int, d_model: int, n_blocks: int, n_heads: int,
+                 dropout: float, in_dropout: float,
+                 n_res_blocks: int = 1, n_xattn_layers: int = 1):
         super().__init__()
 
         self.msa_proj = nn.Linear(d_msa, d_model, bias=True)
@@ -227,7 +280,9 @@ class EvoformerLiteMSASeq(nn.Module):
 
         # Evoformer-Lite tower (updated to use ConvMix2D)
         self.blocks = nn.ModuleList([
-            EvoformerLiteBlock(d_model, n_heads, dropout) 
+            EvoformerLiteBlock(d_model, n_heads, dropout,
+                               n_res_blocks=n_res_blocks,
+                               n_xattn_layers=n_xattn_layers)
             for _ in range(n_blocks)
         ])
 
@@ -254,6 +309,8 @@ class ProteinLitModule(LightningModule):
         d_msa: int = 768,                     # MSA embedding dimension
         n_blocks: int = 4,                    # Number of Evoformer-Lite blocks
         n_heads: int = 8,                     # Attention heads
+        n_res_blocks: int = 1,                # Number of residue self-attention blocks per Evoformer block
+        n_xattn_layers: int = 1,              # Number of bidirectional cross-attention layers per Evoformer block
         dropout: float = 0.1,                 # Dropout rate
         in_dropout: float = 0.1,              # Input dropout rate
         optimizer: Optional[Any] = None,      # Hydra optimizer config
@@ -276,7 +333,15 @@ class ProteinLitModule(LightningModule):
         nn.init.normal_(self.eos_token, std=0.02)
         
         # Canonical Evoformer-Lite stack with ConvMix2D
-        self.evo_stack = EvoformerLiteMSASeq(d_msa, d_model, n_blocks, n_heads, dropout, in_dropout)
+        self.evo_stack = EvoformerLiteMSASeq(
+            d_msa, d_model,
+            n_blocks=n_blocks,
+            n_heads=n_heads,
+            dropout=dropout,
+            in_dropout=in_dropout,
+            n_res_blocks=n_res_blocks,
+            n_xattn_layers=n_xattn_layers,
+        )
         
         # Create classifier head
         self.head = MLPHead(d_model, get_num_classes_for_task(task_type), dropout)

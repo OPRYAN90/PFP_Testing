@@ -4,12 +4,12 @@ _target_: src.models.protein_module.ProteinLitModule
 d_model: 1152          # Base model dimension (ESM-C actual embedding size)
 d_msa: 768             # MSA embedding dimension (MSA-Transformer output)
 n_seq_layers: 2        # Additional transformer layers on top of ESM-C
-n_cross_layers: 2      # Cross-modal attention layers between ESM and MSA
+n_cross_layers: 5      # Cross-modal attention layers between ESM and MSA
 n_heads: 8             # Attention heads for all transformer layers
 dropout: 0.15           # General dropout rate for model components
 task_type: ${data.task_type}         # Task type: "mf", "bp", or "cc" - automatically from data config
 # Training parameters  
-warmup_ratio: 0.075     # Warmup ratio for cosine schedule (5% of total training steps)
+warmup_ratio: 0.05     # Warmup ratio for cosine schedule (5% of total training steps)
 
 # MSA Encoder specific dropout parameters (now configurable!)
 p_chan: 0.10           # Channel dropout probability (AlphaFold-style embedding dropout)
@@ -19,7 +19,7 @@ p_feat: 0.15           # Feature dropout after MSA projection
 optimizer:
   _target_: torch.optim.AdamW
   _partial_: true
-  lr: 1.1e-4             # IMPORTANT: Adjust learning rate based on task type
+  lr: 1e-4             # IMPORTANT: Adjust learning rate based on task type
   weight_decay: 1e-2   # L2 regularization 
   betas: [0.9, 0.999]  # AdamW momentum parameters
   eps: 1e-8            # Numerical stability epsilon

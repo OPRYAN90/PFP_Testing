@@ -188,6 +188,10 @@ class ProteinDataModule(LightningDataModule):
         num_workers: int = 0,
         pin_memory: bool = True,
         msa_sample_size: Optional[int] = None,
+        # --- Simple stride subsampling (every k-th element) ---
+        stride_train: int = 1,
+        stride_val: int = 1,
+        stride_test: int = 1,
     ) -> None:
         """Initialize ProteinDataModule.
 
@@ -208,6 +212,11 @@ class ProteinDataModule(LightningDataModule):
         self.batch_size_per_device = batch_size
         # Expose requested MSA subsampling size in hyperparameters
         self.hparams.msa_sample_size = msa_sample_size
+        
+        # Store stride parameters
+        self.stride_train = stride_train
+        self.stride_val = stride_val
+        self.stride_test = stride_test
         
         # Store protein IDs for each split
         self.train_protein_ids: List[str] = []
@@ -258,7 +267,7 @@ class ProteinDataModule(LightningDataModule):
         
         print(f"Scanning {split_dir} for proteins with non-empty {self.hparams.task_type} labels...")
         
-        for protein_dir in split_dir.iterdir():
+        for protein_dir in sorted(split_dir.iterdir()):
             if not protein_dir.is_dir():
                 continue
                 
@@ -400,6 +409,25 @@ class ProteinDataModule(LightningDataModule):
                 msa_sample_size=self.hparams.msa_sample_size,
             )
 
+        # Apply stride subsampling (deterministic)
+        def subsample(ds, k: int):
+            if k <= 1: 
+                return ds
+            idx = list(range(0, len(ds), k))
+            from torch.utils.data import Subset
+            return Subset(ds, idx)
+
+        self.data_train = subsample(self.data_train, self.stride_train)
+        self.data_val = subsample(self.data_val, self.stride_val)
+        self.data_test = subsample(self.data_test, self.stride_test)
+
+        if (self.stride_train > 1 or self.stride_val > 1 or self.stride_test > 1) and \
+           (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0):
+            print(f"[StrideSubsample] train:1/{self.stride_train} "
+                  f"val:1/{self.stride_val} test:1/{self.stride_test} "
+                  f"→ sizes = "
+                  f"{len(self.data_train)}/{len(self.data_val)}/{len(self.data_test)}")
+            
     def train_dataloader(self) -> DataLoader[Any]:
         """Create training dataloader."""
         return DataLoader(
@@ -407,7 +435,7 @@ class ProteinDataModule(LightningDataModule):
             batch_size=self.batch_size_per_device,
             num_workers=self.hparams.num_workers,
             pin_memory=self.hparams.pin_memory,
-            shuffle=True,
+            shuffle=True,  # still okay; underlying subset is fixed
             collate_fn=protein_collate,
             persistent_workers=True if self.hparams.num_workers > 0 else False,
         )
