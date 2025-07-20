@@ -4,7 +4,7 @@ _target_: src.models.protein_module.ProteinLitModule
 d_model: 1152          # Base model dimension (ESM-C actual embedding size)
 d_msa: 768             # MSA embedding dimension (MSA-Transformer output)
 n_seq_layers: 2        # Additional transformer layers on top of ESM-C
-n_cross_layers: 5      # Cross-modal attention layers between ESM and MSA
+n_cross_layers: 6      # Cross-modal attention layers between ESM and MSA
 n_heads: 8             # Attention heads for all transformer layers
 dropout: 0.15           # General dropout rate for model components
 task_type: ${data.task_type}         # Task type: "mf", "bp", or "cc" - automatically from data config

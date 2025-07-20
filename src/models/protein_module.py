@@ -90,16 +90,16 @@ class SequenceEncoder(nn.Module):
         # ➊ optional embedding-level dropout
         self.embed_drop = nn.Dropout(dropout*0.75) 
 
-        # Additional transformer layers on top of ESM-C
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=n_heads,
-            dim_feedforward=d_model * 4,
-            dropout=dropout,
-            batch_first=True,
-            norm_first=True
-        )
-        self.tr = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        # # Additional transformer layers on top of ESM-C
+        # encoder_layer = nn.TransformerEncoderLayer(
+        #     d_model=d_model,
+        #     nhead=n_heads,
+        #     dim_feedforward=d_model * 4,
+        #     dropout=dropout,
+        #     batch_first=True,
+        #     norm_first=True
+        # )
+        # self.tr = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
         self.proj = nn.Linear(d_model, 768)
 
     def forward(self, x: torch.Tensor, pad_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -113,11 +113,135 @@ class SequenceEncoder(nn.Module):
             Enhanced sequence representations [B, L, d_model]
         """
         x = self.embed_drop(x)                 # ➋ new dropout point
-        x = self.tr(x, src_key_padding_mask=pad_mask)
+        # x = self.tr(x, src_key_padding_mask=pad_mask)
         x = self.proj(x)
         return x  # [B, L, d_model]
 
-#TODO: TEST BOTH with and without negative examples in dataset
+
+class AFF2D(nn.Module):
+    """
+    Adaptive‑Frequency‑Filter token mixer (channel–last).
+    Args
+    ----
+    hidden_size : C  – number of channels coming from the previous block
+    num_groups  : G  – number of groups for the group‑wise 1×1 “mask MLP”
+    mask_hidden : r  – expansion ratio for the hidden layer inside the mask MLP
+    Forward
+    -------
+    x : (B, H*W, C)     – flattened tokens
+    spatial_size : (H, W)
+    returns : (B, H*W, C)   – filtered tokens (residual added)
+    """
+    def __init__(self,
+                 hidden_size: int,
+                 num_groups: int = 8,
+                 mask_hidden: int = 4):
+        super().__init__()
+        if hidden_size % num_groups:
+            raise ValueError('hidden_size must be divisible by num_groups')
+
+        self.hidden_size   = hidden_size             # C
+        self.num_groups    = num_groups              # G
+        self.freq_channels = 2 * hidden_size         # real ⊕ imag ⇒ 2C
+
+        # Group‑wise 1×1‑MLP that predicts the complex mask  M  in Eq.(4):contentReference[oaicite:0]{index=0}
+        self.mask_fc1 = nn.Conv2d(
+            in_channels  = self.freq_channels,
+            out_channels = mask_hidden * self.freq_channels,
+            kernel_size  = 1,
+            groups       = num_groups,
+            bias         = True,
+        )
+        self.act = nn.ReLU(inplace=True)
+        self.mask_fc2 = nn.Conv2d(
+            in_channels  = mask_hidden * self.freq_channels,
+            out_channels = self.freq_channels,
+            kernel_size  = 1,
+            groups       = num_groups,
+            bias         = True,
+        )
+
+        # ---- Identity‑preserving init: zero last layer so ΔM ≈ 0
+        nn.init.zeros_(self.mask_fc2.weight)
+        nn.init.zeros_(self.mask_fc2.bias)
+        self.mask_scale = nn.Parameter(torch.tensor(0.0))
+
+
+    # keep FFTs in fp32 for numerical stability (paper uses the same precaution)
+    # @torch.cuda.amp.autocast(enabled=False)
+    def forward(self, x: torch.Tensor, spatial_size: tuple[int, int]):
+        B, HW, C = x.shape
+        H, W     = spatial_size
+        if HW != H * W or C != self.hidden_size:
+            raise ValueError('`spatial_size` inconsistent with input')
+
+        # -> (B, C, H, W)
+        x_img = x.transpose(1, 2).reshape(B, C, H, W)
+
+        # 2‑D real FFT  (orthonormal scaling keeps energy unchanged)
+        Xf = torch.fft.rfft2(x_img, dim=(-2, -1), norm='ortho')
+
+        # split into real/imag and stack along channel dim  → (B, 2C, H, W//2+1)
+        Xf_cat = torch.cat([Xf.real, Xf.imag], dim=1)
+
+        # learn instance‑adaptive mask  M(F(X))  (same shape as Xf_cat)
+        M = self.mask_fc2(self.act(self.mask_fc1(Xf_cat)))
+
+        # complex multiplication — Eq.(4) Hadamard product in frequency domain
+        M_real, M_imag = M.chunk(2, dim=1)
+        s = self.mask_scale.tanh()
+        M_real = 1 + s * M_real    # identity real mask
+        M_imag = s * M_imag        # zero phase shift at init
+        Yf = torch.complex(
+            M_real * Xf.real - M_imag * Xf.imag,
+            M_real * Xf.imag + M_imag * Xf.real,
+        )
+
+        # inverse FFT  (B, C, H, W)  — gives F⁻¹[M⊙F(X)]
+        y_img = torch.fft.irfft2(Yf, s=(H, W), dim=(-2, -1), norm='ortho')
+
+        # reshape back & add residual
+        y = y_img.reshape(B, C, HW).transpose(1, 2)
+        return y
+
+
+class AFFMix2D(nn.Module):     # mirrors your AFNOMix2D
+    def __init__(self, d_model, num_groups=8, dropout=0.1):
+        super().__init__()
+        self.norm_aff = nn.LayerNorm(d_model)
+        self.norm_ffn = nn.LayerNorm(d_model)
+        self.aff      = AFF2D(hidden_size=d_model, num_groups=num_groups)
+        self.drop_aff = nn.Dropout(dropout)
+        self.alpha_aff = nn.Parameter(torch.zeros(1))    # ReZero gate
+        self.ffn_body = nn.Sequential(
+            nn.Linear(d_model, d_model*4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model*4, d_model),
+            nn.Dropout(dropout),
+        )
+        self.alpha_ffn = nn.Parameter(torch.zeros(1))    # ReZero gate
+        self.drop_ffn = nn.Dropout(dropout)
+
+    def forward(self, x, pad):
+        B, N, L, D = x.shape
+        pad_exp = pad.unsqueeze(-1)           # [B,N,L,1]
+
+        # 1) AFF delta (identity at init because alpha_aff=0 and mask_scale≈0)
+        x_masked = x.masked_fill(pad_exp, 0.)
+        y_aff = self.aff(self.norm_aff(x_masked).reshape(B, N*L, D),
+                         spatial_size=(N, L)).reshape(B, N, L, D)
+        # Option 1 (use y directly): x + α * y_aff  (since y_aff ≈ x at init)
+        x = x + self.alpha_aff * self.drop_aff(y_aff)
+
+        # 2) FFN delta (also identity at init)
+        delta_ffn = self.ffn_body(self.norm_ffn(x))
+        x = x + self.alpha_ffn * self.drop_ffn(delta_ffn)
+
+        # Final mask once
+        x = x.masked_fill(pad_exp, 0.)
+        return x
+
 class MSAEncoder(nn.Module):
     """Encoder for Multiple Sequence Alignment (MSA) embeddings.
     Expected input: msa [B, N_seq, L_cls+res, d_msa] (already includes CLS at col 0)
@@ -144,27 +268,28 @@ class MSAEncoder(nn.Module):
         self.channel_dropout = nn.Dropout(p_chan)
         
         # 3) Conservation scoring head
-        self.conservation_head = nn.Linear(d_msa, 1, bias=False)
-        
+        # self.conservation_head = nn.Linear(d_msa, 1, bias=False)
+        self.msa_mix = AFFMix2D(d_msa, num_groups=8, dropout=0.1)
         # 4) Projection + regularization
-        assert d_model == 1152, "d_model must be 1152"
-        d_hidden = 1024 #TODO: EDIT THIS WITH DIMENSION ONLY MEANT FOR INTIAL RUN 
-        self.expansion_mlp = nn.Sequential(
-            nn.Linear(d_msa, d_hidden, bias=True),
-            nn.GELU(),
-            nn.Dropout(p_feat * 0.75),
-            nn.Linear(d_hidden, 1280, bias=False),   # fixed width
-        )
-        self.post_ffn   = ResidualFeedForward(1280, expansion=4, dropout=p_feat)
-        self.final_proj = nn.Linear(1280, 768, bias=False)  
-        self.feat_dropout = nn.Dropout(p_feat)
-        self.final_dropout = nn.Dropout(p_feat * 0.75)
+        # assert d_model == 1152, "d_model must be 1152"
+        # d_hidden = 1024 #TODO: EDIT THIS WITH DIMENSION ONLY MEANT FOR INTIAL RUN 
+        # self.expansion_mlp = nn.Sequential(
+        #     nn.Linear(d_msa, d_hidden, bias=True),
+        #     nn.GELU(),
+        #     nn.Dropout(p_feat * 0.75),
+        #     nn.Linear(d_hidden, 1280, bias=False),   # fixed width
+        # )
+        self.post_ffn   = ResidualFeedForward(d_msa, expansion=4, dropout=p_feat)
+        # self.final_proj = nn.Linear(1280, 768, bias=False)  
+        # self.feat_dropout = nn.Dropout(p_feat)
+        # self.final_dropout = nn.Dropout(p_feat * 0.75)
         self.norm = nn.LayerNorm(d_msa)
     def forward(
         self,
         msa: torch.Tensor,   # [B, N_seq, L_pad, d_msa]  zero-padded
         lengths: torch.Tensor,   # [B]  true residue counts (no CLS/EOS)
         pad_mask: torch.Tensor,  # [B, L] True where padded
+        seq_pad: torch.Tensor,  # [B, N_max]
     ) -> torch.Tensor:
         # ------------------------------------------------------------
         # Insert EOS (learnable) at position L+1  — truly in-place
@@ -178,35 +303,18 @@ class MSAEncoder(nn.Module):
 
         # 2) scatter the EOS token into the msa along dim-2
         msa.scatter_(2, idx, eos_tok) 
-
+        full_mask = seq_pad.unsqueeze(-1) | pad_mask.unsqueeze(1)  # [B,N,L]
         msa     = self.channel_dropout(msa)
-
-        scores  = self.conservation_head(msa).squeeze(-1)     # [B, N_seq, L_pad]
-        
-        # Mask out padded positions before softmax
-        # pad_mask: [B, L] → expand to [B, N_seq, L]
-        mask = pad_mask.unsqueeze(1).expand(-1, msa.size(1), -1)      
-        scores   = scores.masked_fill(mask, -1e4)                  # never get prob-mass
-        
-        # Detect rows that are entirely padding (vertical padding from collate_fn)
-        # If first position (CLS token) of a row has all zeros, entire row is padding
-        row_padding_mask = (msa[:, :, 0, :].abs().sum(-1) == 0)    # [B, N_seq] - True if row is padding
-        row_padding_mask = row_padding_mask.unsqueeze(-1).expand(-1, -1, msa.size(2))  # [B, N_seq, L_pad]
-        
-        # Combine position-wise dropout mask with row padding mask
-        mask_logits = row_padding_mask & (~mask)                          # only real residues
-        scores = scores.masked_fill(mask_logits, -1e4)
-
-        weights = torch.softmax(scores, dim=1)                # over N_seq
-        weights = weights.masked_fill(mask, 0.0)       # ← explicit zero-out after softmax
-        pooled  = (msa * weights.unsqueeze(-1)).sum(dim=1)    # [B, L_pad, d_msa]
-        x = self.norm(pooled)
-        x = self.expansion_mlp(x)
-        x = self.feat_dropout(x)
+        msa = self.msa_mix(msa, full_mask)
+        msa = msa.masked_fill(full_mask.unsqueeze(-1), 0.)
+        msa = msa.sum(dim=1)
+        x = self.norm(msa)
+        # x = self.expansion_mlp(x)
+        # x = self.feat_dropout(x)
         x = self.post_ffn(x)
-        x = self.final_proj(x)          # down-project
-        x = self.final_dropout(x)
-        return x #TODO: Experiment with complex FFN vs simple projection
+        # x = self.final_proj(x)          # down-project
+        # x = self.final_dropout(x)
+        return x 
 
 
 ############################################################
@@ -348,6 +456,7 @@ class ProteinLitModule(LightningModule):
         msa_tok_list = batch["msa_tok"]   # list[Tensor] – variable [N_seq_i, L_i]
 
         pad_mask = batch["pad_mask"]     # [B, L] - True where padded
+        seq_pad    = batch["seq_pad_mask"]  # [B, N_max]
 
         # Compute MSA embeddings on-the-fly (sequential, per-sample)
         target_len = seq_emb.shape[1]  # CLS + residues + EOS (same as pad_mask width)
@@ -366,7 +475,7 @@ class ProteinLitModule(LightningModule):
 
         # Encode each modality with padding masks
         seq_z = self.seq_encoder(seq_emb, pad_mask=seq_pad_mask)  # [B, L, d]
-        msa_z = self.msa_encoder(msa_emb, batch["lengths"], pad_mask=msa_pad_mask)  # [B, L, d]
+        msa_z = self.msa_encoder(msa_emb, batch["lengths"], pad_mask=msa_pad_mask, seq_pad=seq_pad)  # [B, L, d]
 
         # Cross-modal attention with padding masks
         seq_z, msa_z = self.cross_attn(seq_z, msa_z, seq_pad_mask, msa_pad_mask)  # each [B, L, d]

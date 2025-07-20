@@ -230,7 +230,8 @@ class EvoformerLiteBlock(nn.Module):
         seq_mask   = (~seq_pad_mask).unsqueeze(-1).unsqueeze(-1).type_as(msa)
         seq_valid  = seq_mask.sum(dim=1)
         msa_mean   = (msa * seq_mask).sum(dim=1) / seq_valid     # [B, L, D]
-                      # [B,L,C]
+        msa_mean   = msa_mean.masked_fill(pad_mask.unsqueeze(-1), 0.0)
+             # [B,L,C]
     
         # ④ Bidirectional cross-attention between residue & pooled MSA.
         # Masks for nn.MultiheadAttention: key_padding_mask is [B,L] True→ignore.
@@ -257,6 +258,8 @@ class EvoformerLiteBlock(nn.Module):
             msa_mean = self.msa_ffns[i](msa_mean)
 
         # ⑤ Fuse seq ⊕ msa_mean → project back to C (residual to seq)
+        residue = residue.masked_fill(pad_mask.unsqueeze(-1), 0.0)
+        msa_mean = msa_mean.masked_fill(pad_mask.unsqueeze(-1), 0.0)
         fused   = torch.cat([residue, msa_mean], dim=-1)  # [B,L,2C]
         fused   = self.x_drop(self.x_fuse(fused))         # [B,L,C]
         residue = residue + fused                         # residual add
