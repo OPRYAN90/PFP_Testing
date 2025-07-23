@@ -119,7 +119,14 @@ class ProteinDataset(Dataset):
         # Extract embeddings from data structures
         # ESM-C: Direct tensor (1, L+2, 1152) -> squeeze to (L+2, 1152)
         assert esmc_data.dim() == 3, "ESM-C data should be a 3D tensor"
-        esmc_emb = esmc_data.squeeze(0)
+        esmc_emb = esmc_data.squeeze(0)               # [L+2, d]
+
+        # --- GRAPH PART -------------------------------------------------
+        edge_path = protein_dir / "edge_index.pt"
+        edge_index = torch.load(edge_path).long()     # [2, E]
+
+        # Node features = residues only (drop CLS/EOS)
+        node_x = esmc_emb[1:1 + protein_length]       # [L, d]
         
         # Prepare MSA tokens (CPU-only, no embedding computation)
         # Parse A3M file + convert to integer tokens (CPU-only)
@@ -162,6 +169,8 @@ class ProteinDataset(Dataset):
             "msa_tok": msa_tok,
             "length": protein_length,
             "labels": labels,
+            "node_x": node_x,                  # >>> ADDED
+            "edge_index": edge_index,          # >>> ADDED
         }
 
         return sample
@@ -543,6 +552,22 @@ def protein_collate(batch):
     # 4) Timing aggregation
     # ----------------------------------------------------
 
+    # -------- GRAPH PACKING (no padding) -------------------------------
+    node_x_list   = [b["node_x"]      for b in batch]   # [L_i, d]
+    edge_list     = [b["edge_index"]  for b in batch]   # [2, E_i]
+
+    cum = 0
+    x_cat, ei_cat, batch_vec = [], [], []
+    for i, (x_i, e_i) in enumerate(zip(node_x_list, edge_list)):
+        x_cat.append(x_i)
+        ei_cat.append(e_i + cum)
+        batch_vec.append(torch.full((x_i.size(0),), i, dtype=torch.long))
+        cum += x_i.size(0)
+
+    graph_x        = torch.cat(x_cat, 0)                     # [N_tot, d]
+    graph_edge_idx = torch.cat(ei_cat, 1)                    # [2, E_tot]
+    graph_batch    = torch.cat(batch_vec, 0)                 # [N_tot]
+
     return {
         "protein_id": protein_ids,
         "sequence": sequences,
@@ -552,4 +577,8 @@ def protein_collate(batch):
         "labels": labels,
         "pad_mask": pad_mask,
         "lengths": lengths_tensor,
+        # --- graph stuff ---
+        "x": graph_x,
+        "edge_index": graph_edge_idx,
+        "graph_batch": graph_batch,
     }
