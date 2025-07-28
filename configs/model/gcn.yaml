@@ -2,7 +2,7 @@ _target_: src.models.graph_network.ProteinLitModule
 
 # Model architecture parameters
 d_in: 1152             # Node feature dimension (ESM-C embeddings)
-num_layers: 3          # Number of GCN layers
+num_layers: 5          # Number of GCN layers
 dropout: 0.15           # General dropout rate for model components
 edge_drop: 0.0         # Edge dropout probability for regularization
 

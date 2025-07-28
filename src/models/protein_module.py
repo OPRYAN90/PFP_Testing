@@ -117,6 +117,7 @@ class SequenceEncoder(nn.Module):
         x = self.proj(x)
         return x  # [B, L, d_model]
 
+
 class MSAEncoder(nn.Module):
     """Encoder for Multiple Sequence Alignment (MSA) embeddings.
     Expected input: msa [B, N_seq, L_cls+res, d_msa] (already includes CLS at col 0)
@@ -135,24 +136,41 @@ class MSAEncoder(nn.Module):
     ):
         super().__init__()
         
+        # 0) Learnable EOS token shared across rows
+        self.eos_token = nn.Parameter(torch.zeros(1, 1, 1, d_msa))
+        nn.init.normal_(self.eos_token, std=0.02)
+        
+        # 2) Standard element-wise dropout on the embedding vector
+        self.channel_dropout = nn.Dropout(p_chan)
         
         # 3) Conservation scoring head
         self.conservation_head = nn.Linear(d_msa, 1, bias=False)
-        
- 
+
         self.post_ffn   = ResidualFeedForward(d_msa, expansion=4, dropout=p_feat)
+
         self.norm = nn.LayerNorm(d_msa)
     def forward(
         self,
         msa: torch.Tensor,   # [B, N_seq, L_pad, d_msa]  zero-padded
         lengths: torch.Tensor,   # [B]  true residue counts (no CLS/EOS)
         pad_mask: torch.Tensor,  # [B, L] True where padded
+        seq_pad: torch.Tensor,  # [B, N_max]
     ) -> torch.Tensor:
         # ------------------------------------------------------------
         # Insert EOS (learnable) at position L+1  — truly in-place
         # ------------------------------------------------------------
+        B, N_seq, L_pad, D = msa.shape
+        # 0) prepare a (B × N_seq × 1 × D) tensor full of your EOS token
+        eos_tok = self.eos_token.view(1, 1, 1, D).expand(B, N_seq, 1, D)    # (B, N_seq, 1, D)
 
+        # 1) build the same shape index tensor for the "length+1" position
+        idx = (lengths + 1).view(B, 1, 1, 1).expand(B, N_seq, 1, D)                # (B, N_seq, 1, D)
 
+        # 2) scatter the EOS token into the msa along dim-2
+        msa.scatter_(2, idx, eos_tok) 
+
+        msa = self.channel_dropout(msa)
+        
         scores  = self.conservation_head(msa).squeeze(-1)     # [B, N_seq, L_pad]
         
         # Mask out padded positions before softmax
@@ -174,7 +192,8 @@ class MSAEncoder(nn.Module):
         pooled  = (msa * weights.unsqueeze(-1)).sum(dim=1)    # [B, L_pad, d_msa]
         x = self.norm(pooled)
         x = self.post_ffn(x)
-        return x
+
+        return x 
 
 
 ############################################################
@@ -256,9 +275,6 @@ class ProteinLitModule(LightningModule):
         import esm
         self.msa_model, _ = esm.pretrained.esm_msa1b_t12_100M_UR50S()
         self.msa_model.eval().requires_grad_(False)
-        self.channel_dropout = nn.Dropout(p_chan)
-        self.eos_token = nn.Parameter(torch.zeros(1, 1, 1, d_msa))
-        nn.init.normal_(self.eos_token, std=0.02)
         
         # Encoders
         self.seq_encoder = SequenceEncoder(
@@ -287,36 +303,7 @@ class ProteinLitModule(LightningModule):
         
         # Create classifier head
         self.head = MLPHead(768, get_num_classes_for_task(task_type), dropout)
-        
 
-        self.msa_encoder_2 = MSAEncoder(
-            d_msa=d_msa,
-            d_model=d_model,
-            p_chan=p_chan,
-            p_feat=p_feat
-        )
-        
-        self.cross_attn_2 = CrossModalAttention(
-            d_model=768,
-            n_heads=n_heads,
-            n_layers=n_cross_layers,
-            dropout=dropout
-        )
-        
-        self.cross_attn_3 = CrossModalAttention(
-            d_model=768,
-            n_heads=n_heads,
-            n_layers=n_cross_layers,
-            dropout=dropout
-        )
-
-        self.msa_encoder_3 = MSAEncoder(
-            d_msa=d_msa,
-            d_model=d_model,
-            p_chan=p_chan,
-            p_feat=p_feat
-        )
-        
         # For multi-label protein prediction, we use standard BCE loss
         self.loss_fn = nn.BCEWithLogitsLoss()
 
@@ -348,21 +335,12 @@ class ProteinLitModule(LightningModule):
         msa_tok_list = batch["msa_tok"]   # list[Tensor] – variable [N_seq_i, L_i]
 
         pad_mask = batch["pad_mask"]     # [B, L] - True where padded
+        seq_pad    = batch["seq_pad_mask"]  # [B, N_max]
 
         # Compute MSA embeddings on-the-fly (sequential, per-sample)
         target_len = seq_emb.shape[1]  # CLS + residues + EOS (same as pad_mask width)
         msa_emb, msa_compute_time = self._compute_msa_embeddings(msa_tok_list, target_len)  # [B, N_seq_max, target_len, d_msa]
-        msa = msa_emb.clone()
-        B, N_seq, L_pad, D = msa_emb.shape
-        eos_tok = self.eos_token.view(1, 1, 1, D).expand(B, N_seq, 1, D)    # (B, N_seq, 1, D)
-
-        # 1) build the same shape index tensor for the "length+1" position
-        idx = (batch["lengths"] + 1).view(B, 1, 1, 1).expand(B, N_seq, 1, D)                # (B, N_seq, 1, D)
-
-        # 2) scatter the EOS token into the msa along dim-2
-        msa.scatter_(2, idx, eos_tok) 
-
-        msa     = self.channel_dropout(msa)
+        msa_emb = msa_emb.clone()
         # Expose timing so callbacks (e.g., BatchTimer) can log it **after** the forward pass.
         # Storing it on `self` ensures it is available in hooks such as `on_before_backward`.
         self._last_msa_compute_time = msa_compute_time
@@ -376,23 +354,11 @@ class ProteinLitModule(LightningModule):
 
         # Encode each modality with padding masks
         seq_z = self.seq_encoder(seq_emb, pad_mask=seq_pad_mask)  # [B, L, d]
-        msa_z = self.msa_encoder(msa, batch["lengths"], pad_mask=msa_pad_mask)  # [B, L, d]
+        msa_z = self.msa_encoder(msa_emb, batch["lengths"], pad_mask=msa_pad_mask, seq_pad=seq_pad)  # [B, L, d]
 
         # Cross-modal attention with padding masks
         seq_z, msa_z = self.cross_attn(seq_z, msa_z, seq_pad_mask, msa_pad_mask)  # each [B, L, d]
-            
-        msa_update = self.msa_encoder_2(msa, batch["lengths"], pad_mask=msa_pad_mask)
-        msa_update = msa_update + msa_z
-        seq_update, msa_update = self.cross_attn_2(seq_z, msa_update, seq_pad_mask, msa_pad_mask)
-        
-        msa_update_2 = self.msa_encoder_3(msa, batch["lengths"], pad_mask=msa_pad_mask)
-        msa_update_2 = msa_update + msa_update_2
-        seq_update, msa_update_2 = self.cross_attn_3(seq_update, msa_update_2, seq_pad_mask, msa_pad_mask)
-        
-        seq_z = seq_update
-        msa_z = msa_update_2
-        
-        
+
         # Do masked pooling instead of naive .mean()
         # compute length of each sequence (non-padding)
         valid_counts = (~pad_mask).sum(dim=1, keepdim=True) # [B, 1]
@@ -599,5 +565,4 @@ class ProteinLitModule(LightningModule):
         }, prog_bar=True, sync_dist=True)
 
         self.test_loss.reset(); self._test_logits.clear(); self._test_labels.clear()
-
 

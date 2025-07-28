@@ -8,14 +8,14 @@ task_type: "mf"
 # BP (1943 classes):
 # CC (320 classes): 
 batch_size: 32         # TODO: CHANGE THIS
-msa_sample_size: 12
+msa_sample_size: 24
 
-# --- Simple stride subsampling (every k-th element) ---
-stride_train: 1         # Use every 1st element (no subsampling)
-stride_val: 1           # Use every 1st element (no subsampling)  
-stride_test: 1          # Use every 1st element (no subsampling)
+# # --- Simple stride subsampling (every k-th element) ---
+# stride_train: 1         # Use every 1st element (no subsampling)
+# stride_val: 1           # Use every 1st element (no subsampling)  
+# stride_test: 1          # Use every 1st element (no subsampling)
 
 # Data loading parameters
-num_workers: 16         #NOTE CONSIDER CHANING
+num_workers: 25         #NOTE CONSIDER CHANING
 pin_memory: true       # Pin memory for faster GPU transfer
 

@@ -14,7 +14,7 @@ model_checkpoint:
   save_last: True
   save_top_k: 1  # Save top 1 model for early testing 
   auto_insert_metric_name: False
-  every_n_epochs: ${trainer.check_val_every_n_epoch}
+  every_n_epochs: 1
 
 early_stopping:
   monitor: "val/Fmax"  #NOTE: Monitor Fmax for protein function prediction (higher is better)
