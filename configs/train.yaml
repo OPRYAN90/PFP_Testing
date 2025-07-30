@@ -43,6 +43,6 @@ train: False
 test: True
 
 # simply provide checkpoint path to resume training
-ckpt_path: /teamspace/studios/this_studio/PFP_Testing/logs/train/runs/2025-07-23_19-00-34/checkpoints/epoch_017_fmax_0.7898.ckpt
+ckpt_path: /teamspace/studios/this_studio/PFP_Testing/logs/train/runs/2025-07-30_20-03-01/checkpoints/epoch_005_fmax_0.6830.ckpt
 # seed for random number generators in pytorch, numpy and python.random
 seed: null

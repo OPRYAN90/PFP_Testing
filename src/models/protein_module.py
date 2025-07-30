@@ -26,6 +26,44 @@ def get_num_classes_for_task(task_type: str) -> int:
     return class_counts[task_type]
 
 
+class RowDropout(nn.Module):
+    """
+    Drops *entire rows* in an MSA tensor with probability `p_row`.
+
+    Inputs
+    ------
+    x       : Tensor[B, N_seq, L_pad, D]
+    seq_pad : BoolTensor[B, N_seq]   – True where the row is padding
+
+    Outputs
+    -------
+    x_out   : Tensor           – rows zeroed out where dropped
+    seq_pad : BoolTensor       – updated to mark dropped rows as padding
+    """
+    def __init__(self, p_row: float = 0.1):
+        super().__init__()
+        self.p_row = float(p_row)
+
+    def forward(self, x: torch.Tensor, seq_pad: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if (not self.training) or self.p_row <= 0.0:
+            return x, seq_pad
+
+        B, N, *_ = x.shape
+        device    = x.device
+        # Bernoulli mask – True means "keep"
+        keep = (torch.rand(B, N, device=device) > self.p_row) & (~seq_pad)
+
+        # Guarantee query sequence (first row) is always kept
+        keep[:, 0] = True
+
+        # broadcast to [B, N, 1, 1]
+        keep_f = keep.unsqueeze(-1).unsqueeze(-1).float()
+        x = x * keep_f
+
+        seq_pad = seq_pad | (~keep)          # treat dropped rows as padding
+        return x, seq_pad
+
+
 class ResidualFeedForward(nn.Module):
     """Transformer-style position-wise FFN with residual + layer norm."""
 
@@ -117,77 +155,94 @@ class SequenceEncoder(nn.Module):
         x = self.proj(x)
         return x  # [B, L, d_model]
 
+
 class MSAEncoder(nn.Module):
-    """
-    Row‑attention pooling encoder for an MSA tensor that already contains
-    CLS (col 0) and the EOS token inserted by ProteinLitModule.insert_eos_token.
+    r"""
+    Multiple‑Sequence‑Alignment encoder with optional attention‑weighted pooling.
 
     Inputs
-    -------
-    msa       : [B, N_seq, L_pad, d_msa]
-    pad_mask  : [B, L_pad]     – True where residue position is padding
-    seq_pad   : [B, N_seq_max] – True where *row* is padding (absent sequence)
+    ------
+    msa       : Tensor[B, N_seq, L_pad, d_msa]
+    pad_mask  : Tensor[B, L_pad]     – True where residue is padding
+    seq_pad   : Tensor[B, N_seq]     – True where whole row is padding
 
     Output
     ------
-    x         : [B, L_pad, d_msa] – condensed L×D representation
+    x         : Tensor[B, L_pad, d_msa]
     """
 
     def __init__(
         self,
         d_msa: int = 768,
-        n_heads: int = 4,
-        dropout_attn: float = 0.1,
-        dropout_ffn: float = 0.1,
+        p_chan: float = 0.10,
+        p_feat: float = 0.10,
+        use_attention: bool = True        # False ➜ mean pooling
     ):
         super().__init__()
-        self.feat_drop = nn.Dropout(dropout_attn)
-        self.row_attn = nn.MultiheadAttention(
-            d_msa, n_heads, dropout=dropout_attn, batch_first=True
-        )
-        self.norm_q = nn.LayerNorm(d_msa)
-        self.norm_msa = nn.LayerNorm(d_msa)
-        self.ffn       = ResidualFeedForward(d_msa, dropout=dropout_ffn)
-        self.out_norm  = nn.LayerNorm(d_msa)
+        self.use_attention = use_attention
+
+        # 1. Row dropout on MSA embeddings
+        self.row_dropout = RowDropout(p_chan)
+
+        # 2. Conservation head for attention scores
+        self.conservation_head = nn.Linear(d_msa, 1, bias=False)
+
+        # 3. Learned temperature τ (only used when attention is enabled)
+        if self.use_attention:
+            self.log_tau = nn.Parameter(torch.zeros(()))  # τ = e^{log τ}, init‑1.0
+
+        # 4. Post‑pooling refinement
+        self.post_ffn = ResidualFeedForward(d_msa, expansion=4, dropout=p_feat)
+        self.norm = nn.LayerNorm(d_msa)
 
     def forward(
         self,
-        msa: torch.Tensor,      # [B, N, L, D]
-        pad_mask: torch.Tensor, # [B, L]
-        seq_pad: torch.Tensor,  # [B, N]
+        msa: torch.Tensor,      # [B, N_seq, L_pad, d_msa]
+        pad_mask: torch.Tensor, # [B, L_pad]
+        seq_pad: torch.Tensor,  # [B, N_seq]
     ) -> torch.Tensor:
 
-        B, N, L, D = msa.shape
-        msa = self.feat_drop(msa)
-        # ── 1. Pick the first row (query sequence) as the per‑residue query ──────
-        q = msa[:, 0]                          # [B, L, D]
-        # ── 2. Reshape so each residue column is an independent “set” ────────────
-        msa_flat = msa.permute(0, 2, 1, 3)     # [B, L, N, D]
-        msa_flat = msa_flat.reshape(B*L, N, D) # [B·L, N, D]
-        q_flat   = q.reshape(B*L, 1, D)        # queries: [B·L, 1, D]
+        B, N_seq, L_pad, D = msa.shape
+        msa, seq_pad = self.row_dropout(msa, seq_pad)
 
-        # ── 3. Build row‑padding mask for MultiheadAttention ─────────────────────
-        # seq_pad : [B, N]  →  repeat for every residue column
-        row_pad = seq_pad.unsqueeze(1).expand(-1, L, -1)        # [B, L, N]
-        row_pad = row_pad.reshape(B*L, N)                       # [B·L, N]
+        # Build boolean mask [B, N_seq, L_pad]
+        pad_bool = seq_pad.unsqueeze(-1) | pad_mask.unsqueeze(1)
 
-        # ── 4. Row‑wise multi‑head attention ─────────────────────────────────────
-        z, _ = self.row_attn(
-            query=self.norm_q(q_flat),                 # [B·L, 1, D]
-            key=self.norm_msa(msa_flat), value=self.norm_msa(msa_flat), # [B·L, N, D]
-            key_padding_mask=row_pad      # mask padded rows
-        )                                 # → [B·L, 1, D]
-        z = z.reshape(B, L, D)            # [B, L, D]
+        # Count valid rows per example   [B, 1]
+        valid_seq = (~seq_pad).sum(dim=1, keepdim=True).clamp(min=1).float()
 
-        # ── 5. Residual + FFN (per residue) ──────────────────────────────────────
-        z = (q + z)         # add residual from query row
-        z = self.ffn(z)                   # [B, L, D]
+        # --------------------------------------------------------------------
+        # POOLING
+        # --------------------------------------------------------------------
+        if self.use_attention:
+            # 1) Conservation logits
+            scores = self.conservation_head(msa).squeeze(-1)          # [B,N,L]
 
-        # ── 6. Zero‑out padded residue positions (keep tensor shape) ────────────
-        z = z.masked_fill(pad_mask.unsqueeze(-1), 0.0)  # [B, L, D]
+            # 2) Centre per column
+            scores = scores.masked_fill(pad_bool, 0.0)
 
-        return z
+            # 3) Scale by (√N · τ)
+            scale = (valid_seq.sqrt() * self.log_tau.exp()).unsqueeze(-1)
+            scores = scores / scale
 
+            # 4) Mask padding & soft‑max over rows
+            scores = scores.masked_fill(pad_bool, -1e4)
+            weights = torch.softmax(scores, dim=1).masked_fill(pad_bool, 0.0)
+
+            # 5) Weighted sum
+            pooled = (msa * weights.unsqueeze(-1)).sum(dim=1)         # [B,L,D]
+        else:
+            # Pure mean pooling – exact N‑invariance
+            masked = msa.masked_fill(pad_bool.unsqueeze(-1), 0.0)
+            pooled = masked.sum(dim=1) / valid_seq.unsqueeze(-1)      # [B,L,D]
+
+        # --------------------------------------------------------------------
+        # Refinement & output
+        # --------------------------------------------------------------------
+        x = self.norm(pooled)
+        x = self.post_ffn(x)
+        x = x.masked_fill(pad_mask.unsqueeze(-1), 0.0)
+        return x
 
 
 ############################################################
