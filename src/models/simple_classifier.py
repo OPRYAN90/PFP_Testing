@@ -13,7 +13,7 @@ from data.go_utils import (
     function_centric_aupr, cafa_fmax, smin
 )
 
-from egnn_pytorch import EGNN   # NEW
+from torch.nn import TransformerEncoder, TransformerEncoderLayer
 
 # Simple helper to get number of classes without datamodule dependency
 def get_num_classes_for_task(task_type: str) -> int:
@@ -27,69 +27,71 @@ class MLPHead(nn.Module):
     
     def __init__(self, d_in: int, d_out: int, dropout: float = 0.1): 
         super().__init__()
-        # assert d_in == 768, "d_in must be 768"
         self.net = nn.Sequential(
             nn.LayerNorm(d_in),
             nn.Linear(d_in, 602),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(602, d_out), #EXTREME WARNING NOTE: DIMS DEPEDNING ON TASK AND D_MSA
+            nn.Linear(602, d_out),
         ) 
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
 
 
-# ------------ Minimal EGNN backbone (dense, no PyG) -----------------
-class MinimalEGNN(nn.Module):
-    def __init__(self, d_in: int, d_hidden: int = 256, depth: int = 4,
-                 k_neighbors: int = 16, dropout: float = 0.1):
+class SimpleTransformer(nn.Module):
+    """A simple Transformer encoder over ESM-C embeddings with proper masking."""
+
+    def __init__(self, d_in: int, d_hidden: int = 768, depth: int = 2,
+                 n_heads: int = 8, dropout: float = 0.1):
         super().__init__()
-        self.in_proj = nn.Linear(d_in, d_hidden)
-        self.layers = nn.ModuleList([
-            EGNN(
-                dim=d_hidden,
-                edge_dim=0,
-                num_nearest_neighbors=k_neighbors,
-                dropout=dropout,
-                norm_feats=False,
-                norm_coors=True,
-                coor_weights_clamp_value=2.0,
-                update_feats=True,
-                update_coors=True
-            ) for _ in range(depth)
-        ])
-        self.out_norm = nn.LayerNorm(d_hidden)
 
-    def forward(self, x, pos, mask):
-        """
-        x   : [B, N, d_in]   residue features
-        pos : [B, N, 3]      coordinates
-        mask: [B, N]         bool (True=valid)
-        """
-        h = self.in_proj(x)
-        c = pos
-        for layer in self.layers:
-            h, c = layer(h, c, mask=mask)
-        h = self.out_norm(h)
-        # masked mean pooling over residues
-        denom = mask.sum(dim=1).clamp(min=1).unsqueeze(-1)    # [B,1]
-        g = (h * mask.unsqueeze(-1)).sum(dim=1) / denom       # [B, d_hidden]
-        return g
+        # Project inputs if needed
+        self.in_proj = nn.Linear(d_in, d_hidden) if d_in != d_hidden else nn.Identity()
 
-############################################################
-#  LightningModule - Updated with Canonical Evoformer-Lite
-############################################################
+        encoder_layer = TransformerEncoderLayer(
+            d_model=d_hidden,
+            nhead=n_heads,
+            dim_feedforward=d_hidden * 4,
+            dropout=dropout,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = TransformerEncoder(encoder_layer, num_layers=depth)
+
+    def forward(self, sequence_emb: torch.Tensor, pad_mask: torch.Tensor) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        sequence_emb : [B, L_max_seq, d_in]   ESM-C embeddings with CLS/EOS tokens
+        pad_mask     : [B, L_max_seq]         bool (True = padding, False = valid)
+        
+        Returns
+        -------
+        pooled_emb   : [B, d_hidden]          pooled protein representation
+        """
+        # Project features
+        h = self.in_proj(sequence_emb)
+        
+        # Use pad_mask directly (True = padding, False = valid)
+        h = self.encoder(h, src_key_padding_mask=pad_mask)
+        
+        # Masked mean pooling over valid positions
+        valid_mask = ~pad_mask  # invert to get valid positions
+        denom = valid_mask.sum(dim=1, keepdim=True).clamp(min=1).to(h.dtype)
+        pooled_emb = (h * valid_mask.unsqueeze(-1)).sum(dim=1) / denom
+        
+        return pooled_emb
+
 
 class ProteinLitModule(LightningModule):
     def __init__(
         self,
         task_type: str,
-        d_in: int = 1152,
-        num_layers: int = 4,              # EGNN depth
+        d_in: int = 1152,                     # ESM-C embedding dimension
+        num_layers: int = 4,                  # Transformer depth
         dropout: float = 0.1,
-        k_neighbors: int = 16,            # NEW
-        d_hidden: int = 256,              # NEW
+        d_hidden: int = 768,                  # Transformer hidden dimension
         optimizer: Optional[Any] = None,
         scheduler: Optional[Any] = None,
         warmup_ratio: float = 0.05,
@@ -100,18 +102,18 @@ class ProteinLitModule(LightningModule):
         # Store task type for easy access
         self.task_type = task_type
 
-        # Minimal EGNN backbone -> pooled graph embedding
-        self.model = MinimalEGNN(
+        # Simple Transformer backbone -> pooled embedding
+        self.model = SimpleTransformer(
             d_in=d_in,
             d_hidden=d_hidden,
             depth=num_layers,
-            k_neighbors=k_neighbors,
+            n_heads=8,
             dropout=dropout,
         )
 
-        # Final MLP head on graph embedding
+        # Final MLP head on pooled embedding
         self.head = MLPHead(
-            d_in=d_hidden,                         # CHANGED
+            d_in=d_hidden,
             d_out=get_num_classes_for_task(task_type),
             dropout=dropout,
         )
@@ -130,17 +132,16 @@ class ProteinLitModule(LightningModule):
         self._test_logits = []
         self._test_labels = []
 
-    # no MSA model anymore, so no special setup needed
     def setup(self, stage: Optional[str] = None) -> None:
         pass
 
     # ---------------------------------------------------------------------
-    #  Forward pass with EOS token scatter
+    #  Forward pass using ESM-C embeddings
     # ---------------------------------------------------------------------
     def forward(self, batch: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
-        """EGNN forward: dense residues -> EGNN -> masked mean -> MLP -> logits."""
-        g = self.model(batch["x"], batch["pos"], batch["mask"])
-        logits = self.head(g)
+        """Forward pass: ESM-C embeddings -> Transformer -> masked mean -> MLP -> logits."""
+        pooled_emb = self.model(batch["sequence_emb"], batch["pad_mask"])
+        logits = self.head(pooled_emb)
         return logits, batch["labels"]
 
     # ------------------------------------------------------------------
@@ -153,7 +154,7 @@ class ProteinLitModule(LightningModule):
         # Update running mean metric
         self.train_loss(loss)
 
-        # Log the raw loss for the current step (avoid computing MeanMetric prematurely)
+        # Log the raw loss for the current step
         self.log("train/loss_step", loss, on_step=True, prog_bar=True, sync_dist=True)
 
         return loss

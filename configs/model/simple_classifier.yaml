@@ -1,10 +1,9 @@
-_target_: src.models.egnn.ProteinLitModule
+_target_: src.models.simple_classifier.ProteinLitModule
 
 # Model architecture parameters
 d_in: 1152              # Input feature dimension (ESM-C embeddings size)
-d_hidden: 512           # Hidden dimension for EGNN layers
-num_layers: 4           # Number of EGNN layers (depth)
-k_neighbors: 16         # Number of nearest neighbors for graph construction
+d_hidden: 768           # Hidden dimension for Transformer layers
+num_layers: 8           # Number of Transformer layers (depth)
 dropout: 0.1            # General dropout rate for model components
 
 # Task and training parameters

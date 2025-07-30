@@ -153,17 +153,8 @@ class ProteinDataset(Dataset):
         with open(protein_dir / "L.csv", "r") as f:
             protein_length = int(f.readline().strip())
         
-        # --- NEW: load EGNN tensors (coordinates + pad), make residue features and mask ---
-        # Load pos.pt and pad.pt from the same protein directory as other files
-        pos = torch.load(protein_dir / "pos.pt").float()      # [L, 3]
-        pad = torch.load(protein_dir / "pad.pt").long()       # [L], 1 = pad, 0 = valid
-
-        # use residue slice (strip CLS/EOS) for features
-        esm_res = esmc_emb[1:1 + protein_length, :]        # [L, d_model]
-        # clamp to common length (robust to small mismatches)
-        assert esm_res.size(0) == pos.size(0) == pad.size(0), "Sequence/MSA/Length mismatch"
-        node_mask = (pad == 0)                             # True = valid residue
-
+        # assert protein_length == esmc_emb.size(0)-2 == msa_emb.size(1)-1, "Sequence/MSA/Length mismatch"
+        
         sample = {
             "protein_id": protein_id,
             "sequence": sequence,
@@ -171,10 +162,6 @@ class ProteinDataset(Dataset):
             "msa_tok": msa_tok,
             "length": protein_length,
             "labels": labels,
-            # --- NEW: minimal tensors for EGNN baseline ---
-            "x_res": esm_res,          # [L, d_model] residue features
-            "pos": pos,                # [L, 3] coordinates
-            "node_mask": node_mask,    # [L] bool (True = valid)
         }
 
         return sample
@@ -282,17 +269,14 @@ class ProteinDataModule(LightningDataModule):
                 "sequence.txt", 
                 "final_filtered_256_stripped.a3m",
                 "esmc_emb.pt",
-                f"{self.hparams.task_type}_go.txt",
-                "pos.pt",  # EGNN coordinates
-                "pad.pt"   # EGNN padding mask
+                f"{self.hparams.task_type}_go.txt"
             ]
             
             missing_files = [f for f in required_files if not (protein_dir / f).exists()]
             
             if missing_files:
                 # This should not happen - all valid proteins must have these files
-                print(f"Protein {protein_id} missing required files: {missing_files}")
-                continue
+                raise FileNotFoundError(f"Protein {protein_id} missing required files: {missing_files}")
             
             valid_proteins.append(protein_id)
         
@@ -476,64 +460,68 @@ class ProteinDataModule(LightningDataModule):
 
 def protein_collate(batch):
     """Collate function for protein data.
-    Keeps your original returns, and additionally exposes minimal EGNN tensors:
-      x   : [B, N_max, d], pos : [B, N_max, 3], mask : [B, N_max] (True=valid)
+    Pads:
+    1. Pre-computed ESM-C embeddings  → shape [B, L_max_seq, d_model]
+    2. Integer MSA tokens            → shape [B, N_seq_max, L_max_seq]
+    3. Sequence padding mask         → shape [B, N_seq_max]
     """
     protein_ids = [it["protein_id"] for it in batch]
     sequences   = [it["sequence"]    for it in batch]
     lengths     = [it["length"]      for it in batch]   # residue counts (no CLS/EOS)
 
-    # ---- pad sequence embeddings (unchanged) ----
-    max_len_seq = max(lengths) + 2
+    # ----------------------------------------------------
+    # 1) Pad sequence embeddings (float tensors)
+    # ----------------------------------------------------
+    max_len_seq = max(lengths) + 2   # CLS + residues + EOS
     assert max_len_seq <= 1024, "Sequence too long (>1024)"
+
     seq_emb_padded = []
     for it in batch:
-        emb = it["sequence_emb"]
+        emb = it["sequence_emb"]  # [L+2, d]
         if emb.size(0) < max_len_seq:
             emb = F.pad(emb, (0, 0, 0, max_len_seq - emb.size(0)), value=0)
         seq_emb_padded.append(emb)
-    sequence_emb = torch.stack(seq_emb_padded)
 
-    # ---- MSA tokens kept as list (unchanged) ----
-    msa_tok_list = [it["msa_tok"] for it in batch]
+    # ----------------------------------------------------
+    # 2) Collect integer MSA token matrices *without* padding
+    #    + build per-sample sequence padding masks
+    # ----------------------------------------------------
+    msa_tok_list = [it["msa_tok"] for it in batch]   # no padding here
+
+    # Determine maximum number of sequences across the batch
     max_n_seq = max(tok.shape[0] for tok in msa_tok_list)
-    seq_pad_mask = torch.tensor(
-        [[i >= tok.shape[0] for i in range(max_n_seq)] for tok in msa_tok_list],
-        dtype=torch.bool
-    )
 
+    # Build boolean mask where True means a padding (absent) sequence
+    seq_pad_mask = torch.tensor([
+        [i >= tok.shape[0] for i in range(max_n_seq)] for tok in msa_tok_list
+    ], dtype=torch.bool)
+
+    # ----------------------------------------------------
+    # 3) Stack sequence embeddings + build masks
+    # ----------------------------------------------------
+    sequence_emb = torch.stack(seq_emb_padded)    # [B, L_max_seq, d_model]
+
+    # `msa_tok` left as list for per-sample processing later
     labels = torch.stack([it["labels"] for it in batch])
+
     pad_mask = torch.tensor(
         [[i >= l + 2 for i in range(max_len_seq)] for l in lengths],
-        dtype=torch.bool
+        dtype=torch.bool,
     )
+
     lengths_tensor = torch.tensor(lengths)
 
-    # ---- NEW: minimal EGNN dense tensors ----
-    B = len(batch)
-    d = batch[0]["x_res"].size(1)
-    N_max = max(it["x_res"].size(0) for it in batch)
-    x_pad   = torch.zeros(B, N_max, d,    dtype=batch[0]["x_res"].dtype)
-    pos_pad = torch.zeros(B, N_max, 3,    dtype=batch[0]["pos"].dtype)
-    m_pad   = torch.zeros(B, N_max,       dtype=torch.bool)
-    for i, it in enumerate(batch):
-        L = it["x_res"].size(0)
-        x_pad[i, :L]   = it["x_res"]
-        pos_pad[i, :L] = it["pos"]
-        m_pad[i, :L]   = it["node_mask"]
+    # ----------------------------------------------------
+    # 4) Timing aggregation
+    # ----------------------------------------------------
 
     return {
-        # original keys
         "protein_id": protein_ids,
         "sequence": sequences,
         "sequence_emb": sequence_emb,
-        "msa_tok": msa_tok_list,
-        "seq_pad_mask": seq_pad_mask,
+        "msa_tok": msa_tok_list,  # list[Tensor] – variable shapes
+        "seq_pad_mask": seq_pad_mask,  # [B, N_seq_max] (True → PAD)
         "labels": labels,
         "pad_mask": pad_mask,
         "lengths": lengths_tensor,
-        # NEW minimal EGNN inputs
-        "x": x_pad,          # [B, N_max, d]
-        "pos": pos_pad,      # [B, N_max, 3]
-        "mask": m_pad,       # [B, N_max]  True=valid
     }

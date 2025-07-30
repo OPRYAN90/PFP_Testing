@@ -7,8 +7,8 @@ import torch.nn as nn
 # Optional FlashAttention toggle – does nothing on unsupported systems
 # -----------------------------------------------------------------------------
 
-from utils.flash_control import maybe_enable_flash_attention  
-maybe_enable_flash_attention(True)
+# from utils.flash_control import maybe_enable_flash_attention  
+# maybe_enable_flash_attention(True)
 
 
 from lightning import LightningModule
@@ -117,83 +117,77 @@ class SequenceEncoder(nn.Module):
         x = self.proj(x)
         return x  # [B, L, d_model]
 
-
 class MSAEncoder(nn.Module):
-    """Encoder for Multiple Sequence Alignment (MSA) embeddings.
-    Expected input: msa [B, N_seq, L_cls+res, d_msa] (already includes CLS at col 0)
-    - B: batch size
-    - N_seq: alignment depth (≈256) 
-    - L_cls+res: CLS token + residue length
-    - d_msa: embedding dim from MSA-Transformer (≈768)
     """
-    
+    Row‑attention pooling encoder for an MSA tensor that already contains
+    CLS (col 0) and the EOS token inserted by ProteinLitModule.insert_eos_token.
+
+    Inputs
+    -------
+    msa       : [B, N_seq, L_pad, d_msa]
+    pad_mask  : [B, L_pad]     – True where residue position is padding
+    seq_pad   : [B, N_seq_max] – True where *row* is padding (absent sequence)
+
+    Output
+    ------
+    x         : [B, L_pad, d_msa] – condensed L×D representation
+    """
+
     def __init__(
         self,
         d_msa: int = 768,
-        d_model: int = 1152,
-        p_chan: float = 0.10,   # channel dropout prob 
-        p_feat: float = 0.10,   # feature dropout after projection
+        n_heads: int = 4,
+        dropout_attn: float = 0.1,
+        dropout_ffn: float = 0.1,
     ):
         super().__init__()
-        
-        # 0) Learnable EOS token shared across rows
-        self.eos_token = nn.Parameter(torch.zeros(1, 1, 1, d_msa))
-        nn.init.normal_(self.eos_token, std=0.02)
-        
-        # 2) Standard element-wise dropout on the embedding vector
-        self.channel_dropout = nn.Dropout(p_chan)
-        
-        # 3) Conservation scoring head
-        self.conservation_head = nn.Linear(d_msa, 1, bias=False)
+        self.feat_drop = nn.Dropout(dropout_attn)
+        self.row_attn = nn.MultiheadAttention(
+            d_msa, n_heads, dropout=dropout_attn, batch_first=True
+        )
+        self.norm_q = nn.LayerNorm(d_msa)
+        self.norm_msa = nn.LayerNorm(d_msa)
+        self.ffn       = ResidualFeedForward(d_msa, dropout=dropout_ffn)
+        self.out_norm  = nn.LayerNorm(d_msa)
 
-        self.post_ffn   = ResidualFeedForward(d_msa, expansion=4, dropout=p_feat)
-
-        self.norm = nn.LayerNorm(d_msa)
     def forward(
         self,
-        msa: torch.Tensor,   # [B, N_seq, L_pad, d_msa]  zero-padded
-        lengths: torch.Tensor,   # [B]  true residue counts (no CLS/EOS)
-        pad_mask: torch.Tensor,  # [B, L] True where padded
-        seq_pad: torch.Tensor,  # [B, N_max]
+        msa: torch.Tensor,      # [B, N, L, D]
+        pad_mask: torch.Tensor, # [B, L]
+        seq_pad: torch.Tensor,  # [B, N]
     ) -> torch.Tensor:
-        # ------------------------------------------------------------
-        # Insert EOS (learnable) at position L+1  — truly in-place
-        # ------------------------------------------------------------
-        B, N_seq, L_pad, D = msa.shape
-        # 0) prepare a (B × N_seq × 1 × D) tensor full of your EOS token
-        eos_tok = self.eos_token.view(1, 1, 1, D).expand(B, N_seq, 1, D)    # (B, N_seq, 1, D)
 
-        # 1) build the same shape index tensor for the "length+1" position
-        idx = (lengths + 1).view(B, 1, 1, 1).expand(B, N_seq, 1, D)                # (B, N_seq, 1, D)
+        B, N, L, D = msa.shape
+        msa = self.feat_drop(msa)
+        # ── 1. Pick the first row (query sequence) as the per‑residue query ──────
+        q = msa[:, 0]                          # [B, L, D]
+        # ── 2. Reshape so each residue column is an independent “set” ────────────
+        msa_flat = msa.permute(0, 2, 1, 3)     # [B, L, N, D]
+        msa_flat = msa_flat.reshape(B*L, N, D) # [B·L, N, D]
+        q_flat   = q.reshape(B*L, 1, D)        # queries: [B·L, 1, D]
 
-        # 2) scatter the EOS token into the msa along dim-2
-        msa.scatter_(2, idx, eos_tok) 
+        # ── 3. Build row‑padding mask for MultiheadAttention ─────────────────────
+        # seq_pad : [B, N]  →  repeat for every residue column
+        row_pad = seq_pad.unsqueeze(1).expand(-1, L, -1)        # [B, L, N]
+        row_pad = row_pad.reshape(B*L, N)                       # [B·L, N]
 
-        msa = self.channel_dropout(msa)
-        
-        scores  = self.conservation_head(msa).squeeze(-1)     # [B, N_seq, L_pad]
-        
-        # Mask out padded positions before softmax
-        # pad_mask: [B, L] → expand to [B, N_seq, L]
-        mask = pad_mask.unsqueeze(1).expand(-1, msa.size(1), -1)      
-        scores   = scores.masked_fill(mask, -1e4)                  # never get prob-mass
-        
-        # Detect rows that are entirely padding (vertical padding from collate_fn)
-        # If first position (CLS token) of a row has all zeros, entire row is padding
-        row_padding_mask = (msa[:, :, 0, :].abs().sum(-1) == 0)    # [B, N_seq] - True if row is padding
-        row_padding_mask = row_padding_mask.unsqueeze(-1).expand(-1, -1, msa.size(2))  # [B, N_seq, L_pad]
-        
-        # Combine position-wise dropout mask with row padding mask
-        mask_logits = row_padding_mask & (~mask)                          # only real residues
-        scores = scores.masked_fill(mask_logits, -1e4)
+        # ── 4. Row‑wise multi‑head attention ─────────────────────────────────────
+        z, _ = self.row_attn(
+            query=self.norm_q(q_flat),                 # [B·L, 1, D]
+            key=self.norm_msa(msa_flat), value=self.norm_msa(msa_flat), # [B·L, N, D]
+            key_padding_mask=row_pad      # mask padded rows
+        )                                 # → [B·L, 1, D]
+        z = z.reshape(B, L, D)            # [B, L, D]
 
-        weights = torch.softmax(scores, dim=1)                # over N_seq
-        weights = weights.masked_fill(mask, 0.0)       # ← explicit zero-out after softmax
-        pooled  = (msa * weights.unsqueeze(-1)).sum(dim=1)    # [B, L_pad, d_msa]
-        x = self.norm(pooled)
-        x = self.post_ffn(x)
+        # ── 5. Residual + FFN (per residue) ──────────────────────────────────────
+        z = (q + z)         # add residual from query row
+        z = self.ffn(z)                   # [B, L, D]
 
-        return x 
+        # ── 6. Zero‑out padded residue positions (keep tensor shape) ────────────
+        z = z.masked_fill(pad_mask.unsqueeze(-1), 0.0)  # [B, L, D]
+
+        return z
+
 
 
 ############################################################
@@ -258,9 +252,6 @@ class ProteinLitModule(LightningModule):
         n_cross_layers: int = 2,              # Cross-attention layers
         n_heads: int = 8,                     # Attention heads
         dropout: float = 0.1,                 # Dropout rate
-        # MSA Encoder dropout parameters
-        p_chan: float = 0.15,                 # Channel dropout probability (AlphaFold-style)
-        p_feat: float = 0.10,                 # Feature dropout after MSA projection
         optimizer: Optional[Any] = None,      # Hydra optimizer config
         scheduler: Optional[Any] = None,      # Hydra scheduler config  
         warmup_ratio: float = 0.05,           # Warmup ratio for cosine schedule (5% of total training steps)
@@ -275,6 +266,9 @@ class ProteinLitModule(LightningModule):
         import esm
         self.msa_model, _ = esm.pretrained.esm_msa1b_t12_100M_UR50S()
         self.msa_model.eval().requires_grad_(False)
+        # Learnable EOS token (shared across alignment rows)
+        self.eos_token = nn.Parameter(torch.zeros(1, 1, 1, d_msa))
+        nn.init.normal_(self.eos_token, std=0.02)
         
         # Encoders
         self.seq_encoder = SequenceEncoder(
@@ -285,9 +279,6 @@ class ProteinLitModule(LightningModule):
         )
         self.msa_encoder = MSAEncoder(
             d_msa=d_msa,
-            d_model=d_model,
-            p_chan=p_chan,
-            p_feat=p_feat
         )
 
         # Fusion / Cross-attention
@@ -340,7 +331,8 @@ class ProteinLitModule(LightningModule):
         # Compute MSA embeddings on-the-fly (sequential, per-sample)
         target_len = seq_emb.shape[1]  # CLS + residues + EOS (same as pad_mask width)
         msa_emb, msa_compute_time = self._compute_msa_embeddings(msa_tok_list, target_len)  # [B, N_seq_max, target_len, d_msa]
-        msa_emb = msa_emb.clone()
+        # Insert EOS token (learnable) before passing the embeddings to the encoders
+        msa_emb = self.insert_eos_token(msa_emb, batch["lengths"])
         # Expose timing so callbacks (e.g., BatchTimer) can log it **after** the forward pass.
         # Storing it on `self` ensures it is available in hooks such as `on_before_backward`.
         self._last_msa_compute_time = msa_compute_time
@@ -354,7 +346,7 @@ class ProteinLitModule(LightningModule):
 
         # Encode each modality with padding masks
         seq_z = self.seq_encoder(seq_emb, pad_mask=seq_pad_mask)  # [B, L, d]
-        msa_z = self.msa_encoder(msa_emb, batch["lengths"], pad_mask=msa_pad_mask, seq_pad=seq_pad)  # [B, L, d]
+        msa_z = self.msa_encoder(msa_emb, pad_mask=msa_pad_mask, seq_pad=seq_pad)  # [B, L, d]
 
         # Cross-modal attention with padding masks
         seq_z, msa_z = self.cross_attn(seq_z, msa_z, seq_pad_mask, msa_pad_mask)  # each [B, L, d]
@@ -429,6 +421,33 @@ class ProteinLitModule(LightningModule):
 
         return msa_emb, time.perf_counter() - start
 
+    # ------------------------------------------------------------------
+    #  EOS token insertion (moved from MSAEncoder)
+    # ------------------------------------------------------------------
+    def insert_eos_token(self, msa: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+        """Scatter a learnable EOS token into the MSA embeddings.
+
+        Args:
+            msa: Tensor of shape [B, N_seq, L_pad, d_msa] without EOS tokens.
+            lengths: Tensor [B] containing the true residue counts (excluding CLS/EOS).
+
+        Returns:
+            Tensor with EOS token inserted at index (length + 1) for every sequence row.
+        """
+        # Clone to avoid inadvertent in-place modifications further upstream
+        msa = msa.clone()
+
+        B, N_seq, L_pad, D = msa.shape
+
+        # Expand the single learnable EOS vector to required shape
+        eos_tok = self.eos_token.view(1, 1, 1, D).expand(B, N_seq, 1, D)
+
+        # Build index tensor for the EOS position
+        idx = (lengths + 1).view(B, 1, 1, 1).expand(B, N_seq, 1, D)
+
+        # Scatter EOS tokens into the residue dimension
+        msa.scatter_(2, idx, eos_tok)
+        return msa
 
     # ------------------------------------------------------------------
     #  Lightning hooks
