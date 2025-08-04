@@ -121,6 +121,33 @@ class ProteinDataset(Dataset):
         assert esmc_data.dim() == 3, "ESM-C data should be a 3D tensor"
         esmc_emb = esmc_data.squeeze(0)
         
+        # Load pre-computed protein embeddings (required file)
+        prot_file = protein_dir / "prot_emb.pt"
+        prot_data = torch.load(prot_file)
+        # Extract embeddings from data structures
+        # Protein: Direct tensor (1, L+2, d_prot) -> squeeze to (L+2, d_prot)
+        assert prot_data.dim() == 3, "Protein data should be a 3D tensor"
+        prot_emb = prot_data.squeeze(0)
+        
+        # Load pre-computed Ankh3-Large embeddings (required file)
+        ankh_file = protein_dir / "ankh_emb.pt"
+        ankh_data = torch.load(ankh_file)
+        # Extract embeddings from data structures
+        # Ankh3-Large: Direct tensor (1, L+2, d_ankh) -> squeeze to (L+2, d_ankh)
+        assert ankh_data.dim() == 3, "Ankh3-Large data should be a 3D tensor"
+        ankh_emb = ankh_data.squeeze(0)
+        
+        # Ensure all embeddings have the same sequence length
+        assert esmc_emb.size(0) == prot_emb.size(0) == ankh_emb.size(0), f"Embeddings have different lengths: ESM-C={esmc_emb.size(0)}, Protein={prot_emb.size(0)}, Ankh={ankh_emb.size(0)}"
+        
+        # Zero out 0th and L+1th indices for protein embeddings (no BOS/EOS tokens)
+        prot_emb[0] = 0.0  # Zero out BOS position
+        prot_emb[-1] = 0.0  # Zero out EOS position
+        
+        # Zero out 0th and L+1th indices for Ankh embeddings (no BOS/EOS tokens)
+        ankh_emb[0] = 0.0  # Zero out BOS position
+        ankh_emb[-1] = 0.0  # Zero out EOS position
+        
         # Prepare MSA tokens (CPU-only, no embedding computation)
         # Parse A3M file + convert to integer tokens (CPU-only)
         a3m_file = protein_dir / "final_filtered_256_stripped.a3m"
@@ -159,6 +186,8 @@ class ProteinDataset(Dataset):
             "protein_id": protein_id,
             "sequence": sequence,
             "sequence_emb": esmc_emb,  # Shape: (L+2, d_model) 
+            "prot_emb": prot_emb,      # Shape: (L+2, d_prot)
+            "ankh_emb": ankh_emb,      # Shape: (L+2, d_ankh)
             "msa_tok": msa_tok,
             "length": protein_length,
             "labels": labels,
@@ -269,6 +298,8 @@ class ProteinDataModule(LightningDataModule):
                 "sequence.txt", 
                 "final_filtered_256_stripped.a3m",
                 "esmc_emb.pt",
+                "prot_emb.pt",
+                "ankh_emb.pt",
                 f"{self.hparams.task_type}_go.txt"
             ]
             
@@ -476,11 +507,26 @@ def protein_collate(batch):
     assert max_len_seq <= 1024, "Sequence too long (>1024)"
 
     seq_emb_padded = []
+    prot_emb_padded = []
+    ankh_emb_padded = []
     for it in batch:
+        # Pad ESM-C embeddings
         emb = it["sequence_emb"]  # [L+2, d]
         if emb.size(0) < max_len_seq:
             emb = F.pad(emb, (0, 0, 0, max_len_seq - emb.size(0)), value=0)
         seq_emb_padded.append(emb)
+        
+        # Pad protein embeddings (same padding logic)
+        prot_emb = it["prot_emb"]  # [L+2, d_prot]
+        if prot_emb.size(0) < max_len_seq:
+            prot_emb = F.pad(prot_emb, (0, 0, 0, max_len_seq - prot_emb.size(0)), value=0)
+        prot_emb_padded.append(prot_emb)
+        
+        # Pad Ankh3-Large embeddings (same padding logic)
+        ankh_emb = it["ankh_emb"]  # [L+2, d_ankh]
+        if ankh_emb.size(0) < max_len_seq:
+            ankh_emb = F.pad(ankh_emb, (0, 0, 0, max_len_seq - ankh_emb.size(0)), value=0)
+        ankh_emb_padded.append(ankh_emb)
 
     # ----------------------------------------------------
     # 2) Collect integer MSA token matrices *without* padding
@@ -500,6 +546,8 @@ def protein_collate(batch):
     # 3) Stack sequence embeddings + build masks
     # ----------------------------------------------------
     sequence_emb = torch.stack(seq_emb_padded)    # [B, L_max_seq, d_model]
+    prot_emb = torch.stack(prot_emb_padded)       # [B, L_max_seq, d_prot]
+    ankh_emb = torch.stack(ankh_emb_padded)       # [B, L_max_seq, d_ankh]
 
     # `msa_tok` left as list for per-sample processing later
     labels = torch.stack([it["labels"] for it in batch])
@@ -519,6 +567,8 @@ def protein_collate(batch):
         "protein_id": protein_ids,
         "sequence": sequences,
         "sequence_emb": sequence_emb,
+        "prot_emb": prot_emb,
+        "ankh_emb": ankh_emb,
         "msa_tok": msa_tok_list,  # list[Tensor] – variable shapes
         "seq_pad_mask": seq_pad_mask,  # [B, N_seq_max] (True → PAD)
         "labels": labels,

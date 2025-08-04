@@ -27,7 +27,7 @@ gradient_clip_val: 1.0
 gradient_clip_algorithm: "norm"
 
 # Accumulate gradients to simulate larger batch sizes
-accumulate_grad_batches: 3
+accumulate_grad_batches: 2
 # Log every N steps for monitoring
 
 

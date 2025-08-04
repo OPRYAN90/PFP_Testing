@@ -116,45 +116,44 @@ class AttentionFusion(nn.Module):
 ############################################################
 #  Encoders for the three modalities
 ############################################################
-
 class SequenceEncoder(nn.Module):
-    """Encode pre-computed ESM-C embeddings with additional transformer layers.
-
-    Input: Pre-computed ESM-C embeddings with shape [B, L, d_model] where:
-    - B: batch size  
-    - L: sequence length
-    - d_model: ESM-C embedding dimension
-    
-    The encoder applies additional transformer layers on top of ESM-C features
-    for task-specific fine-tuning.
-    """
-
-    def __init__(
-        self,
-        d_model: int = 1152,  # ESM-C embedding dimension
-        n_layers: int = 2,   # Additional transformer layers
-        n_heads: int = 8,    # Attention heads
-        dropout: float = 0.1,
-    ) -> None:
+    def __init__(self, d_model=1152, d_prot=128, d_ankh=1024, dropout=0.1, temperature=1.0):
         super().__init__()
-        
-        # ➊ optional embedding-level dropout
-        self.embed_drop = nn.Dropout(dropout) 
-        self.proj = nn.Linear(d_model, 768)
+        self.ln_seq  = nn.LayerNorm(d_model)
+        self.ln_prot = nn.LayerNorm(d_prot)
+        self.ln_ankh = nn.LayerNorm(d_ankh)
+        self.seq_proj  = nn.Linear(d_model, 768)
+        self.prot_proj = nn.Linear(d_prot, 768)
+        self.ankh_proj = nn.Linear(d_ankh, 768)
+        self.g_mlp = nn.Sequential(                  # per-dimension gates
+            nn.Linear(3*768, 1536),
+            nn.GELU(),
+            nn.Linear(1536, 3*768)
+        )
+        self.log_tau = nn.Parameter(torch.log(torch.tensor(float(temperature))))
+        self.drop = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor, pad_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Forward pass with pre-computed ESM-C embeddings.
-        
-        Args:
-            x: Pre-computed ESM-C embeddings [B, L, d_model]
-            pad_mask: [B, L] True where padded
-            
-        Returns:
-            Enhanced sequence representations [B, L, d_model]
-        """
-        x = self.embed_drop(x)                 # ➋ new dropout point
-        x = self.proj(x)
-        return x  # [B, L, d_model]
+    def forward(self, x, prot_emb, ankh_emb, pad_mask=None, lengths=None):
+        s = self.seq_proj(self.ln_seq(x))           # [B,L,768]
+        p = self.prot_proj(self.ln_prot(prot_emb))  # [B,L,768]
+        a = self.ankh_proj(self.ln_ankh(ankh_emb))  # [B,L,768]
+
+        logits = self.g_mlp(torch.cat([s, p, a], dim=-1))    # [B,L,3*768]
+        w = torch.softmax(logits.view(*logits.shape[:-1], 3, 768) / self.log_tau.exp(), dim=-2)  # [B,L,3,768]
+        z = (w[:,:,0,:]*s + w[:,:,1,:]*p + w[:,:,2,:]*a)     # [B,L,768]
+
+        # (optional) keep BOS/EOS from a single source, or simply mask them from attention later
+        z[:, 0] = s[:, 0]
+        if lengths is not None:
+            for i, length in enumerate(lengths):
+                z[i, length + 1] = s[i, length + 1]
+
+        if pad_mask is not None:
+            z = z.masked_fill(pad_mask.unsqueeze(-1), 0.0)
+        return self.drop(z)
+
+
+
 
 
 class MSAEncoder(nn.Module):
@@ -294,8 +293,9 @@ class ProteinLitModule(LightningModule):
         self,
         task_type: str,                       # Task type: "mf", "bp", or "cc" - required
         d_model: int = 1152,                  # Base model dimension
+        d_prot: int = 128,                    # Protein embedding dimension
+        d_ankh: int = 1024,                   # Ankh3-Large embedding dimension
         d_msa: int = 768,                     # MSA embedding dimension
-        n_seq_layers: int = 2,                # Sequence encoder layers
         n_cross_layers: int = 2,              # Cross-attention layers
         n_heads: int = 8,                     # Attention heads
         dropout: float = 0.1,                 # Dropout rate
@@ -320,8 +320,8 @@ class ProteinLitModule(LightningModule):
         # Encoders
         self.seq_encoder = SequenceEncoder(
             d_model=d_model,
-            n_layers=n_seq_layers,
-            n_heads=n_heads,
+            d_prot=d_prot,  # Protein embedding dimension
+            d_ankh=d_ankh,  # Ankh3-Large embedding dimension
             dropout=dropout
         )
         self.msa_encoder = MSAEncoder(
@@ -378,6 +378,8 @@ class ProteinLitModule(LightningModule):
         """
         # Extract inputs - ESM-C embeddings are pre-computed
         seq_emb = batch["sequence_emb"]  # Pre-computed ESM-C: [B, L, d_model]
+        prot_emb = batch["prot_emb"]     # Pre-computed protein: [B, L, d_prot]
+        ankh_emb = batch["ankh_emb"]     # Pre-computed Ankh3-Large: [B, L, d_ankh]
         msa_tok_list = batch["msa_tok"]   # list[Tensor] – variable [N_seq_i, L_i]
 
         pad_mask = batch["pad_mask"]     # [B, L] - True where padded
@@ -401,7 +403,7 @@ class ProteinLitModule(LightningModule):
             pooling_mask[i, pos] = True
 
         # Encode each modality with regular padding masks (EOS included)
-        seq_z = self.seq_encoder(seq_emb, pad_mask=pad_mask)  # [B, L, d]
+        seq_z = self.seq_encoder(seq_emb, prot_emb, ankh_emb, pad_mask=pad_mask, lengths=batch["lengths"])  # [B, L, 768]
         msa_z = self.msa_encoder(msa_emb, pad_mask=pooling_mask, seq_pad=seq_pad)  # [B, L, d]
 
         # Insert learnable EOS token after MSA encoding
