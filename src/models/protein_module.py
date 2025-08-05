@@ -119,64 +119,71 @@ class AttentionFusion(nn.Module):
 #  Encoders for the three modalities
 ############################################################
 
-class CrossAttentionFusion(nn.Module):
-    """Cross-attention between all three modalities - FIXED VERSION"""
+class SeparateMHACrossAttentionFusion(nn.Module):
+    """Cross-attention with separate MHA for each modality pair + softmax gating"""
     
     def __init__(self, d_model: int, dropout: float = 0.1, n_heads: int = 8):
         super().__init__()
         self.d_model = d_model
         self.n_heads = n_heads
         
-        # Multi-head attention for each modality pair
-        self.esm_to_others = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
-        self.prot_to_others = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
-        self.ankh_to_others = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+        # (unchanged) 6 MHAs
+        self.esm_to_prot = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+        self.esm_to_ankh = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+        self.prot_to_esm = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+        self.prot_to_ankh = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+        self.ankh_to_esm = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+        self.ankh_to_prot = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
         
-        # Final combination layer
-        self.combine = nn.Linear(d_model * 3, d_model)
+        # NEW: per-token gating over {esm, prot, ankh}
+        self.gate = nn.Sequential(
+        nn.LayerNorm(d_model * 3),
+        nn.Dropout(0.1),                # (optional) on inputs to the gate
+        nn.Linear(d_model * 3, d_model // 2),
+        nn.GELU(),
+        nn.Dropout(0.1),                # on hidden activations
+        nn.Linear(d_model // 2, 3)      # logits -> softmax outside
+        )
+
         self.norm = nn.LayerNorm(d_model)
     
     def forward(self, esm, prot, ankh, pad_mask=None):
-        # Create key-value pairs from other modalities
-        others_esm = torch.cat([prot, ankh], dim=1)  # [B, 2L, d]
-        others_prot = torch.cat([esm, ankh], dim=1)  # [B, 2L, d]
-        others_ankh = torch.cat([esm, prot], dim=1)  # [B, 2L, d]
-        
-        # Create proper padding masks for concatenated sequences
+        # (unchanged) optional pre-mask of queries
         if pad_mask is not None:
-            # For others_esm (prot + ankh): duplicate pad_mask twice
-            others_esm_mask = torch.cat([pad_mask, pad_mask], dim=1)  # [B, 2L]
-            # For others_prot (esm + ankh): duplicate pad_mask twice  
-            others_prot_mask = torch.cat([pad_mask, pad_mask], dim=1)  # [B, 2L]
-            # For others_ankh (esm + prot): duplicate pad_mask twice
-            others_ankh_mask = torch.cat([pad_mask, pad_mask], dim=1)  # [B, 2L]
-        else:
-            others_esm_mask = others_prot_mask = others_ankh_mask = None
-        
-        # Apply padding mask to query tensors before cross-attention
-        if pad_mask is not None:
-            # Zero out padded positions in query tensors
-            esm = esm.masked_fill(pad_mask.unsqueeze(-1), 0.0)
+            esm  = esm.masked_fill(pad_mask.unsqueeze(-1), 0.0)
             prot = prot.masked_fill(pad_mask.unsqueeze(-1), 0.0)
             ankh = ankh.masked_fill(pad_mask.unsqueeze(-1), 0.0)
-        
-        # Cross-attention with correct padding masks
-        esm_attended, _ = self.esm_to_others(esm, others_esm, others_esm, key_padding_mask=others_esm_mask)
-        prot_attended, _ = self.prot_to_others(prot, others_prot, others_prot, key_padding_mask=others_prot_mask)
-        ankh_attended, _ = self.ankh_to_others(ankh, others_ankh, others_ankh, key_padding_mask=others_ankh_mask)
-        
-        # Combine attended representations
-        combined = torch.cat([esm_attended, prot_attended, ankh_attended], dim=-1)
-        fused = self.combine(combined)
-        
-        return self.norm(fused)  
 
-class CrossAttentionMultiModalFusion(nn.Module):
+        kpm = pad_mask  # MultiheadAttention expects True==pad
+
+        # (unchanged) 6 cross attentions
+        esm_to_prot_att, _  = self.esm_to_prot(esm,  prot, prot, key_padding_mask=kpm)
+        esm_to_ankh_att, _  = self.esm_to_ankh(esm,  ankh, ankh, key_padding_mask=kpm)
+        prot_to_esm_att, _  = self.prot_to_esm(prot, esm,  esm,  key_padding_mask=kpm)
+        prot_to_ankh_att, _ = self.prot_to_ankh(prot, ankh, ankh, key_padding_mask=kpm)
+        ankh_to_esm_att, _  = self.ankh_to_esm(ankh, esm,  esm,  key_padding_mask=kpm)
+        ankh_to_prot_att, _ = self.ankh_to_prot(ankh, prot, prot, key_padding_mask=kpm)
+
+        # (unchanged) residual aggregation per stream
+        esm_att  = esm  + esm_to_prot_att  + esm_to_ankh_att
+        prot_att = prot + prot_to_esm_att  + prot_to_ankh_att
+        ankh_att = ankh + ankh_to_esm_att  + ankh_to_prot_att
+
+        # NEW: convex (softmax) gating per token over the three streams
+        gate_in = torch.cat([esm_att, prot_att, ankh_att], dim=-1)   # [B, L, 3*d]
+        gate = self.gate(gate_in).softmax(dim=-1)                    # [B, L, 3]
+
+        mixed = (
+            gate[..., 0:1] * esm_att +
+            gate[..., 1:2] * prot_att +
+            gate[..., 2:3] * ankh_att
+        )  # [B, L, d_model]
+
+        return self.norm(mixed)  
+
+class SeparateMHAMultiModalFusion(nn.Module):
     """
-    Cross-attention fusion for three protein modalities:
-    - ESM-C sequence embeddings
-    - Protein embeddings  
-    - Ankh embeddings
+    Cross-attention fusion using separate MHA for each modality pair
     """
     
     def __init__(self,
@@ -189,31 +196,31 @@ class CrossAttentionMultiModalFusion(nn.Module):
         super().__init__()
         self.d_out = d_out
         
-        # Normalization layers
+        # Normalization layers (same as original)
         self.ln_esm = nn.LayerNorm(d_esm)
         self.ln_prot = nn.LayerNorm(d_prot)
         self.ln_ankh = nn.LayerNorm(d_ankh)
         
-        # Projection layers
+        # Projection layers (same as original)
         self.proj_esm = nn.Linear(d_esm, d_out)
         self.proj_prot = nn.Linear(d_prot, d_out)
         self.proj_ankh = nn.Linear(d_ankh, d_out)
         
-        # Cross-attention fusion
-        self.fusion = CrossAttentionFusion(d_out, dropout, n_heads)
+        # Separate MHA cross-attention fusion
+        self.fusion = SeparateMHACrossAttentionFusion(d_out, dropout, n_heads)
         
         self.dropout = nn.Dropout(dropout)
     
     def forward(self, esm_emb, prot_emb, ankh_emb, pad_mask=None, lengths=None):
-        # Normalize and project
+        # Normalize and project (same as original)
         esm_proj = self.proj_esm(self.ln_esm(esm_emb))      # [B, L, d_out]
         prot_proj = self.proj_prot(self.ln_prot(prot_emb))  # [B, L, d_out]
         ankh_proj = self.proj_ankh(self.ln_ankh(ankh_emb))  # [B, L, d_out]
         
-        # Apply cross-attention fusion
+        # Apply separate MHA cross-attention fusion
         fused = self.fusion(esm_proj, prot_proj, ankh_proj, pad_mask)
         
-        # Preserve special tokens (BOS/EOS) from ESM-C
+        # Preserve special tokens (same as original)
         if lengths is not None:
             fused[:, 0] = esm_proj[:, 0]  # Keep BOS token
             for i, length in enumerate(lengths):
@@ -223,8 +230,8 @@ class CrossAttentionMultiModalFusion(nn.Module):
         
         return self.dropout(fused).masked_fill(pad_mask.unsqueeze(-1), 0.0)
 
-# Drop-in replacement for your current SequenceEncoder
-class CrossAttentionSequenceEncoder(nn.Module):
+# Drop-in replacement for comparison
+class SeparateMHASequenceEncoder(nn.Module):
     def __init__(self,
                  d_model: int = 1152,
                  d_prot: int = 128,
@@ -234,7 +241,7 @@ class CrossAttentionSequenceEncoder(nn.Module):
                  n_heads: int = 8):
         super().__init__()
         
-        self.fusion = CrossAttentionMultiModalFusion(
+        self.fusion = SeparateMHAMultiModalFusion(
             d_esm=d_model,
             d_prot=d_prot, 
             d_ankh=d_ankh,
@@ -412,7 +419,7 @@ class ProteinLitModule(LightningModule):
         nn.init.normal_(self.eos_token, std=0.02)
         
         # Encoders
-        self.seq_encoder = CrossAttentionSequenceEncoder(
+        self.seq_encoder = SeparateMHASequenceEncoder(
             d_model=d_model,
             d_prot=d_prot,  # Protein embedding dimension
             d_ankh=d_ankh,  # Ankh3-Large embedding dimension

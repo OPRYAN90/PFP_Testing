@@ -16,6 +16,6 @@ msa_sample_size: 16
 # stride_test: 1          # Use every 1st element (no subsampling)
 
 # Data loading parameters
-num_workers: 16         #NOTE CONSIDER CHANING
+num_workers: 25         #NOTE CONSIDER CHANING
 pin_memory: true       # Pin memory for faster GPU transfer
 
