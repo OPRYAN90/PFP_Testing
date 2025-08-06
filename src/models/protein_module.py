@@ -27,21 +27,31 @@ def get_num_classes_for_task(task_type: str) -> int:
     class_counts = {"mf": 489, "bp": 1943, "cc": 320}
     return class_counts[task_type]
 
-class ResidualFeedForward(nn.Module):
-    """Transformer-style position-wise FFN with residual + layer norm."""
+class SwiGLU(nn.Module):
+    def __init__(self, d_in, d_hidden):
+        super().__init__()
+        self.w12 = nn.Linear(d_in, 2 * d_hidden)  # produces [a, b]
+        self.proj = nn.Linear(d_hidden, d_in)
 
-    def __init__(self, d_model: int, expansion: int = 4, dropout: float = 0.1):
+    def forward(self, x):
+        a, b = self.w12(x).chunk(2, dim=-1)
+        return self.proj(F.silu(a) * b)
+
+
+class ResidualFeedForward(nn.Module):
+    """Transformer-style FFN with SwiGLU."""
+    def __init__(self, d_model: int, expansion: float = 4.0, dropout: float = 0.1):
         super().__init__()
         self.norm = nn.LayerNorm(d_model)
+
+        # match params of GELU(4x) with SwiGLU(~8/3 x)
+        d_hidden = int(round((8/3) * d_model))
         self.ff = nn.Sequential(
-            nn.Linear(d_model, d_model * expansion),
-            nn.GELU(),
-            nn.Dropout(dropout),  # Standard: dropout after activation
-            nn.Linear(d_model * expansion, d_model),
-            nn.Dropout(dropout),  # Standard: dropout before residual
+            SwiGLU(d_model, d_hidden),
+            nn.Dropout(dropout),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         return x + self.ff(self.norm(x))
 
 
@@ -84,35 +94,25 @@ def masked_mean_pooling(x: torch.Tensor, pad_mask: torch.Tensor) -> torch.Tensor
     pooled = x_masked.sum(dim=1) / lengths
     
     return pooled
-
-
+    
 class AttentionFusion(nn.Module):
-    """
-    Lightweight fusion: a **scalar gate** decides how much to trust each
-    modality; a single linear layer adds extra capacity.
-    """
-    def __init__(self, d_model: int = 768):
+    def __init__(self, d_model=768, p_drop=0.1, favor_seq_bias=0.0):
         super().__init__()
+        self.pre = nn.LayerNorm(2 * d_model)
+        self.dropout = nn.Dropout(p_drop)
+        self.gate = nn.Linear(2 * d_model, 2)
+        # Optional: bias > 0 favors seq at init; 0.0 is neutral (50/50)
+        nn.init.constant_(self.gate.bias, favor_seq_bias)
 
-        # Scalar gate in [0,1]
-        self.gate = nn.Sequential(
-            nn.Linear(d_model * 2, 1, bias=True),
-            nn.Sigmoid()
-        )
+        # (Nice default) zero-init weights so bias controls the initial mix
+        nn.init.zeros_(self.gate.weight)
 
+    def forward(self, seq_feat, msa_feat):
+        h = torch.cat([seq_feat, msa_feat], dim=-1)
+        logits = self.gate(self.dropout(self.pre(h)))   # [B, 2]
+        w = torch.softmax(logits, dim=-1)               # [B, 2]
+        return w[..., 0:1] * seq_feat + w[..., 1:2] * msa_feat
 
-    def forward(
-        self,
-        seq_feat: torch.Tensor,          # [B, D]
-        msa_feat: torch.Tensor,          # [B, D]
-    ) -> torch.Tensor:
-
-        concat = torch.cat([seq_feat, msa_feat], dim=-1)             # [B, 2D]
-
-        g = self.gate(concat)                                       # [B,1]
-
-        fused = g * seq_feat + (1.0 - g) * msa_feat                  # gated sum
-        return fused
 
 
 ############################################################
@@ -539,6 +539,7 @@ class ProteinLitModule(LightningModule):
                 ankh_emb[i, eos_pos] = self.ankh_eos_token.to(ankh_emb.dtype).squeeze()    # [d_ankh]
         
         # Remove BOS tokens from MSA input for conservation head (zero out position 0)
+        msa_emb = msa_emb.clone()  # Clone to avoid inplace modification of inference tensor
         msa_emb[:, :, 0] = 0.0  # Zero out BOS position for all sequences in MSA
         
         # Create mask for MSA encoder: mask BOS position (0) and ensure EOS positions are masked
