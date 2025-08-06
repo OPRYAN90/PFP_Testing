@@ -140,6 +140,10 @@ class ProteinDataset(Dataset):
         # Ensure all embeddings have the same sequence length
         assert esmc_emb.size(0) == prot_emb.size(0) == ankh_emb.size(0), f"Embeddings have different lengths: ESM-C={esmc_emb.size(0)}, Protein={prot_emb.size(0)}, Ankh={ankh_emb.size(0)}"
         
+        # Zero out 0th and L+1th indices for ESM-C embeddings (no BOS/EOS tokens)
+        esmc_emb[0] = 0.0  # Zero out BOS position
+        esmc_emb[-1] = 0.0  # Zero out EOS position
+        
         # Zero out 0th and L+1th indices for protein embeddings (no BOS/EOS tokens)
         prot_emb[0] = 0.0  # Zero out BOS position
         prot_emb[-1] = 0.0  # Zero out EOS position

@@ -228,14 +228,6 @@ class CrossAttentionMultiModalFusion(nn.Module):
         # Apply cross-attention fusion
         fused = self.fusion(esm_proj, prot_proj, ankh_proj, pad_mask)
         
-        # Preserve special tokens (BOS/EOS) from ESM-C
-        if lengths is not None:
-            fused[:, 0] = esm_proj[:, 0]  # Keep BOS token
-            for i, length in enumerate(lengths):
-                eos_pos = length + 1
-                if eos_pos < fused.size(1):  # Safety check
-                    fused[i, eos_pos] = esm_proj[i, eos_pos]  # Keep EOS token
-        
         return self.dropout(fused).masked_fill(pad_mask.unsqueeze(-1), 0.0)
 
 # Drop-in replacement for your current SequenceEncoder
@@ -259,7 +251,7 @@ class CrossAttentionSequenceEncoder(nn.Module):
         )
     
     def forward(self, x, prot_emb, ankh_emb, pad_mask=None, lengths=None):
-        return self.fusion(x, prot_emb, ankh_emb, pad_mask, lengths)
+        return self.fusion(x, prot_emb, ankh_emb, pad_mask)
 
 
 
@@ -422,9 +414,31 @@ class ProteinLitModule(LightningModule):
         import esm
         self.msa_model, _ = esm.pretrained.esm_msa1b_t12_100M_UR50S()
         self.msa_model.eval().requires_grad_(False)
-        # Learnable EOS token (inserted after MSA encoding as a register)
-        self.eos_token = nn.Parameter(torch.zeros(1, 1, 1, d_msa))
-        nn.init.normal_(self.eos_token, std=0.02)
+        
+        # Individual learnable BOS/EOS tokens for each modality
+        # ESM-C tokens (d_model dimension)
+        self.esm_bos_token = nn.Parameter(torch.zeros(1, d_model))
+        self.esm_eos_token = nn.Parameter(torch.zeros(1, d_model))
+        nn.init.normal_(self.esm_bos_token, std=0.02)
+        nn.init.normal_(self.esm_eos_token, std=0.02)
+        
+        # Protein tokens (d_prot dimension)
+        self.prot_bos_token = nn.Parameter(torch.zeros(1, d_prot))
+        self.prot_eos_token = nn.Parameter(torch.zeros(1, d_prot))
+        nn.init.normal_(self.prot_bos_token, std=0.02)
+        nn.init.normal_(self.prot_eos_token, std=0.02)
+        
+        # Ankh tokens (d_ankh dimension)
+        self.ankh_bos_token = nn.Parameter(torch.zeros(1, d_ankh))
+        self.ankh_eos_token = nn.Parameter(torch.zeros(1, d_ankh))
+        nn.init.normal_(self.ankh_bos_token, std=0.02)
+        nn.init.normal_(self.ankh_eos_token, std=0.02)
+        
+        # MSA tokens (d_msa dimension) - for insertion after MSA encoder
+        self.msa_bos_token = nn.Parameter(torch.zeros(1, d_msa))
+        self.msa_eos_token = nn.Parameter(torch.zeros(1, d_msa))
+        nn.init.normal_(self.msa_bos_token, std=0.02)
+        nn.init.normal_(self.msa_eos_token, std=0.02)
         
         # Encoders
         self.seq_encoder = CrossAttentionSequenceEncoder(
@@ -480,12 +494,12 @@ class ProteinLitModule(LightningModule):
     #  Forward pass - optimized MSA computation
     # ---------------------------------------------------------------------
     def forward(self, batch: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass with optimized MSA processing and deferred EOS token handling.
+        """Forward pass with individual learnable BOS/EOS tokens for each modality.
         
         Key changes:
-        - EOS token is excluded from MSA pooling by masking its position
-        - Learnable EOS token is inserted after MSA encoding as a register
-        - This ensures EOS doesn't interfere with attention/pooling operations
+        - Each modality gets its own learnable BOS/EOS tokens
+        - BOS tokens are inserted at position 0, EOS tokens at position L+1
+        - This allows each modality to learn optimal start/end representations
         """
         # Extract inputs - ESM-C embeddings are pre-computed
         seq_emb = batch["sequence_emb"]  # Pre-computed ESM-C: [B, L, d_model]
@@ -507,26 +521,56 @@ class ProteinLitModule(LightningModule):
         # Keep original behaviour for potential external use
         batch["msa_compute_time"] = msa_compute_time
 
-        # Mask EOS position for pooling-only (exclude from attention/pooling)
-        eos_idx = batch["lengths"] + 1
-        pooling_mask = pad_mask.clone()
-        for i, pos in enumerate(eos_idx):
-            pooling_mask[i, pos] = True
-
-        # Encode each modality with regular padding masks (EOS included)
-        seq_z = self.seq_encoder(seq_emb, prot_emb, ankh_emb, pad_mask=pad_mask, lengths=batch["lengths"])  # [B, L, 768]
-        msa_z = self.msa_encoder(msa_emb, pad_mask=pooling_mask, seq_pad=seq_pad)  # [B, L, d]
-
-        # Insert learnable EOS token after MSA encoding
-        for i, pos in enumerate(eos_idx):
-            msa_z[i, pos] = self.eos_token.squeeze()
+        # Insert individual learnable BOS/EOS tokens for each modality
+        B = seq_emb.size(0)
+        lengths = batch["lengths"]
+        
+        # Insert BOS tokens at position 0
+        seq_emb[:, 0] = self.esm_bos_token.to(seq_emb.dtype).expand(B, -1)      # [B, d_model]
+        prot_emb[:, 0] = self.prot_bos_token.to(prot_emb.dtype).expand(B, -1)    # [B, d_prot]
+        ankh_emb[:, 0] = self.ankh_bos_token.to(ankh_emb.dtype).expand(B, -1)    # [B, d_ankh]
+        
+        # Insert EOS tokens at position L+1
+        for i, length in enumerate(lengths):
+            eos_pos = length + 1
+            if eos_pos < seq_emb.size(1):  # Safety check
+                seq_emb[i, eos_pos] = self.esm_eos_token.to(seq_emb.dtype).squeeze()      # [d_model]
+                prot_emb[i, eos_pos] = self.prot_eos_token.to(prot_emb.dtype).squeeze()    # [d_prot]
+                ankh_emb[i, eos_pos] = self.ankh_eos_token.to(ankh_emb.dtype).squeeze()    # [d_ankh]
+        
+        # Remove BOS tokens from MSA input for conservation head (zero out position 0)
+        msa_emb[:, :, 0] = 0.0  # Zero out BOS position for all sequences in MSA
+        
+        # Create mask for MSA encoder: mask BOS position (0) and ensure EOS positions are masked
+        msa_encoder_mask = pad_mask.clone()
+        msa_encoder_mask[:, 0] = True  # Mask out BOS position for MSA encoder (padding=True)
+        
+        # Also ensure EOS positions (L+1) are masked as True
+        for i, length in enumerate(lengths):
+            eos_pos = length + 1
+            if eos_pos < msa_encoder_mask.size(1):  # Safety check
+                msa_encoder_mask[i, eos_pos] = True  # Mask out EOS position for MSA encoder
+        
+        # Encode each modality with appropriate masks
+        seq_z = self.seq_encoder(seq_emb, prot_emb, ankh_emb, pad_mask=pad_mask)  # [B, L, 768]
+        msa_z = self.msa_encoder(msa_emb, pad_mask=msa_encoder_mask, seq_pad=seq_pad)  # [B, L, d] - only real residues
+        
+        # After MSA encoder, insert learnable BOS/EOS tokens in the MSA representation
+        # Insert BOS tokens at position 0
+        msa_z[:, 0] = self.msa_bos_token.to(msa_z.dtype).expand(B, -1)  # [B, d_msa]
+        
+        # Insert EOS tokens at position L+1
+        for i, length in enumerate(lengths):
+            eos_pos = length + 1
+            if eos_pos < msa_z.size(1):  # Safety check
+                msa_z[i, eos_pos] = self.msa_eos_token.to(msa_z.dtype).squeeze()  # [d_msa]
 
         # Cross-modal attention with padding masks
         seq_z, msa_z = self.cross_attn(seq_z, msa_z, pad_mask, pad_mask)  # each [B, L, d]
 
-        # Use masked mean pooling
-        seq_pool = masked_mean_pooling(seq_z, pad_mask)  # [B, d]
-        msa_pool = masked_mean_pooling(msa_z, pad_mask)  # [B, d]
+        # Use masked mean pooling (exclude BOS/EOS tokens)
+        seq_pool = masked_mean_pooling(seq_z, msa_encoder_mask)  # [B, d] - excludes BOS/EOS
+        msa_pool = masked_mean_pooling(msa_z, msa_encoder_mask)  # [B, d] - excludes BOS/EOS
 
         # Use AttentionFusion instead of concatenation
         fused = self.fusion(seq_pool, msa_pool)    # [B, d]
