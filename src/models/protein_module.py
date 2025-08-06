@@ -5,98 +5,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
-# ADD
-from peft import LoraConfig, get_peft_model
-from peft.tuners.lora import LoraLayer
-
 # -----------------------------------------------------------------------------
 # Optional FlashAttention toggle – does nothing on unsupported systems
 # -----------------------------------------------------------------------------
 
 # from utils.flash_control import maybe_enable_flash_attention  
 # maybe_enable_flash_attention(True)
-
-# ADD (put near the top of the file)
-from typing import Iterable, List
-import torch.nn as nn
-
-def collect_msa_lora_targets(msa_model: nn.Module,
-                             layers: Iterable[int] | None = None,
-                             kv_only: bool = False) -> List[str]:
-    """
-    Build target module names for LoRA inside ESM-MSA:
-      layers.{i}.row_self_attention.layer.{q,k,v,out}_proj
-      layers.{i}.column_self_attention.layer.{q,k,v,out}_proj
-    """
-    proj_list = (["k_proj", "v_proj"] if kv_only else ["q_proj", "k_proj", "v_proj", "out_proj"])
-    if layers is None:
-        n = sum(1 for _ in msa_model.layers)  # 12 for esm_msa1b_t12_100M_UR50S
-        layers = range(n)
-    targets = []
-    for i in layers:
-        base_row = f"layers.{i}.row_self_attention.layer"
-        base_col = f"layers.{i}.column_self_attention.layer"
-        for p in proj_list:
-            targets.append(f"{base_row}.{p}")
-            targets.append(f"{base_col}.{p}")
-    return targets
-
-def sanity_check_lora_modes(model: nn.Module):
-    """
-    Expect:
-      - model.training == False (we keep the base in eval)
-      - LoRA layers (peft.tuners.lora.LoraLayer) are in train()
-      - Dropouts inside LoRA layers may be in train()  ✅ allowed
-      - All other Dropout modules are in eval()        ❌ if training
-      - Only LoRA params require grad
-    """
-    # collect names of LoRA layers to detect their submodules by prefix
-    lora_prefixes = [name for name, m in model.named_modules() if isinstance(m, LoraLayer)]
-
-    def under_lora(name: str) -> bool:
-        return any(name.startswith(p + ".") or name == p for p in lora_prefixes)
-
-    bad_lora_mode = []
-    bad_base_dropout_mode = []
-    bad_grad_flags = []
-
-    # 1) module-level checks
-    for name, m in model.named_modules():
-        if isinstance(m, LoraLayer):
-            if not m.training:
-                bad_lora_mode.append(name)
-        elif isinstance(m, (nn.Dropout, nn.AlphaDropout)):
-            if m.training and not under_lora(name):
-                bad_base_dropout_mode.append(name)
-
-    # 2) parameter grad checks
-    for name, p in model.named_parameters():
-        # True LoRA params in PEFT always have 'lora_' in their names (lora_A, lora_B, etc.)
-        is_lora_param = "lora_" in name
-
-        if is_lora_param and not p.requires_grad:
-            bad_grad_flags.append(f"LoRA param not trainable: {name}")
-
-        # Base weights (including base_layer.*) should be frozen
-        if (not is_lora_param) and p.requires_grad:
-            bad_grad_flags.append(f"Base param unexpectedly trainable: {name}")
-
-    print(f"model.training = {model.training}  (expected False for frozen base)")
-    if bad_lora_mode or bad_base_dropout_mode or bad_grad_flags:
-        print("❌ LoRA sanity check FAILED")
-        if bad_lora_mode:
-            print("  LoRA layers not in train():")
-            for n in bad_lora_mode: print("   •", n)
-        if bad_base_dropout_mode:
-            print("  Base Dropout modules in train():")
-            for n in bad_base_dropout_mode: print("   •", n)
-        if bad_grad_flags:
-            print("  Bad requires_grad flags:")
-            for n in bad_grad_flags: print("   •", n)
-        raise RuntimeError("LoRA setup sanity check failed.")
-    else:
-        print("✅ LoRA sanity check passed: base eval, adapters train, grads only on LoRA.")
-
 
 
 from lightning import LightningModule
@@ -186,18 +100,25 @@ class AttentionFusion(nn.Module):
         super().__init__()
         self.pre = nn.LayerNorm(2 * d_model)
         self.dropout = nn.Dropout(p_drop)
-        self.gate = nn.Linear(2 * d_model, 2)
-        # Optional: bias > 0 favors seq at init; 0.0 is neutral (50/50)
+        self.gate = nn.Linear(2 * d_model, 2 * d_model)
+
+        # init so bias controls initial mix; weights start at 0
+        nn.init.zeros_(self.gate.weight)
         nn.init.constant_(self.gate.bias, favor_seq_bias)
 
-        # (Nice default) zero-init weights so bias controls the initial mix
-        nn.init.zeros_(self.gate.weight)
+        # optional learned temperature for sharper/softer gates
+        self.log_temp = nn.Parameter(torch.zeros(()))  # temp = exp(log_temp)
 
     def forward(self, seq_feat, msa_feat):
         h = torch.cat([seq_feat, msa_feat], dim=-1)
-        logits = self.gate(self.dropout(self.pre(h)))   # [B, 2]
-        w = torch.softmax(logits, dim=-1)               # [B, 2]
-        return w[..., 0:1] * seq_feat + w[..., 1:2] * msa_feat
+        logits = self.gate(self.dropout(self.pre(h)))
+        temp = self.log_temp.exp()
+
+        # shape: [B, D, 2] → softmax over last dim (convex per channel)
+        B, D = seq_feat.shape
+        logits = logits.view(B, D, 2) / temp
+        w = torch.softmax(logits, dim=-1)            # [B, D, 2]
+        return (w[..., 0] * seq_feat) + (w[..., 1] * msa_feat)
 
 
 
@@ -218,15 +139,17 @@ class CrossAttentionFusion(nn.Module):
         self.prot_to_others = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
         self.ankh_to_others = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
         
-        # NEW: per-token gating over {esm, prot, ankh}
-        self.gate = nn.Sequential(
-            nn.LayerNorm(d_model * 3),
-            nn.Dropout(0.1),                # (optional) on inputs to the gate
-            nn.Linear(d_model * 3, d_model // 2),
-            nn.GELU(),
-            nn.Dropout(0.1),                # on hidden activations
-            nn.Linear(d_model // 2, 3)      # logits -> softmax outside
-        )
+        # NEW: per-dimension gating over {esm, prot, ankh}
+        self.gate_pre = nn.LayerNorm(d_model * 3)
+        self.gate_dropout = nn.Dropout(0.1)
+        self.gate = nn.Linear(d_model * 3, d_model * 3)
+        
+        # init so bias controls initial mix; weights start at 0
+        nn.init.zeros_(self.gate.weight)
+        nn.init.constant_(self.gate.bias, 0.0)  # neutral initialization
+        
+        # optional learned temperature for sharper/softer gates
+        self.log_temp = nn.Parameter(torch.zeros(()))
         
         # Final combination layer
         self.norm = nn.LayerNorm(d_model)
@@ -260,14 +183,21 @@ class CrossAttentionFusion(nn.Module):
         prot_attended, _ = self.prot_to_others(prot, others_prot, others_prot, key_padding_mask=others_prot_mask)
         ankh_attended, _ = self.ankh_to_others(ankh, others_ankh, others_ankh, key_padding_mask=others_ankh_mask)
         
-        # NEW: convex (softmax) gating per token over the three streams
+        # NEW: per-dimension gating over the three streams
         gate_in = torch.cat([esm_attended, prot_attended, ankh_attended], dim=-1)   # [B, L, 3*d]
-        gate = self.gate(gate_in).softmax(dim=-1)                    # [B, L, 3]
-
+        logits = self.gate(self.gate_dropout(self.gate_pre(gate_in)))
+        temp = self.log_temp.exp()
+        
+        # shape: [B, L, D, 3] → softmax over last dim (convex per channel)
+        B, L, _ = gate_in.shape
+        D = self.d_model
+        logits = logits.view(B, L, D, 3) / temp
+        w = torch.softmax(logits, dim=-1)            # [B, L, D, 3]
+        
         mixed = (
-            gate[..., 0:1] * esm_attended +
-            gate[..., 1:2] * prot_attended +
-            gate[..., 2:3] * ankh_attended
+            w[..., 0] * esm_attended +
+            w[..., 1] * prot_attended +
+            w[..., 2] * ankh_attended
         )  # [B, L, d_model]
         
         return self.norm(mixed)  
@@ -499,35 +429,7 @@ class ProteinLitModule(LightningModule):
         # Load MSA model - NO STREAM NEEDED
         import esm
         self.msa_model, _ = esm.pretrained.esm_msa1b_t12_100M_UR50S()
-
-        # 1) Load and freeze base
-        self.msa_model.requires_grad_(False)
-        self.msa_model.eval()  # keep frozen trunk in eval (no dropout)
-
-        # === LoRA Preset A: Q,K,V,Out on ALL layers; r=4, alpha=1, dropout=0.1 ===  # ADD
-        targets = collect_msa_lora_targets(self.msa_model, layers=None, kv_only=False)
-        lora_cfg = LoraConfig(
-            r=4,
-            lora_alpha=1,
-            lora_dropout=0.1,
-            target_modules=targets,
-            bias="none",
-            task_type="FEATURE_EXTRACTION",
-        )
-        self.msa_model = get_peft_model(self.msa_model, lora_cfg)
-
-
-        self.msa_model.eval()  # base stays eval
-        for m in self.msa_model.modules():
-            if isinstance(m, LoraLayer):
-                m.train()         # adapters train (dropout active inside adapters)
-
-        sanity_check_lora_modes(self.msa_model)
-
-        # ADD (optional, after get_peft_model)
-        n_total = sum(p.numel() for p in self.msa_model.parameters())
-        n_train = sum(p.numel() for p in self.msa_model.parameters() if p.requires_grad)
-        print(f"[LoRA/MSA] trainable fraction: {n_train/n_total:.4%} ({n_train}/{n_total})")
+        self.msa_model.eval().requires_grad_(False)
         
         # Individual learnable BOS/EOS tokens for each modality
         # ESM-C tokens (d_model dimension)
@@ -697,7 +599,7 @@ class ProteinLitModule(LightningModule):
     # ------------------------------------------------------------------
     #  Simple MSA embedding computation without streams
     # ------------------------------------------------------------------
-    # @torch.inference_mode()
+    @torch.inference_mode()
     def _compute_msa_embeddings(
         self,
         msa_tok_list: List[torch.Tensor],
