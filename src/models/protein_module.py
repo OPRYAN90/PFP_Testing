@@ -20,6 +20,9 @@ from data.go_utils import (
     propagate_go_preds, propagate_ec_preds,
     function_centric_aupr, cafa_fmax, smin
 )
+from transformers import AutoTokenizer, T5EncoderModel, T5Tokenizer
+from esm.models.esmc import ESMC
+from esm.sdk.api import ESMProtein, LogitsConfig
 
 # Simple helper to get number of classes without datamodule dependency
 def get_num_classes_for_task(task_type: str) -> int:
@@ -197,7 +200,7 @@ class CrossAttentionMultiModalFusion(nn.Module):
     
     def __init__(self,
                  d_esm: int = 1152,
-                 d_prot: int = 128,
+                 d_prot: int = 1024,
                  d_ankh: int = 1024,
                  d_msa: int = 768,
                  d_out: int = 768,
@@ -239,7 +242,7 @@ class CrossAttentionMultiModalFusion(nn.Module):
 class CrossAttentionSequenceEncoder(nn.Module):
     def __init__(self,
                  d_model: int = 1152,
-                 d_prot: int = 128,
+                 d_prot: int = 1024,
                  d_ankh: int = 1024,
                  d_out: int = 768,
                  dropout: float = 0.1,
@@ -378,7 +381,7 @@ class ProteinLitModule(LightningModule):
         self,
         task_type: str,                       # Task type: "mf", "bp", or "cc" - required
         d_model: int = 1152,                  # Base model dimension
-        d_prot: int = 128,                    # Protein embedding dimension
+        d_prot: int = 1024,                   # ProtT5 embedding dimension
         d_ankh: int = 1024,                   # Ankh3-Large embedding dimension
         d_msa: int = 768,                     # MSA embedding dimension
         n_cross_layers: int = 2,              # Cross-attention layers
@@ -387,6 +390,10 @@ class ProteinLitModule(LightningModule):
         optimizer: Optional[Any] = None,      # Hydra optimizer config
         scheduler: Optional[Any] = None,      # Hydra scheduler config  
         warmup_ratio: float = 0.05,           # Warmup ratio for cosine schedule (5% of total training steps)
+        # --- LoRA toggles (placeholders; wiring to be added later) ---
+        lora_esmc: bool = False,
+        lora_prott5: bool = False,
+        lora_ankh: bool = False,
     ) -> None:
         super().__init__()
         self.save_hyperparameters(logger=True)
@@ -394,10 +401,27 @@ class ProteinLitModule(LightningModule):
         # Store task type for easy access
         self.task_type = task_type
         
-        # Load MSA model - NO STREAM NEEDED
+        # Load models (frozen by default) ---------------------------------
         import esm
         self.msa_model, _ = esm.pretrained.esm_msa1b_t12_100M_UR50S()
         self.msa_model.eval().requires_grad_(False)
+
+        # ESM-C 600M (SDK)
+        self.esmc_model = ESMC.from_pretrained("esmc_600m").eval().requires_grad_(False)
+
+        # ProtT5 (HF)
+        self.prot_t5 = T5EncoderModel.from_pretrained("Rostlab/prot_t5_xl_uniref50").eval().requires_grad_(False)
+
+        # Ankh3-Large (HF)
+        self.ankh_enc = T5EncoderModel.from_pretrained("ElnaggarLab/ankh3-large").eval().requires_grad_(False)
+
+        # --- LoRA placeholders: will attach adapters here later ---
+        if self.hparams.lora_esmc:
+            self._attach_lora_placeholder(self.esmc_model, "esmc")
+        if self.hparams.lora_prott5:
+            self._attach_lora_placeholder(self.prot_t5, "prot_t5")
+        if self.hparams.lora_ankh:
+            self._attach_lora_placeholder(self.ankh_enc, "ankh")
         
         # Individual learnable BOS/EOS tokens for each modality
         # ESM-C tokens (d_model dimension)
@@ -427,7 +451,7 @@ class ProteinLitModule(LightningModule):
         # Encoders
         self.seq_encoder = CrossAttentionSequenceEncoder(
             d_model=d_model,
-            d_prot=d_prot,  # Protein embedding dimension
+            d_prot=d_prot,  # ProtT5 embedding dimension
             d_ankh=d_ankh,  # Ankh3-Large embedding dimension
             d_out=768,
             dropout=dropout,
@@ -473,54 +497,38 @@ class ProteinLitModule(LightningModule):
     #  Forward pass - optimized MSA computation
     # ---------------------------------------------------------------------
     def forward(self, batch: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass with individual learnable BOS/EOS tokens for each modality.
-        
-        Key changes:
-        - Each modality gets its own learnable BOS/EOS tokens
-        - BOS tokens are inserted at position 0, EOS tokens at position L+1
-        - This allows each modality to learn optimal start/end representations
-        """
-        # Extract inputs - ESM-C embeddings are pre-computed
-        seq_emb = batch["sequence_emb"]  # Pre-computed ESM-C: [B, L, d_model]
-        prot_emb = batch["prot_emb"]     # Pre-computed protein: [B, L, d_prot]
-        ankh_emb = batch["ankh_emb"]     # Pre-computed Ankh3-Large: [B, L, d_ankh]
-        msa_tok_list = batch["msa_tok"]   # list[Tensor] – variable [N_seq_i, L_i]
+        """Forward with on-the-fly PLM embeddings (ESM-C, ProtT5, Ankh).
+        Datamodule passes tokens; we keep BOS/EOS through the PLMs and
+        only replace them with learnable tokens afterward."""
+        sequences = batch["sequence"]              # List[str], length B
+        prot_ids = batch["prot_input_ids"]         # [B, T_max]
+        prot_mask = batch["prot_attention_mask"]   # [B, T_max]
+        ankh_ids = batch["ankh_input_ids"]         # [B, T_max]
+        ankh_mask = batch["ankh_attention_mask"]   # [B, T_max]
+        msa_tok_list = batch["msa_tok"]            # list[Tensor] – variable [N_i, L_i]
 
-        pad_mask = batch["pad_mask"]     # [B, L] - True where padded
+        pad_mask = batch["pad_mask"]               # [B, L_max] (True where padded)
         seq_pad    = batch["seq_pad_mask"]  # [B, N_max]
 
-        # Compute MSA embeddings on-the-fly (sequential, per-sample)
-        target_len = seq_emb.shape[1]  # CLS + residues + EOS (same as pad_mask width)
+        # Shapes / sizes
+        B = len(sequences)
+        lengths = batch["lengths"]                 # [B] (residue counts, no specials)
+        Lmax = pad_mask.shape[1]                   # = max(lengths) + 2
+
+        # -------------------------------------------------------------
+        # 1) Compute MSA embeddings (unchanged)
+        # -------------------------------------------------------------
+        target_len = Lmax
         msa_emb, msa_compute_time = self._compute_msa_embeddings(msa_tok_list, target_len)  # [B, N_seq_max, target_len, d_msa]
-        
         # Expose timing so callbacks (e.g., BatchTimer) can log it **after** the forward pass.
         # Storing it on `self` ensures it is available in hooks such as `on_before_backward`.
         self._last_msa_compute_time = msa_compute_time
-
         # Keep original behaviour for potential external use
         batch["msa_compute_time"] = msa_compute_time
+        # For conservation head: treat BOS as masked in MSA encoder
+        msa_emb = msa_emb.clone()
+        msa_emb[:, :, 0] = 0.0
 
-        # Insert individual learnable BOS/EOS tokens for each modality
-        B = seq_emb.size(0)
-        lengths = batch["lengths"]
-        
-        # Insert BOS tokens at position 0
-        seq_emb[:, 0] = self.esm_bos_token.to(seq_emb.dtype).expand(B, -1)      # [B, d_model]
-        prot_emb[:, 0] = self.prot_bos_token.to(prot_emb.dtype).expand(B, -1)    # [B, d_prot]
-        ankh_emb[:, 0] = self.ankh_bos_token.to(ankh_emb.dtype).expand(B, -1)    # [B, d_ankh]
-        
-        # Insert EOS tokens at position L+1
-        for i, length in enumerate(lengths):
-            eos_pos = length + 1
-            if eos_pos < seq_emb.size(1):  # Safety check
-                seq_emb[i, eos_pos] = self.esm_eos_token.to(seq_emb.dtype).squeeze()      # [d_model]
-                prot_emb[i, eos_pos] = self.prot_eos_token.to(prot_emb.dtype).squeeze()    # [d_prot]
-                ankh_emb[i, eos_pos] = self.ankh_eos_token.to(ankh_emb.dtype).squeeze()    # [d_ankh]
-        
-        # Remove BOS tokens from MSA input for conservation head (zero out position 0)
-        msa_emb = msa_emb.clone()  # Clone to avoid inplace modification of inference tensor
-        msa_emb[:, :, 0] = 0.0  # Zero out BOS position for all sequences in MSA
-        
         # Create mask for MSA encoder: mask BOS position (0) and ensure EOS positions are masked
         msa_encoder_mask = pad_mask.clone()
         msa_encoder_mask[:, 0] = True  # Mask out BOS position for MSA encoder (padding=True)
@@ -530,19 +538,28 @@ class ProteinLitModule(LightningModule):
             eos_pos = length + 1
             if eos_pos < msa_encoder_mask.size(1):  # Safety check
                 msa_encoder_mask[i, eos_pos] = True  # Mask out EOS position for MSA encoder
-        
-        # Encode MSA and insert BOS/EOS tokens into the MSA representation
+
+        # -------------------------------------------------------------
+        # 2) PLM embeddings on-the-fly via helpers (with BOS/EOS injection)
+        # -------------------------------------------------------------
+        esmc_emb = self._compute_esmc_embeddings(sequences, lengths, Lmax)
+        prot_emb = self._compute_prott5_embeddings(prot_ids, prot_mask, lengths, Lmax)
+        ankh_emb = self._compute_ankh_embeddings(ankh_ids, ankh_mask, lengths, Lmax)
+
+        # -------------------------------------------------------------
+        # 3) MSA encode (unchanged)
+        # -------------------------------------------------------------
         msa_z = self.msa_encoder(msa_emb, pad_mask=msa_encoder_mask, seq_pad=seq_pad)  # [B, L, d_msa]
-        # Insert BOS at position 0
-        msa_z[:, 0] = self.msa_bos_token.to(msa_z.dtype).expand(B, -1)
-        # Insert EOS at position L+1
-        for i, length in enumerate(lengths):
-            eos_pos = length + 1
-            if eos_pos < msa_z.size(1):
-                msa_z[i, eos_pos] = self.msa_eos_token.to(msa_z.dtype).squeeze()
+
+        # Insert BOS/EOS tokens for MSA stream
+        msa_z[:, 0]    = self.msa_bos_token.to(msa_z.dtype).expand(B, -1)
+        for i, L in enumerate(lengths.tolist()):
+            eos = L + 1
+            if eos < Lmax:
+                msa_z[i, eos]    = self.msa_eos_token.to(msa_z.dtype).squeeze()
 
         # Multi-modal fusion over four modalities → [B, L, 768]
-        fused_z = self.seq_encoder(seq_emb, prot_emb, ankh_emb, msa_z, pad_mask=pad_mask)
+        fused_z = self.seq_encoder(esmc_emb, prot_emb, ankh_emb, msa_z, pad_mask=pad_mask)
 
         # Self-attention transformer over fused tokens
         fused_z = self.self_attn(fused_z, pad_mask=pad_mask)
@@ -607,6 +624,89 @@ class ProteinLitModule(LightningModule):
         msa_emb = torch.stack(padded_reps, dim=0)  # [B, N_seq_max, L_max, d_msa]
 
         return msa_emb, time.perf_counter() - start
+
+    # ------------------------------------------------------------------
+    #  Embedding helpers (inference mode) with BOS/EOS injection
+    # ------------------------------------------------------------------
+    @torch.inference_mode()
+    def _compute_esmc_embeddings(
+        self,
+        sequences: List[str],
+        lengths: torch.Tensor,
+        Lmax: int,
+    ) -> torch.Tensor:
+        esmc_list: List[torch.Tensor] = []
+        for s in sequences:
+            prot = ESMProtein(sequence=s)
+            h = self.esmc_model.encode(prot)  # [1, L+2, 1152]
+            out = self.esmc_model.logits(h, LogitsConfig(sequence=True, return_embeddings=True)).embeddings  # [1, L+2, 1152]
+            esmc_list.append(out.squeeze(0))  # [L+2, 1152]
+        B = len(sequences)
+        D = esmc_list[0].shape[-1]
+        esmc_emb = esmc_list[0].new_zeros(B, Lmax, D)
+        for i, (e, L) in enumerate(zip(esmc_list, lengths.tolist())):
+            copy_len = min(L + 2, e.shape[0], Lmax)
+            esmc_emb[i, :copy_len] = e[:copy_len]
+            # Replace BOS/EOS with learnable tokens
+            esmc_emb[i, 0] = self.esm_bos_token.to(esmc_emb.dtype).squeeze(0)
+            eos = L + 1
+            if eos < Lmax:
+                esmc_emb[i, eos] = self.esm_eos_token.to(esmc_emb.dtype).squeeze(0)
+        return esmc_emb
+
+    @torch.inference_mode()
+    def _compute_prott5_embeddings(
+        self,
+        input_ids: torch.Tensor,        # [B, T]
+        attention_mask: torch.Tensor,   # [B, T]
+        lengths: torch.Tensor,
+        Lmax: int,
+    ) -> torch.Tensor:
+        proth = self.prot_t5(input_ids=input_ids.to(self.prot_t5.device),
+                              attention_mask=attention_mask.to(self.prot_t5.device)).last_hidden_state  # [B, T, 1024]
+        B, _, D = proth.shape
+        prot_emb = proth.new_zeros(B, Lmax, D)
+        for i, L in enumerate(lengths.tolist()):
+            # Fill residues into positions 1..L
+            prot_emb[i, 1:L+1] = proth[i, :L, :]
+            # Inject BOS/EOS learnable tokens
+            prot_emb[i, 0] = self.prot_bos_token.to(prot_emb.dtype).squeeze(0)
+            eos = L + 1
+            if eos < Lmax:
+                prot_emb[i, eos] = self.prot_eos_token.to(prot_emb.dtype).squeeze(0)
+        return prot_emb
+
+    @torch.inference_mode()
+    def _compute_ankh_embeddings(
+        self,
+        input_ids: torch.Tensor,        # [B, T]
+        attention_mask: torch.Tensor,   # [B, T]
+        lengths: torch.Tensor,
+        Lmax: int,
+    ) -> torch.Tensor:
+        ankhh = self.ankh_enc(input_ids=input_ids.to(self.ankh_enc.device),
+                              attention_mask=attention_mask.to(self.ankh_enc.device)).last_hidden_state  # [B, T, 1024]
+        B, _, D = ankhh.shape
+        ankh_emb = ankhh.new_zeros(B, Lmax, D)
+        for i, L in enumerate(lengths.tolist()):
+            # Model outputs: first token is prefix, last is EOS; map residues into 1..L
+            ankh_emb[i, 1:L+1] = ankhh[i, 1:L+1, :]
+            # Inject BOS/EOS learnable tokens
+            ankh_emb[i, 0] = self.ankh_bos_token.to(ankh_emb.dtype).squeeze(0)
+            eos = L + 1
+            if eos < Lmax:
+                ankh_emb[i, eos] = self.ankh_eos_token.to(ankh_emb.dtype).squeeze(0)
+        return ankh_emb
+
+    # -------------------------------------------------------------
+    #  LoRA hook (placeholder)
+    # -------------------------------------------------------------
+    def _attach_lora_placeholder(self, model: nn.Module, tag: str) -> None:
+        """
+        Placeholder to attach LoRA adapters to `model`.
+        Wire this up later with PEFT or custom LoRA.
+        """
+        print(f"[LoRA] Placeholder active for {tag} (no adapters attached).")
 
 
 
