@@ -9,7 +9,6 @@ import torch.nn.functional as F
 import pickle as pkl
 from .go_utils import load_go_dict
 import random  # For MSA subsampling
-from transformers import AutoTokenizer, T5Tokenizer
 
 
 class ProteinDataset(Dataset):
@@ -17,8 +16,6 @@ class ProteinDataset(Dataset):
     
     # class-level cache for MSA batch converter only
     _msa_batch_conv = None
-    _prot_tok = None
-    _ankh_tok = None
     
     # class-level cache so every worker only builds it once
     _go_dicts = {}
@@ -57,20 +54,6 @@ class ProteinDataset(Dataset):
         alphabet = Alphabet.from_architecture("msa_transformer")
         cls._msa_batch_conv = alphabet.get_batch_converter()
         return cls._msa_batch_conv
-
-    @classmethod
-    def _get_prot_tokenizer(cls):
-        """Cached ProtT5 tokenizer."""
-        if cls._prot_tok is None:
-            cls._prot_tok = AutoTokenizer.from_pretrained("Rostlab/prot_t5_xl_uniref50", do_lower_case=False, use_fast=False)
-        return cls._prot_tok
-
-    @classmethod
-    def _get_ankh_tokenizer(cls):
-        """Cached Ankh3-Large tokenizer."""
-        if cls._ankh_tok is None:
-            cls._ankh_tok = T5Tokenizer.from_pretrained("ElnaggarLab/ankh3-large")
-        return cls._ankh_tok
 
     def _parse_a3m(self, path: Path) -> List[str]:
         """Parse A3M file - first sequence is query, max 256 total sequences."""
@@ -130,21 +113,32 @@ class ProteinDataset(Dataset):
         with open(protein_dir / "sequence.txt", "r") as f:
             sequence = f.read().strip()
             
-        # --- Tokenize for ProtT5 / Ankh (keep specials; model will strip/replace) ---
-        prot_tok = self._get_prot_tokenizer()
-        ankh_tok = self._get_ankh_tokenizer()
+        # Load pre-computed protein embeddings (required file)
+        prot_file = protein_dir / "prot_emb.pt"
+        prot_data = torch.load(prot_file)
+        # Extract embeddings from data structures
+        # Protein: Direct tensor (1, L+2, d_prot) -> squeeze to (L+2, d_prot)
+        assert prot_data.dim() == 3, "Protein data should be a 3D tensor"
+        prot_emb = prot_data.squeeze(0)
+        
+        # Load pre-computed Ankh3-Large embeddings (required file)
+        ankh_file = protein_dir / "ankh_emb.pt"
+        ankh_data = torch.load(ankh_file)
+        # Extract embeddings from data structures
+        # Ankh3-Large: Direct tensor (1, L+2, d_ankh) -> squeeze to (L+2, d_ankh)
+        assert ankh_data.dim() == 3, "Ankh3-Large data should be a 3D tensor"
+        ankh_emb = ankh_data.squeeze(0)
+        
+        # Ensure both embeddings have the same sequence length
+        assert prot_emb.size(0) == ankh_emb.size(0), f"Embeddings have different lengths: Protein={prot_emb.size(0)}, Ankh={ankh_emb.size(0)}"
 
-        # ProtT5 expects space-separated residues
-        spaced = " ".join(sequence)
-        prot_enc = prot_tok(spaced, add_special_tokens=True, return_tensors="pt")
-        prot_input_ids = prot_enc["input_ids"].squeeze(0)          # [T_p]
-        prot_attention_mask = prot_enc["attention_mask"].squeeze(0)# [T_p]
-
-        # Ankh uses a prefix token; keep specials
-        PREFIX = "[S2S]"
-        ankh_enc = ankh_tok(PREFIX + sequence, add_special_tokens=True, return_tensors="pt")
-        ankh_input_ids = ankh_enc["input_ids"].squeeze(0)          # [T_a]
-        ankh_attention_mask = ankh_enc["attention_mask"].squeeze(0)# [T_a]
+        # Zero out 0th and L+1th indices for protein embeddings (no BOS/EOS tokens)
+        prot_emb[0] = 0.0  # Zero out BOS position
+        prot_emb[-1] = 0.0  # Zero out EOS position
+        
+        # Zero out 0th and L+1th indices for Ankh embeddings (no BOS/EOS tokens)
+        ankh_emb[0] = 0.0  # Zero out BOS position
+        ankh_emb[-1] = 0.0  # Zero out EOS position
         
         # Prepare MSA tokens (CPU-only, no embedding computation)
         # Parse A3M file + convert to integer tokens (CPU-only)
@@ -183,11 +177,8 @@ class ProteinDataset(Dataset):
         sample = {
             "protein_id": protein_id,
             "sequence": sequence,
-            # Tokenized inputs for on-the-fly embeddings
-            "prot_input_ids": prot_input_ids,                   # [T_p]
-            "prot_attention_mask": prot_attention_mask,         # [T_p]
-            "ankh_input_ids": ankh_input_ids,                   # [T_a]
-            "ankh_attention_mask": ankh_attention_mask,         # [T_a]
+            "prot_emb": prot_emb,      # Shape: (L+2, d_prot)
+            "ankh_emb": ankh_emb,      # Shape: (L+2, d_ankh)
             "msa_tok": msa_tok,
             "length": protein_length,
             "labels": labels,
@@ -297,6 +288,8 @@ class ProteinDataModule(LightningDataModule):
                 "L.csv",
                 "sequence.txt", 
                 "final_filtered_256_stripped.a3m",
+                "prot_emb.pt",
+                "ankh_emb.pt",
                 f"{self.hparams.task_type}_go.txt"
             ]
             
@@ -489,52 +482,55 @@ class ProteinDataModule(LightningDataModule):
 def protein_collate(batch):
     """Collate function for protein data.
     Pads:
-    1) Prot/Ankh token ids & masks   → [B, L_max_seq]
-    2) Integer MSA tokens            → list[Tensor], plus seq_pad_mask [B, N_seq_max]
-    3) Shared residue pad_mask       → [B, L_max_seq]
+    1. Integer MSA tokens            → shape [B, N_seq_max, L_max_seq]
+    2. Sequence padding mask         → shape [B, N_seq_max]
     """
     protein_ids = [it["protein_id"] for it in batch]
     sequences   = [it["sequence"]    for it in batch]
     lengths     = [it["length"]      for it in batch]   # residue counts (no CLS/EOS)
 
     # ----------------------------------------------------
-    # 1) Establish shared sequence length with specials
+    # 1) Determine padding length for sequence-aligned tensors
     # ----------------------------------------------------
     max_len_seq = max(lengths) + 2   # CLS + residues + EOS
     assert max_len_seq <= 1024, "Sequence too long (>1024)"
 
-    # Pad ProtT5 / Ankh tokens to max_len_seq (pad id = 0 for T5 family)
-    prot_ids_padded, prot_mask_padded = [], []
-    ankh_ids_padded, ankh_mask_padded = [], []
+    prot_emb_padded = []
+    ankh_emb_padded = []
     for it in batch:
-        pi, pm = it["prot_input_ids"], it["prot_attention_mask"]
-        ai, am = it["ankh_input_ids"], it["ankh_attention_mask"]
-        if pi.size(0) < max_len_seq:
-            pi = F.pad(pi, (0, max_len_seq - pi.size(0)), value=0)
-            pm = F.pad(pm, (0, max_len_seq - pm.size(0)), value=0)
-        if ai.size(0) < max_len_seq:
-            ai = F.pad(ai, (0, max_len_seq - ai.size(0)), value=0)
-            am = F.pad(am, (0, max_len_seq - am.size(0)), value=0)
-  
-        prot_ids_padded.append(pi)
-        prot_mask_padded.append(pm)
-        ankh_ids_padded.append(ai)
-        ankh_mask_padded.append(am)
+        # Pad protein embeddings (same padding logic)
+        prot_emb = it["prot_emb"]  # [L+2, d_prot]
+        if prot_emb.size(0) < max_len_seq:
+            prot_emb = F.pad(prot_emb, (0, 0, 0, max_len_seq - prot_emb.size(0)), value=0)
+        prot_emb_padded.append(prot_emb)
+        
+        # Pad Ankh3-Large embeddings (same padding logic)
+        ankh_emb = it["ankh_emb"]  # [L+2, d_ankh]
+        if ankh_emb.size(0) < max_len_seq:
+            ankh_emb = F.pad(ankh_emb, (0, 0, 0, max_len_seq - ankh_emb.size(0)), value=0)
+        ankh_emb_padded.append(ankh_emb)
 
+    # ----------------------------------------------------
+    # 2) Collect integer MSA token matrices *without* padding
+    #    + build per-sample sequence padding masks
+    # ----------------------------------------------------
     msa_tok_list = [it["msa_tok"] for it in batch]   # no padding here
+
     # Determine maximum number of sequences across the batch
     max_n_seq = max(tok.shape[0] for tok in msa_tok_list)
+
     # Build boolean mask where True means a padding (absent) sequence
-    seq_pad_mask = torch.tensor(
-        [[i >= tok.shape[0] for i in range(max_n_seq)] for tok in msa_tok_list],
-        dtype=torch.bool,
-    )
+    seq_pad_mask = torch.tensor([
+        [i >= tok.shape[0] for i in range(max_n_seq)] for tok in msa_tok_list
+    ], dtype=torch.bool)
 
-    prot_input_ids = torch.stack(prot_ids_padded)         # [B, L_max_seq]
-    prot_attention_mask = torch.stack(prot_mask_padded)   # [B, L_max_seq]
-    ankh_input_ids = torch.stack(ankh_ids_padded)         # [B, L_max_seq]
-    ankh_attention_mask = torch.stack(ankh_mask_padded)   # [B, L_max_seq]
+    # ----------------------------------------------------
+    # 3) Stack aligned tensors + build masks
+    # ----------------------------------------------------
+    prot_emb = torch.stack(prot_emb_padded)       # [B, L_max_seq, d_prot]
+    ankh_emb = torch.stack(ankh_emb_padded)       # [B, L_max_seq, d_ankh]
 
+    # `msa_tok` left as list for per-sample processing later
     labels = torch.stack([it["labels"] for it in batch])
 
     pad_mask = torch.tensor(
@@ -544,18 +540,17 @@ def protein_collate(batch):
 
     lengths_tensor = torch.tensor(lengths)
 
+    # ----------------------------------------------------
+    # 4) Timing aggregation
+    # ----------------------------------------------------
+
     return {
         "protein_id": protein_ids,
         "sequence": sequences,
-        # Tokenized inputs for on-the-fly PLM embeddings
-        "prot_input_ids": prot_input_ids,
-        "prot_attention_mask": prot_attention_mask,
-        "ankh_input_ids": ankh_input_ids,
-        "ankh_attention_mask": ankh_attention_mask,
-        # MSA
-        "msa_tok": msa_tok_list,            # list[Tensor] – variable shapes
-        "seq_pad_mask": seq_pad_mask,       # [B, N_seq_max] (True → PAD)
-        # Labels / masks
+        "prot_emb": prot_emb,
+        "ankh_emb": ankh_emb,
+        "msa_tok": msa_tok_list,  # list[Tensor] – variable shapes
+        "seq_pad_mask": seq_pad_mask,  # [B, N_seq_max] (True → PAD)
         "labels": labels,
         "pad_mask": pad_mask,
         "lengths": lengths_tensor,

@@ -20,7 +20,6 @@ from data.go_utils import (
     propagate_go_preds, propagate_ec_preds,
     function_centric_aupr, cafa_fmax, smin
 )
-from transformers import AutoTokenizer, T5EncoderModel, T5Tokenizer
 from esm.models.esmc import ESMC
 from esm.sdk.api import ESMProtein, LogitsConfig
 
@@ -123,86 +122,84 @@ class AttentionFusion(nn.Module):
 ############################################################
 
 class CrossAttentionFusion(nn.Module):
-    """Cross-attention between four modalities with softmax gating (esm, prot, ankh, msa)"""
+    """Cross-attention between all three modalities with softmax gating"""
     
     def __init__(self, d_model: int, dropout: float = 0.1, n_heads: int = 8):
         super().__init__()
         self.d_model = d_model
         self.n_heads = n_heads
         
-        # Multi-head attention for each modality attending to the other three
-        self.esm_to_others  = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+        # Multi-head attention for each modality pair
+        self.esm_to_others = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
         self.prot_to_others = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
         self.ankh_to_others = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
-        self.msa_to_others  = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
         
-        # Per-token gating over 4 attended streams
+        # NEW: per-token gating over {esm, prot, ankh}
         self.gate = nn.Sequential(
-            nn.LayerNorm(d_model * 4),
-            nn.Dropout(0.1),
-            nn.Linear(d_model * 4, d_model // 2),
+            nn.LayerNorm(d_model * 3),
+            nn.Dropout(0.1),                # (optional) on inputs to the gate
+            nn.Linear(d_model * 3, d_model // 2),
             nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(d_model // 2, 4)
+            nn.Dropout(0.1),                # on hidden activations
+            nn.Linear(d_model // 2, 3)      # logits -> softmax outside
         )
         
         # Final combination layer
         self.norm = nn.LayerNorm(d_model)
     
-    def forward(self, esm, prot, ankh, msa, pad_mask=None):
-        # Build concatenated key/value banks for each query stream
-        others_esm  = torch.cat([prot, ankh, msa], dim=1)  # [B, 3L, d]
-        others_prot = torch.cat([esm, ankh, msa], dim=1)  # [B, 3L, d]
-        others_ankh = torch.cat([esm, prot, msa], dim=1)  # [B, 3L, d]
-        others_msa  = torch.cat([esm, prot, ankh], dim=1) # [B, 3L, d]
+    def forward(self, esm, prot, ankh, pad_mask=None):
+        # Create key-value pairs from other modalities
+        others_esm = torch.cat([prot, ankh], dim=1)  # [B, 2L, d]
+        others_prot = torch.cat([esm, ankh], dim=1)  # [B, 2L, d]
+        others_ankh = torch.cat([esm, prot], dim=1)  # [B, 2L, d]
         
+        # Create proper padding masks for concatenated sequences
         if pad_mask is not None:
-            triple = [pad_mask, pad_mask, pad_mask]
-            others_esm_mask  = torch.cat(triple, dim=1)
-            others_prot_mask = torch.cat(triple, dim=1)
-            others_ankh_mask = torch.cat(triple, dim=1)
-            others_msa_mask  = torch.cat(triple, dim=1)
+            # For others_esm (prot + ankh): duplicate pad_mask twice
+            others_esm_mask = torch.cat([pad_mask, pad_mask], dim=1)  # [B, 2L]
+            # For others_prot (esm + ankh): duplicate pad_mask twice  
+            others_prot_mask = torch.cat([pad_mask, pad_mask], dim=1)  # [B, 2L]
+            # For others_ankh (esm + prot): duplicate pad_mask twice
+            others_ankh_mask = torch.cat([pad_mask, pad_mask], dim=1)  # [B, 2L]
+        else:
+            others_esm_mask = others_prot_mask = others_ankh_mask = None
+        
+        # Apply padding mask to query tensors before cross-attention
+        if pad_mask is not None:
             # Zero out padded positions in query tensors
-            esm  = esm.masked_fill(pad_mask.unsqueeze(-1), 0.0)
+            esm = esm.masked_fill(pad_mask.unsqueeze(-1), 0.0)
             prot = prot.masked_fill(pad_mask.unsqueeze(-1), 0.0)
             ankh = ankh.masked_fill(pad_mask.unsqueeze(-1), 0.0)
-            msa  = msa.masked_fill(pad_mask.unsqueeze(-1), 0.0)
-        else:
-            others_esm_mask = others_prot_mask = others_ankh_mask = others_msa_mask = None
         
-        # Cross-attention per stream
-        esm_attended,  _ = self.esm_to_others(esm,  others_esm,  others_esm,  key_padding_mask=others_esm_mask)
+        # Cross-attention with correct padding masks
+        esm_attended, _ = self.esm_to_others(esm, others_esm, others_esm, key_padding_mask=others_esm_mask)
         prot_attended, _ = self.prot_to_others(prot, others_prot, others_prot, key_padding_mask=others_prot_mask)
         ankh_attended, _ = self.ankh_to_others(ankh, others_ankh, others_ankh, key_padding_mask=others_ankh_mask)
-        msa_attended,  _ = self.msa_to_others(msa,  others_msa,  others_msa,  key_padding_mask=others_msa_mask)
         
-        # Softmax gating across four streams
-        gate_in = torch.cat([esm_attended, prot_attended, ankh_attended, msa_attended], dim=-1)   # [B, L, 4*d]
-        gate = self.gate(gate_in).softmax(dim=-1)                                                 # [B, L, 4]
+        # NEW: convex (softmax) gating per token over the three streams
+        gate_in = torch.cat([esm_attended, prot_attended, ankh_attended], dim=-1)   # [B, L, 3*d]
+        gate = self.gate(gate_in).softmax(dim=-1)                    # [B, L, 3]
 
         mixed = (
             gate[..., 0:1] * esm_attended +
             gate[..., 1:2] * prot_attended +
-            gate[..., 2:3] * ankh_attended +
-            gate[..., 3:4] * msa_attended
+            gate[..., 2:3] * ankh_attended
         )  # [B, L, d_model]
         
-        return self.norm(mixed)
+        return self.norm(mixed)  
 
 class CrossAttentionMultiModalFusion(nn.Module):
     """
-    Cross-attention fusion for four protein modalities:
+    Cross-attention fusion for three protein modalities:
     - ESM-C sequence embeddings
     - Protein embeddings  
     - Ankh embeddings
-    - MSA encoder outputs (LN + proj to d_out)
     """
     
     def __init__(self,
                  d_esm: int = 1152,
-                 d_prot: int = 1024,
+                 d_prot: int = 128,
                  d_ankh: int = 1024,
-                 d_msa: int = 768,
                  d_out: int = 768,
                  dropout: float = 0.1,
                  n_heads: int = 8):
@@ -213,28 +210,25 @@ class CrossAttentionMultiModalFusion(nn.Module):
         self.ln_esm = nn.LayerNorm(d_esm)
         self.ln_prot = nn.LayerNorm(d_prot)
         self.ln_ankh = nn.LayerNorm(d_ankh)
-        self.ln_msa = nn.LayerNorm(d_msa)
         
         # Projection layers
         self.proj_esm = nn.Linear(d_esm, d_out)
         self.proj_prot = nn.Linear(d_prot, d_out)
         self.proj_ankh = nn.Linear(d_ankh, d_out)
-        self.proj_msa = nn.Linear(d_msa, d_out)
         
-        # Cross-attention fusion (now 4-way)
+        # Cross-attention fusion
         self.fusion = CrossAttentionFusion(d_out, dropout, n_heads)
         
         self.dropout = nn.Dropout(dropout)
     
-    def forward(self, esm_emb, prot_emb, ankh_emb, msa_emb, pad_mask=None, lengths=None):
+    def forward(self, esm_emb, prot_emb, ankh_emb, pad_mask=None, lengths=None):
         # Normalize and project
-        esm_proj  = self.proj_esm(self.ln_esm(esm_emb))       # [B, L, d_out]
-        prot_proj = self.proj_prot(self.ln_prot(prot_emb))    # [B, L, d_out]
-        ankh_proj = self.proj_ankh(self.ln_ankh(ankh_emb))    # [B, L, d_out]
-        msa_proj  = self.proj_msa(self.ln_msa(msa_emb))       # [B, L, d_out]
+        esm_proj = self.proj_esm(self.ln_esm(esm_emb))      # [B, L, d_out]
+        prot_proj = self.proj_prot(self.ln_prot(prot_emb))  # [B, L, d_out]
+        ankh_proj = self.proj_ankh(self.ln_ankh(ankh_emb))  # [B, L, d_out]
         
         # Apply cross-attention fusion
-        fused = self.fusion(esm_proj, prot_proj, ankh_proj, msa_proj, pad_mask)
+        fused = self.fusion(esm_proj, prot_proj, ankh_proj, pad_mask)
         
         return self.dropout(fused).masked_fill(pad_mask.unsqueeze(-1), 0.0)
 
@@ -242,7 +236,7 @@ class CrossAttentionMultiModalFusion(nn.Module):
 class CrossAttentionSequenceEncoder(nn.Module):
     def __init__(self,
                  d_model: int = 1152,
-                 d_prot: int = 1024,
+                 d_prot: int = 128,
                  d_ankh: int = 1024,
                  d_out: int = 768,
                  dropout: float = 0.1,
@@ -253,103 +247,18 @@ class CrossAttentionSequenceEncoder(nn.Module):
             d_esm=d_model,
             d_prot=d_prot, 
             d_ankh=d_ankh,
-            d_msa=768,
             d_out=d_out,
             dropout=dropout,
             n_heads=n_heads
         )
     
-    def forward(self, x, prot_emb, ankh_emb, msa_emb, pad_mask=None, lengths=None):
-        return self.fusion(x, prot_emb, ankh_emb, msa_emb, pad_mask)
+    def forward(self, x, prot_emb, ankh_emb, pad_mask=None, lengths=None):
+        return self.fusion(x, prot_emb, ankh_emb, pad_mask)
 
 
 
 
-
-class MSAEncoder(nn.Module):
-    r"""
-    Multiple‑Sequence‑Alignment encoder with optional attention‑weighted pooling.
-
-    Inputs
-    ------
-    msa       : Tensor[B, N_seq, L_pad, d_msa]
-    pad_mask  : Tensor[B, L_pad]     – True where residue is padding
-    seq_pad   : Tensor[B, N_seq]     – True where whole row is padding
-
-    Output
-    ------
-    x         : Tensor[B, L_pad, d_msa]
-    """
-
-    def __init__(
-        self,
-        d_msa: int = 768,
-        p_chan: float = 0.10,
-        p_feat: float = 0.10,
-    ):
-        super().__init__()
-        # 1. Row dropout on MSA embeddings
-        self.dropout = nn.Dropout(p_chan)
-
-        # 2. Conservation head for attention scores
-        self.conservation_head = nn.Linear(d_msa, 1, bias=False)
-
-        # 3. Learned temperature τ (only used when attention is enabled)
-        self.log_tau = nn.Parameter(torch.zeros(()))  # τ = e^{log τ}, init‑1.0
-
-        # 4. Post‑pooling refinement
-        self.post_ffn = ResidualFeedForward(d_msa, expansion=4, dropout=p_feat)
-        self.norm = nn.LayerNorm(d_msa)
-
-    def forward(
-        self,
-        msa: torch.Tensor,      # [B, N_seq, L_pad, d_msa]
-        pad_mask: torch.Tensor, # [B, L_pad]
-        seq_pad: torch.Tensor,  # [B, N_seq]
-    ) -> torch.Tensor:
-
-        B, N_seq, L_pad, D = msa.shape
-        msa = self.dropout(msa)
-
-        # Build boolean mask [B, N_seq, L_pad]
-        pad_bool = seq_pad.unsqueeze(-1) | pad_mask.unsqueeze(1)
-
-        # Count valid rows per example   [B, 1]
-        valid_seq = (~seq_pad).sum(dim=1, keepdim=True).clamp(min=1).float()
-
-        # --------------------------------------------------------------------
-        # POOLING
-        # --------------------------------------------------------------------
-        # 1) Conservation logits
-        scores = self.conservation_head(msa).squeeze(-1)          # [B,N,L]
-
-        # 2) Centre per column
-        scores = scores.masked_fill(pad_bool, 0.0)
-
-        # 3) Scale by (√N · τ)
-        scale = (valid_seq.sqrt() * self.log_tau.exp()).unsqueeze(-1)
-        scores = scores / scale
-
-        # 4) Mask padding & soft‑max over rows
-        scores = scores.masked_fill(pad_bool, -1e4)
-        weights = torch.softmax(scores, dim=1).masked_fill(pad_bool, 0.0)
-
-        # 5) Weighted sum
-        pooled = (msa * weights.unsqueeze(-1)).sum(dim=1)         # [B,L,D]
-        # --------------------------------------------------------------------
-        # Refinement & output
-        # --------------------------------------------------------------------
-        x = self.norm(pooled)
-        x = self.post_ffn(x)
-        x = x.masked_fill(pad_mask.unsqueeze(-1), 0.0)
-        return x
-
-
-############################################################
-#  Cross-modal attention fusion
-############################################################
-
-class SelfAttentionEncoder(nn.Module):
+class SelfAttentionTransformer(nn.Module):
     def __init__(self, d_model: int = 768, n_heads: int = 8, n_layers: int = 2, dropout: float = 0.1):
         super().__init__()
         self.layers = nn.ModuleList()
@@ -357,16 +266,15 @@ class SelfAttentionEncoder(nn.Module):
             layer = nn.ModuleDict({
                 "norm": nn.LayerNorm(d_model),
                 "attn": nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True),
-                "drop": nn.Dropout(dropout),
                 "ffn": ResidualFeedForward(d_model, dropout=dropout),
             })
             self.layers.append(layer)
 
     def forward(self, x: torch.Tensor, pad_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         for layer in self.layers:
-            x = layer["norm"](x)
-            attn_out, _ = layer["attn"](x, x, x, key_padding_mask=pad_mask)
-            x = x + layer["drop"](attn_out)
+            x_norm = layer["norm"](x)
+            y, _ = layer["attn"](x_norm, x_norm, x_norm, key_padding_mask=pad_mask)
+            x = x + y
             x = layer["ffn"](x)
         return x
 
@@ -381,47 +289,21 @@ class ProteinLitModule(LightningModule):
         self,
         task_type: str,                       # Task type: "mf", "bp", or "cc" - required
         d_model: int = 1152,                  # Base model dimension
-        d_prot: int = 1024,                   # ProtT5 embedding dimension
+        d_prot: int = 128,                    # Protein embedding dimension
         d_ankh: int = 1024,                   # Ankh3-Large embedding dimension
-        d_msa: int = 768,                     # MSA embedding dimension
-        n_cross_layers: int = 2,              # Cross-attention layers
+        d_msa: int = 768,                     # (unused after MSA removal)
+        n_cross_layers: int = 2,              # Transformer self-attention layers
         n_heads: int = 8,                     # Attention heads
         dropout: float = 0.1,                 # Dropout rate
         optimizer: Optional[Any] = None,      # Hydra optimizer config
         scheduler: Optional[Any] = None,      # Hydra scheduler config  
         warmup_ratio: float = 0.05,           # Warmup ratio for cosine schedule (5% of total training steps)
-        # --- LoRA toggles (placeholders; wiring to be added later) ---
-        lora_esmc: bool = False,
-        lora_prott5: bool = False,
-        lora_ankh: bool = False,
     ) -> None:
         super().__init__()
         self.save_hyperparameters(logger=True)
 
         # Store task type for easy access
         self.task_type = task_type
-        
-        # Load models (frozen by default) ---------------------------------
-        import esm
-        self.msa_model, _ = esm.pretrained.esm_msa1b_t12_100M_UR50S()
-        self.msa_model.eval().requires_grad_(False)
-
-        # ESM-C 600M (SDK)
-        self.esmc_model = ESMC.from_pretrained("esmc_600m").eval().requires_grad_(False)
-
-        # ProtT5 (HF)
-        self.prot_t5 = T5EncoderModel.from_pretrained("Rostlab/prot_t5_xl_uniref50").eval().requires_grad_(False)
-
-        # Ankh3-Large (HF)
-        self.ankh_enc = T5EncoderModel.from_pretrained("ElnaggarLab/ankh3-large").eval().requires_grad_(False)
-
-        # --- LoRA placeholders: will attach adapters here later ---
-        if self.hparams.lora_esmc:
-            self._attach_lora_placeholder(self.esmc_model, "esmc")
-        if self.hparams.lora_prott5:
-            self._attach_lora_placeholder(self.prot_t5, "prot_t5")
-        if self.hparams.lora_ankh:
-            self._attach_lora_placeholder(self.ankh_enc, "ankh")
         
         # Individual learnable BOS/EOS tokens for each modality
         # ESM-C tokens (d_model dimension)
@@ -442,27 +324,18 @@ class ProteinLitModule(LightningModule):
         nn.init.normal_(self.ankh_bos_token, std=0.02)
         nn.init.normal_(self.ankh_eos_token, std=0.02)
         
-        # MSA tokens (d_msa dimension) - for insertion after MSA encoder
-        self.msa_bos_token = nn.Parameter(torch.zeros(1, d_msa))
-        self.msa_eos_token = nn.Parameter(torch.zeros(1, d_msa))
-        nn.init.normal_(self.msa_bos_token, std=0.02)
-        nn.init.normal_(self.msa_eos_token, std=0.02)
-        
         # Encoders
         self.seq_encoder = CrossAttentionSequenceEncoder(
             d_model=d_model,
-            d_prot=d_prot,  # ProtT5 embedding dimension
+            d_prot=d_prot,  # Protein embedding dimension
             d_ankh=d_ankh,  # Ankh3-Large embedding dimension
             d_out=768,
             dropout=dropout,
             n_heads=n_heads
         )
-        self.msa_encoder = MSAEncoder(
-            d_msa=d_msa,
-        )
-
-        # Self-attention transformer over fused representation (replaces bidirectional cross-attention)
-        self.self_attn = SelfAttentionEncoder(
+        
+        # Replace bidirectional cross-attention (seq↔MSA) with self-attention on fused seq
+        self.seq_transformer = SelfAttentionTransformer(
             d_model=768,
             n_heads=n_heads,
             n_layers=n_cross_layers,
@@ -486,233 +359,61 @@ class ProteinLitModule(LightningModule):
         self._test_logits = []
         self._test_labels = []
 
+        # Local ESM-C model (frozen)
+        self.esmc_model = ESMC.from_pretrained("esmc_600m").eval().requires_grad_(False)
+
     def setup(self, stage: str) -> None:
-        """Setup hook handles MSA model device movement and compilation."""
-        if stage == "fit":
-            # MSA model compilation disabled by default for easier debugging
-            print("🐛 MSA model compilation disabled for easier debugging and development")
-            print(f"✅ ESM-MSA model loaded on {self.device}")
+        return
 
     # ---------------------------------------------------------------------
     #  Forward pass - optimized MSA computation
     # ---------------------------------------------------------------------
     def forward(self, batch: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Forward with on-the-fly PLM embeddings (ESM-C, ProtT5, Ankh).
-        Datamodule passes tokens; we keep BOS/EOS through the PLMs and
-        only replace them with learnable tokens afterward."""
-        sequences = batch["sequence"]              # List[str], length B
-        prot_ids = batch["prot_input_ids"]         # [B, T_max]
-        prot_mask = batch["prot_attention_mask"]   # [B, T_max]
-        ankh_ids = batch["ankh_input_ids"]         # [B, T_max]
-        ankh_mask = batch["ankh_attention_mask"]   # [B, T_max]
-        msa_tok_list = batch["msa_tok"]            # list[Tensor] – variable [N_i, L_i]
+        """Forward pass with on-the-fly ESM-C embeddings and learnable BOS/EOS tokens."""
+        # Extract inputs
+        sequences: List[str] = batch["sequence"]
+        prot_emb = batch["prot_emb"]     # [B, L, d_prot]
+        ankh_emb = batch["ankh_emb"]     # [B, L, d_ankh]
+        pad_mask = batch["pad_mask"]     # [B, L]
+        lengths = batch["lengths"]       # [B]
 
-        pad_mask = batch["pad_mask"]               # [B, L_max] (True where padded)
-        seq_pad    = batch["seq_pad_mask"]  # [B, N_max]
+        # Compute ESM-C embeddings on the fly (includes BOS/EOS replacement inside)
+        Lmax = pad_mask.shape[1]
+        seq_emb = self._compute_esmc_embeddings(sequences, lengths, Lmax)  # [B, L, d_model]
+        # Ensure device/dtype alignment with other modalities
+        seq_emb = seq_emb.clone()
 
-        # Shapes / sizes
-        B = len(sequences)
-        lengths = batch["lengths"]                 # [B] (residue counts, no specials)
-        Lmax = pad_mask.shape[1]                   # = max(lengths) + 2
-
-        # -------------------------------------------------------------
-        # 1) Compute MSA embeddings (unchanged)
-        # -------------------------------------------------------------
-        target_len = Lmax
-        msa_emb, msa_compute_time = self._compute_msa_embeddings(msa_tok_list, target_len)  # [B, N_seq_max, target_len, d_msa]
-        # Expose timing so callbacks (e.g., BatchTimer) can log it **after** the forward pass.
-        # Storing it on `self` ensures it is available in hooks such as `on_before_backward`.
-        self._last_msa_compute_time = msa_compute_time
-        # Keep original behaviour for potential external use
-        batch["msa_compute_time"] = msa_compute_time
-        # For conservation head: treat BOS as masked in MSA encoder
-        msa_emb = msa_emb.clone()
-        msa_emb[:, :, 0] = 0.0
-
-        # Create mask for MSA encoder: mask BOS position (0) and ensure EOS positions are masked
-        msa_encoder_mask = pad_mask.clone()
-        msa_encoder_mask[:, 0] = True  # Mask out BOS position for MSA encoder (padding=True)
-        
-        # Also ensure EOS positions (L+1) are masked as True
+        # Insert individual learnable BOS/EOS tokens for protein and ankh modalities
+        B = prot_emb.size(0)
+        prot_emb[:, 0] = self.prot_bos_token.to(prot_emb.dtype).expand(B, -1)
+        ankh_emb[:, 0] = self.ankh_bos_token.to(ankh_emb.dtype).expand(B, -1)
         for i, length in enumerate(lengths):
-            eos_pos = length + 1
-            if eos_pos < msa_encoder_mask.size(1):  # Safety check
-                msa_encoder_mask[i, eos_pos] = True  # Mask out EOS position for MSA encoder
+            eos_pos = int(length.item()) + 1
+            if eos_pos < prot_emb.size(1):
+                prot_emb[i, eos_pos] = self.prot_eos_token.to(prot_emb.dtype).squeeze()
+                ankh_emb[i, eos_pos] = self.ankh_eos_token.to(ankh_emb.dtype).squeeze()
 
-        # -------------------------------------------------------------
-        # 2) PLM embeddings on-the-fly via helpers (with BOS/EOS injection)
-        # -------------------------------------------------------------
-        esmc_emb = self._compute_esmc_embeddings(sequences, lengths, Lmax)
-        prot_emb = self._compute_prott5_embeddings(prot_ids, prot_mask, lengths, Lmax)
-        ankh_emb = self._compute_ankh_embeddings(ankh_ids, ankh_mask, lengths, Lmax)
+        # Create pooling mask: mask BOS and EOS positions
+        pool_mask = pad_mask.clone()
+        pool_mask[:, 0] = True
+        for i, length in enumerate(lengths):
+            eos_pos = int(length.item()) + 1
+            if eos_pos < pool_mask.size(1):
+                pool_mask[i, eos_pos] = True
 
-        # -------------------------------------------------------------
-        # 3) MSA encode (unchanged)
-        # -------------------------------------------------------------
-        msa_z = self.msa_encoder(msa_emb, pad_mask=msa_encoder_mask, seq_pad=seq_pad)  # [B, L, d_msa]
+        # Encode and transform the fused sequence stream
+        seq_z = self.seq_encoder(seq_emb, prot_emb, ankh_emb, pad_mask=pad_mask)
+        seq_z = self.seq_transformer(seq_z, pad_mask=pad_mask)
 
-        # Insert BOS/EOS tokens for MSA stream
-        msa_z[:, 0]    = self.msa_bos_token.to(msa_z.dtype).expand(B, -1)
-        for i, L in enumerate(lengths.tolist()):
-            eos = L + 1
-            if eos < Lmax:
-                msa_z[i, eos]    = self.msa_eos_token.to(msa_z.dtype).squeeze()
-
-        # Multi-modal fusion over four modalities → [B, L, 768]
-        fused_z = self.seq_encoder(esmc_emb, prot_emb, ankh_emb, msa_z, pad_mask=pad_mask)
-
-        # Self-attention transformer over fused tokens
-        fused_z = self.self_attn(fused_z, pad_mask=pad_mask)
-
-        # Masked mean pooling (exclude BOS/EOS via msa_encoder_mask)
-        pooled = masked_mean_pooling(fused_z, msa_encoder_mask)  # [B, 768]
-
-        logits = self.head(pooled)                  # [B, C]
-        
+        # Masked mean pooling (excludes BOS/EOS)
+        seq_pool = masked_mean_pooling(seq_z, pool_mask)
+        logits = self.head(seq_pool)
         return logits, batch["labels"]
-
-    # ------------------------------------------------------------------
-    #  Simple MSA embedding computation without streams
-    # ------------------------------------------------------------------
-    @torch.inference_mode()
-    def _compute_msa_embeddings(
-        self,
-        msa_tok_list: List[torch.Tensor],
-        target_len: int,
-    ) -> Tuple[torch.Tensor, float]:
-        """Compute MSA embeddings sequentially (one sample at a time).
-
-        This avoids the huge memory spike that occurs when feeding the whole
-        batch to ESM-MSA at once.  After all representations are computed we
-        zero-pad them to a common shape so downstream code can keep treating
-        the result as a single 4-D tensor: [B, N_seq_max, L_max, d_msa].
-        """
-        import time
-        start = time.perf_counter()
-
-        reps: List[torch.Tensor] = []
-        max_n_seq = 0
-        max_L     = 0
-
-        for tok in msa_tok_list:
-            # Move single sample to device and add batch dim expected by ESM-MSA
-            tok = tok.unsqueeze(0)  # [1, N_seq, L]
-
-            rep = self.msa_model(tok, repr_layers=[12])["representations"][12]
-
-            rep = rep.squeeze(0)      # [N_seq, L, d_msa]
-            reps.append(rep)
-
-            # Track largest shapes for padding later
-            max_n_seq = max(max_n_seq, rep.shape[0])
-
-        # Ensure horizontal padding matches desired target_len
-        max_L = target_len
-
-        # ---------------------------------------------------------
-        # Pad each representation to [max_n_seq, max_L, d_msa]
-        # ---------------------------------------------------------
-        padded_reps: List[torch.Tensor] = []
-        for rep in reps:
-            n_seq, L, D = rep.shape
-            if n_seq < max_n_seq or L < max_L:
-                padded = rep.new_zeros(max_n_seq, max_L, D) #TODO: CONSIDER PADDING TOKEN
-                padded[:n_seq, :L] = rep
-                rep = padded
-            padded_reps.append(rep)
-
-        msa_emb = torch.stack(padded_reps, dim=0)  # [B, N_seq_max, L_max, d_msa]
-
-        return msa_emb, time.perf_counter() - start
-
-    # ------------------------------------------------------------------
-    #  Embedding helpers (inference mode) with BOS/EOS injection
-    # ------------------------------------------------------------------
-    @torch.inference_mode()
-    def _compute_esmc_embeddings(
-        self,
-        sequences: List[str],
-        lengths: torch.Tensor,
-        Lmax: int,
-    ) -> torch.Tensor:
-        esmc_list: List[torch.Tensor] = []
-        for s in sequences:
-            prot = ESMProtein(sequence=s)
-            h = self.esmc_model.encode(prot)  # [1, L+2, 1152]
-            out = self.esmc_model.logits(h, LogitsConfig(sequence=True, return_embeddings=True)).embeddings  # [1, L+2, 1152]
-            esmc_list.append(out.squeeze(0))  # [L+2, 1152]
-        B = len(sequences)
-        D = esmc_list[0].shape[-1]
-        esmc_emb = esmc_list[0].new_zeros(B, Lmax, D)
-        for i, (e, L) in enumerate(zip(esmc_list, lengths.tolist())):
-            copy_len = min(L + 2, e.shape[0], Lmax)
-            esmc_emb[i, :copy_len] = e[:copy_len]
-            # Replace BOS/EOS with learnable tokens
-            esmc_emb[i, 0] = self.esm_bos_token.to(esmc_emb.dtype).squeeze(0)
-            eos = L + 1
-            if eos < Lmax:
-                esmc_emb[i, eos] = self.esm_eos_token.to(esmc_emb.dtype).squeeze(0)
-        return esmc_emb
-
-    @torch.inference_mode()
-    def _compute_prott5_embeddings(
-        self,
-        input_ids: torch.Tensor,        # [B, T]
-        attention_mask: torch.Tensor,   # [B, T]
-        lengths: torch.Tensor,
-        Lmax: int,
-    ) -> torch.Tensor:
-        proth = self.prot_t5(input_ids=input_ids.to(self.prot_t5.device),
-                              attention_mask=attention_mask.to(self.prot_t5.device)).last_hidden_state  # [B, T, 1024]
-        B, _, D = proth.shape
-        prot_emb = proth.new_zeros(B, Lmax, D)
-        for i, L in enumerate(lengths.tolist()):
-            # Fill residues into positions 1..L
-            prot_emb[i, 1:L+1] = proth[i, :L, :]
-            # Inject BOS/EOS learnable tokens
-            prot_emb[i, 0] = self.prot_bos_token.to(prot_emb.dtype).squeeze(0)
-            eos = L + 1
-            if eos < Lmax:
-                prot_emb[i, eos] = self.prot_eos_token.to(prot_emb.dtype).squeeze(0)
-        return prot_emb
-
-    @torch.inference_mode()
-    def _compute_ankh_embeddings(
-        self,
-        input_ids: torch.Tensor,        # [B, T]
-        attention_mask: torch.Tensor,   # [B, T]
-        lengths: torch.Tensor,
-        Lmax: int,
-    ) -> torch.Tensor:
-        ankhh = self.ankh_enc(input_ids=input_ids.to(self.ankh_enc.device),
-                              attention_mask=attention_mask.to(self.ankh_enc.device)).last_hidden_state  # [B, T, 1024]
-        B, _, D = ankhh.shape
-        ankh_emb = ankhh.new_zeros(B, Lmax, D)
-        for i, L in enumerate(lengths.tolist()):
-            # Model outputs: first token is prefix, last is EOS; map residues into 1..L
-            ankh_emb[i, 1:L+1] = ankhh[i, 1:L+1, :]
-            # Inject BOS/EOS learnable tokens
-            ankh_emb[i, 0] = self.ankh_bos_token.to(ankh_emb.dtype).squeeze(0)
-            eos = L + 1
-            if eos < Lmax:
-                ankh_emb[i, eos] = self.ankh_eos_token.to(ankh_emb.dtype).squeeze(0)
-        return ankh_emb
-
-    # -------------------------------------------------------------
-    #  LoRA hook (placeholder)
-    # -------------------------------------------------------------
-    def _attach_lora_placeholder(self, model: nn.Module, tag: str) -> None:
-        """
-        Placeholder to attach LoRA adapters to `model`.
-        Wire this up later with PEFT or custom LoRA.
-        """
-        print(f"[LoRA] Placeholder active for {tag} (no adapters attached).")
-
-
 
     # ------------------------------------------------------------------
     #  Lightning hooks
     # ------------------------------------------------------------------
+    
     def training_step(self, batch: Dict[str, Any], batch_idx: int):
         logits, labels = self.forward(batch)
         loss = self.loss_fn(logits, labels)
@@ -845,3 +546,30 @@ class ProteinLitModule(LightningModule):
         }, prog_bar=True, sync_dist=True)
 
         self.test_loss.reset(); self._test_logits.clear(); self._test_labels.clear()
+
+    @torch.inference_mode()
+    def _compute_esmc_embeddings(
+        self,
+        sequences: List[str],
+        lengths: torch.Tensor,
+        Lmax: int,
+    ) -> torch.Tensor:
+        esmc_list: List[torch.Tensor] = []
+        for s in sequences:
+            prot = ESMProtein(sequence=s)
+            h = self.esmc_model.encode(prot)  # [1, L+2, 1152]
+            out = self.esmc_model.logits(h, LogitsConfig(sequence=True, return_embeddings=True)).embeddings  # [1, L+2, 1152]
+            esmc_list.append(out.squeeze(0))  # [L+2, 1152]
+
+        B = len(sequences)
+        D = esmc_list[0].shape[-1]
+        esmc_emb = esmc_list[0].new_zeros(B, Lmax, D)
+        for i, (e, L) in enumerate(zip(esmc_list, lengths.tolist())):
+            copy_len = min(L + 2, e.shape[0], Lmax)
+            esmc_emb[i, :copy_len] = e[:copy_len]
+            # Replace BOS/EOS with learnable tokens
+            esmc_emb[i, 0] = self.esm_bos_token.to(esmc_emb.dtype).squeeze(0)
+            eos = L + 1
+            if eos < Lmax:
+                esmc_emb[i, eos] = self.esm_eos_token.to(esmc_emb.dtype).squeeze(0)
+        return esmc_emb

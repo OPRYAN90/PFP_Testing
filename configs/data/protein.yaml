@@ -8,7 +8,7 @@ task_type: "mf"
 # BP (1943 classes):
 # CC (320 classes): 
 batch_size: 48         # TODO: CHANGE THIS
-msa_sample_size: 16
+msa_sample_size: 1
 
 # # --- Simple stride subsampling (every k-th element) ---
 # stride_train: 1         # Use every 1st element (no subsampling)
