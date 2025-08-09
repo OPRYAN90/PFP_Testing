@@ -359,8 +359,9 @@ class ProteinLitModule(LightningModule):
         self._test_logits = []
         self._test_labels = []
 
-        # Local ESM-C model (frozen)
-        self.esmc_model = ESMC.from_pretrained("esmc_600m").eval().requires_grad_(False)
+        # Local ESM-C model (trainable by default)
+        self.esmc_model = ESMC.from_pretrained("esmc_600m")
+        self.esmc_model.train()  # optional, Lightning will set mode each stage anyway
 
     def setup(self, stage: str) -> None:
         return
@@ -547,7 +548,6 @@ class ProteinLitModule(LightningModule):
 
         self.test_loss.reset(); self._test_logits.clear(); self._test_labels.clear()
 
-    @torch.inference_mode()
     def _compute_esmc_embeddings(
         self,
         sequences: List[str],
@@ -557,19 +557,30 @@ class ProteinLitModule(LightningModule):
         esmc_list: List[torch.Tensor] = []
         for s in sequences:
             prot = ESMProtein(sequence=s)
-            h = self.esmc_model.encode(prot)  # [1, L+2, 1152]
-            out = self.esmc_model.logits(h, LogitsConfig(sequence=True, return_embeddings=True)).embeddings  # [1, L+2, 1152]
-            esmc_list.append(out.squeeze(0))  # [L+2, 1152]
+            h = self.esmc_model.encode(prot)  # [1, L+2, 1152], grad-enabled now
+            out = self.esmc_model.logits(
+                h, LogitsConfig(sequence=True, return_embeddings=True)
+            ).embeddings.squeeze(0)  # [L+2, 1152]
+            esmc_list.append(out)
 
-        B = len(sequences)
-        D = esmc_list[0].shape[-1]
-        esmc_emb = esmc_list[0].new_zeros(B, Lmax, D)
-        for i, (e, L) in enumerate(zip(esmc_list, lengths.tolist())):
+        # Pad each sequence to Lmax along the sequence dimension, then stack
+        padded = []
+        for e, L in zip(esmc_list, lengths.tolist()):
             copy_len = min(L + 2, e.shape[0], Lmax)
-            esmc_emb[i, :copy_len] = e[:copy_len]
-            # Replace BOS/EOS with learnable tokens
-            esmc_emb[i, 0] = self.esm_bos_token.to(esmc_emb.dtype).squeeze(0)
+            # truncate if needed, then right-pad to Lmax
+            e_trim = e[:copy_len]
+            pad_amt = Lmax - e_trim.shape[0]
+            if pad_amt > 0:
+                e_trim = F.pad(e_trim, (0, 0, 0, pad_amt))  # pad seq dim
+            padded.append(e_trim)
+
+        esmc_emb = torch.stack(padded, dim=0)  # [B, Lmax, D] — keeps grad
+
+        # Replace BOS/EOS tokens (OK to do in-place on a grad tensor)
+        esmc_emb[:, 0] = self.esm_bos_token.to(esmc_emb.dtype).expand(esmc_emb.size(0), -1)
+        for i, L in enumerate(lengths.tolist()):
             eos = L + 1
             if eos < Lmax:
                 esmc_emb[i, eos] = self.esm_eos_token.to(esmc_emb.dtype).squeeze(0)
+
         return esmc_emb
