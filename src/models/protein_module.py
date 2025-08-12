@@ -1,9 +1,8 @@
-from typing import Any, Dict, Optional, Tuple, Union, List
+from typing import Any, Dict, Optional, Tuple, List
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
 
 # -----------------------------------------------------------------------------
 # Optional FlashAttention toggle – does nothing on unsupported systems
@@ -15,7 +14,6 @@ import math
 
 from lightning import LightningModule
 from torchmetrics import MeanMetric
-import numpy as np
 from data.go_utils import (
     propagate_go_preds, propagate_ec_preds,
     function_centric_aupr, cafa_fmax, smin
@@ -66,7 +64,7 @@ class MLPHead(nn.Module):
             nn.Linear(d_in, 602),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(602, d_out), #EXTREME WARNING NOTE: DIMS DEPEDNING ON TASK AND D_MSA
+            nn.Linear(602, d_out)
         ) 
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -107,84 +105,15 @@ class AttentionFusion(nn.Module):
         # (Nice default) zero-init weights so bias controls the initial mix
         nn.init.zeros_(self.gate.weight)
 
-    def forward(self, seq_feat, msa_feat):
-        h = torch.cat([seq_feat, msa_feat], dim=-1)
+    def forward(self, left_feat, right_feat):
+        h = torch.cat([left_feat, right_feat], dim=-1)
         logits = self.gate(self.dropout(self.pre(h)))   # [B, 2]
         w = torch.softmax(logits, dim=-1)               # [B, 2]
-        return w[..., 0:1] * seq_feat + w[..., 1:2] * msa_feat
-
-
+        return w[..., 0:1] * left_feat + w[..., 1:2] * right_feat
 
 ############################################################
-#  Encoders for the three modalities
+#  Encoders for modality pairs
 ############################################################
-
-class CrossAttentionFusion(nn.Module):
-    """Cross-attention between all three modalities with softmax gating"""
-    
-    def __init__(self, d_model: int, dropout: float = 0.1, n_heads: int = 8):
-        super().__init__()
-        self.d_model = d_model
-        self.n_heads = n_heads
-        
-        # Multi-head attention for each modality pair
-        self.esm_to_others = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
-        self.prot_to_others = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
-        self.ankh_to_others = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
-        
-        # NEW: per-token gating over {esm, prot, ankh}
-        self.gate = nn.Sequential(
-            nn.LayerNorm(d_model * 3),
-            nn.Dropout(0.1),                # (optional) on inputs to the gate
-            nn.Linear(d_model * 3, d_model // 2),
-            nn.GELU(),
-            nn.Dropout(0.1),                # on hidden activations
-            nn.Linear(d_model // 2, 3)      # logits -> softmax outside
-        )
-        
-        # Final combination layer
-        self.norm = nn.LayerNorm(d_model)
-    
-    def forward(self, esm, prot, ankh, pad_mask=None):
-        # Create key-value pairs from other modalities
-        others_esm = torch.cat([prot, ankh], dim=1)  # [B, 2L, d]
-        others_prot = torch.cat([esm, ankh], dim=1)  # [B, 2L, d]
-        others_ankh = torch.cat([esm, prot], dim=1)  # [B, 2L, d]
-        
-        # Create proper padding masks for concatenated sequences
-        if pad_mask is not None:
-            # For others_esm (prot + ankh): duplicate pad_mask twice
-            others_esm_mask = torch.cat([pad_mask, pad_mask], dim=1)  # [B, 2L]
-            # For others_prot (esm + ankh): duplicate pad_mask twice  
-            others_prot_mask = torch.cat([pad_mask, pad_mask], dim=1)  # [B, 2L]
-            # For others_ankh (esm + prot): duplicate pad_mask twice
-            others_ankh_mask = torch.cat([pad_mask, pad_mask], dim=1)  # [B, 2L]
-        else:
-            others_esm_mask = others_prot_mask = others_ankh_mask = None
-        
-        # Apply padding mask to query tensors before cross-attention
-        if pad_mask is not None:
-            # Zero out padded positions in query tensors
-            esm = esm.masked_fill(pad_mask.unsqueeze(-1), 0.0)
-            prot = prot.masked_fill(pad_mask.unsqueeze(-1), 0.0)
-            ankh = ankh.masked_fill(pad_mask.unsqueeze(-1), 0.0)
-        
-        # Cross-attention with correct padding masks
-        esm_attended, _ = self.esm_to_others(esm, others_esm, others_esm, key_padding_mask=others_esm_mask)
-        prot_attended, _ = self.prot_to_others(prot, others_prot, others_prot, key_padding_mask=others_prot_mask)
-        ankh_attended, _ = self.ankh_to_others(ankh, others_ankh, others_ankh, key_padding_mask=others_ankh_mask)
-        
-        # NEW: convex (softmax) gating per token over the three streams
-        gate_in = torch.cat([esm_attended, prot_attended, ankh_attended], dim=-1)   # [B, L, 3*d]
-        gate = self.gate(gate_in).softmax(dim=-1)                    # [B, L, 3]
-
-        mixed = (
-            gate[..., 0:1] * esm_attended +
-            gate[..., 1:2] * prot_attended +
-            gate[..., 2:3] * ankh_attended
-        )  # [B, L, d_model]
-        
-        return self.norm(mixed)  
 
 class CrossAttentionFusionTwoModalities(nn.Module):
     """Cross-attention between two modalities with softmax gating"""
@@ -235,9 +164,9 @@ class CrossAttentionFusionTwoModalities(nn.Module):
 
 class CrossAttentionMultiModalFusion(nn.Module):
     """
-    Cross-attention fusion for two protein modalities:
+    Cross-attention fusion for two modalities in the sequence stream:
     - ESM-C sequence embeddings
-    - Protein embeddings  
+    - ProtT5-BFD residue embeddings
     """
     
     def __init__(self,
@@ -296,7 +225,7 @@ class CrossAttentionSequenceEncoder(nn.Module):
 
 class PGLMAnkhCrossModalFusion(nn.Module):
     """
-    Cross-attention fusion for PGLM embeddings and Ankh embeddings.
+    Cross-attention fusion for PGLM embeddings and Ankh embeddings (auxiliary stream).
     """
 
     def __init__(self,
@@ -331,135 +260,51 @@ class PGLMAnkhCrossModalFusion(nn.Module):
         
         return self.dropout(fused).masked_fill(pad_mask.unsqueeze(-1), 0.0)
 
-
-
-
-
-class MSAEncoder(nn.Module):
-    r"""
-    Multiple‑Sequence‑Alignment encoder with optional attention‑weighted pooling.
-
-    Inputs
-    ------
-    msa       : Tensor[B, N_seq, L_pad, d_msa]
-    pad_mask  : Tensor[B, L_pad]     – True where residue is padding
-    seq_pad   : Tensor[B, N_seq]     – True where whole row is padding
-
-    Output
-    ------
-    x         : Tensor[B, L_pad, d_msa]
-    """
-
-    def __init__(
-        self,
-        d_msa: int = 768,
-        p_chan: float = 0.10,
-        p_feat: float = 0.10,
-    ):
-        super().__init__()
-        # 1. Row dropout on MSA embeddings
-        self.dropout = nn.Dropout(p_chan)
-
-        # 2. Conservation head for attention scores
-        self.conservation_head = nn.Linear(d_msa, 1, bias=False)
-
-        # 3. Learned temperature τ (only used when attention is enabled)
-        self.log_tau = nn.Parameter(torch.zeros(()))  # τ = e^{log τ}, init‑1.0
-
-        # 4. Post‑pooling refinement
-        self.post_ffn = ResidualFeedForward(d_msa, expansion=4, dropout=p_feat)
-        self.norm = nn.LayerNorm(d_msa)
-
-    def forward(
-        self,
-        msa: torch.Tensor,      # [B, N_seq, L_pad, d_msa]
-        pad_mask: torch.Tensor, # [B, L_pad]
-        seq_pad: torch.Tensor,  # [B, N_seq]
-    ) -> torch.Tensor:
-
-        B, N_seq, L_pad, D = msa.shape
-        msa = self.dropout(msa)
-
-        # Build boolean mask [B, N_seq, L_pad]
-        pad_bool = seq_pad.unsqueeze(-1) | pad_mask.unsqueeze(1)
-
-        # Count valid rows per example   [B, 1]
-        valid_seq = (~seq_pad).sum(dim=1, keepdim=True).clamp(min=1).float()
-
-        # --------------------------------------------------------------------
-        # POOLING
-        # --------------------------------------------------------------------
-        # 1) Conservation logits
-        scores = self.conservation_head(msa).squeeze(-1)          # [B,N,L]
-
-        # 2) Centre per column
-        scores = scores.masked_fill(pad_bool, 0.0)
-
-        # 3) Scale by (√N · τ)
-        scale = (valid_seq.sqrt() * self.log_tau.exp()).unsqueeze(-1)
-        scores = scores / scale
-
-        # 4) Mask padding & soft‑max over rows
-        scores = scores.masked_fill(pad_bool, -1e4)
-        weights = torch.softmax(scores, dim=1).masked_fill(pad_bool, 0.0)
-
-        # 5) Weighted sum
-        pooled = (msa * weights.unsqueeze(-1)).sum(dim=1)         # [B,L,D]
-        # --------------------------------------------------------------------
-        # Refinement & output
-        # --------------------------------------------------------------------
-        x = self.norm(pooled)
-        x = self.post_ffn(x)
-        x = x.masked_fill(pad_mask.unsqueeze(-1), 0.0)
-        return x
-
-
 ############################################################
-#  Cross-modal attention fusion
+#  Dual-stream cross-attention fusion
 ############################################################
 
-class CrossModalAttention(nn.Module):
+class DualStreamCrossAttention(nn.Module):
     def __init__(self, d_model: int = 1152, n_heads: int = 8, n_layers: int = 2, dropout: float = 0.1):
         super().__init__()
         self.layers = nn.ModuleList()
-        print(d_model)
         for _ in range(n_layers):
             layer = nn.ModuleDict({
-                "seq_norm": nn.LayerNorm(d_model),
-                "msa_norm": nn.LayerNorm(d_model),
-                "seq_attn": nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True),
-                "msa_attn": nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True),
-                "seq_ffn": ResidualFeedForward(d_model, dropout=dropout),
-                "msa_ffn": ResidualFeedForward(d_model, dropout=dropout),
+                "left_norm": nn.LayerNorm(d_model),
+                "right_norm": nn.LayerNorm(d_model),
+                "left_attn": nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True),
+                "right_attn": nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True),
+                "left_ffn": ResidualFeedForward(d_model, dropout=dropout),
+                "right_ffn": ResidualFeedForward(d_model, dropout=dropout),
             })
             self.layers.append(layer)
 
     def forward(
         self, 
-        seq: torch.Tensor, 
-        msa: torch.Tensor,
-        seq_pad: Optional[torch.Tensor] = None,  # [B, L] True where padded
-        msa_pad: Optional[torch.Tensor] = None   # [B, L] True where padded
-    ) -> Tuple[torch.Tensor, torch.Tensor]: #TODO: Check for probability density in masked queries 
+        left: torch.Tensor, 
+        right: torch.Tensor,
+        left_pad: Optional[torch.Tensor] = None,  # [B, L] True where padded
+        right_pad: Optional[torch.Tensor] = None   # [B, L] True where padded
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         for layer in self.layers:
-            # seq attends to msa - normalize ALL inputs
-            seq2, _ = layer["seq_attn"](
-                layer["seq_norm"](seq),      # Normalize sequence queries
-                layer["msa_norm"](msa),      # Normalize MSA keys (for stable attention weights)  
-                layer["msa_norm"](msa),      # Normalize MSA values (for stable outputs)
-                key_padding_mask=msa_pad
+            # left attends to right
+            left2, _ = layer["left_attn"](
+                layer["left_norm"](left),
+                layer["right_norm"](right),
+                layer["right_norm"](right),
+                key_padding_mask=right_pad,
             )
-            # msa attends to seq - normalize ALL inputs
-            msa2, _ = layer["msa_attn"](
-                layer["msa_norm"](msa),      # Normalize MSA queries
-                layer["seq_norm"](seq),      # Normalize sequence keys (for stable attention weights)
-                layer["seq_norm"](seq),      # Normalize sequence values (for stable outputs)
-                key_padding_mask=seq_pad
+            # right attends to left
+            right2, _ = layer["right_attn"](
+                layer["right_norm"](right),
+                layer["left_norm"](left),
+                layer["left_norm"](left),
+                key_padding_mask=left_pad,
             )
-            seq, msa = seq + seq2, msa + msa2
-            seq = layer["seq_ffn"](seq)
-            msa = layer["msa_ffn"](msa)
-        return seq, msa
+            left, right = left + left2, right + right2
+            left = layer["left_ffn"](left)
+            right = layer["right_ffn"](right)
+        return left, right
 
 
 
@@ -524,9 +369,8 @@ class ProteinLitModule(LightningModule):
             dropout=dropout,
             n_heads=n_heads
         )
-        # Second stream: PGLM + Ankh fusion (no MSA encoder)
-        self.msa_encoder = None
-        self.msa_ankh_encoder = PGLMAnkhCrossModalFusion(
+        # Second stream: PGLM + Ankh fusion
+        self.pglm_ankh_encoder = PGLMAnkhCrossModalFusion(
             d_pglm=d_msa,  # d_msa arg represents pglm dim
             d_ankh=d_ankh,
             d_out=768,
@@ -535,7 +379,7 @@ class ProteinLitModule(LightningModule):
         )
 
         # Fusion / Cross-attention
-        self.cross_attn = CrossModalAttention(
+        self.cross_attn = DualStreamCrossAttention(
             d_model=768,
             n_heads=n_heads,
             n_layers=n_cross_layers,
@@ -565,14 +409,11 @@ class ProteinLitModule(LightningModule):
         self._test_labels = []
 
     def setup(self, stage: str) -> None:
-        """Setup hook handles MSA model device movement and compilation."""
-        if stage == "fit":
-            # MSA model compilation disabled by default for easier debugging
-            print("🐛 MSA model compilation disabled for easier debugging and development")
-            print(f"✅ ESM-MSA model loaded on {self.device}")
+        """No-op setup (MSA has been fully removed)."""
+        return
 
     # ---------------------------------------------------------------------
-    #  Forward pass - optimized MSA computation
+    #  Forward pass
     # ---------------------------------------------------------------------
     def forward(self, batch: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
         """Forward pass with individual learnable BOS/EOS tokens for each modality.
@@ -582,15 +423,14 @@ class ProteinLitModule(LightningModule):
         - BOS tokens are inserted at position 0, EOS tokens at position L+1
         - This allows each modality to learn optimal start/end representations
         """
-        # Extract inputs - ESM-C embeddings are pre-computed
+        # Extract inputs - all embeddings are pre-computed
         seq_emb = batch["sequence_emb"]  # Pre-computed ESM-C: [B, L, d_model]
         prot_emb = batch["prot_emb"]     # Pre-computed protein: [B, L, d_prot]
         ankh_emb = batch["ankh_emb"]     # Pre-computed Ankh3-Large: [B, L, d_ankh]
         pglm_emb = batch["pglm_emb"]     # Pre-computed PGLM: [B, L, d_pglm]
-        msa_tok_list = batch["msa_tok"]   # list[Tensor] – variable [N_seq_i, L_i]
 
         pad_mask = batch["pad_mask"]     # [B, L] - True where padded
-        seq_pad    = batch["seq_pad_mask"]  # [B, N_max]
+        # no sequence-of-sequences mask needed (no MSA)
 
         # Skip MSA embedding computation; tokens remain unused but are kept in the batch
 
@@ -616,31 +456,29 @@ class ProteinLitModule(LightningModule):
                 pglm_emb[i, eos_pos] = self.pglm_eos_token.to(pglm_emb.dtype).squeeze()    # [d_pglm]
         
         # Create mask for pooling that masks BOS/EOS positions
-        msa_encoder_mask = pad_mask.clone()
-        msa_encoder_mask[:, 0] = True  # Mask out BOS position for MSA encoder (padding=True)
+        pool_mask = pad_mask.clone()
+        pool_mask[:, 0] = True  # Mask out BOS position
         
         # Also ensure EOS positions (L+1) are masked as True
         for i, length in enumerate(lengths):
             eos_pos = length + 1
-            if eos_pos < msa_encoder_mask.size(1):  # Safety check
-                msa_encoder_mask[i, eos_pos] = True  # Mask out EOS position for MSA encoder
+            if eos_pos < pool_mask.size(1):  # Safety check
+                pool_mask[i, eos_pos] = True  # Mask out EOS position
         
         # Encode each modality with appropriate masks
         # Sequence stream: ESM-C + ProtT5
         seq_z = self.seq_encoder(seq_emb, prot_emb, pad_mask=pad_mask)  # [B, L, 768]
-        # Replace MSA stream with PGLM embeddings (BOS/EOS already inserted above)
-        msa_z = pglm_emb
 
         # Apply PGLM+Ankh cross-modal fusion
-        msa_ankh_z = self.msa_ankh_encoder(msa_z, ankh_emb, pad_mask=pad_mask)  # [B, L, 768]
+        msa_ankh_z = self.pglm_ankh_encoder(pglm_emb, ankh_emb, pad_mask=pad_mask)  # [B, L, 768]
 
         # Cross-modal attention with padding masks between the two streams
         # seq_z contains ESM-C + ProtT5 fusion, msa_ankh_z contains PGLM + Ankh fusion
         seq_z, msa_ankh_z = self.cross_attn(seq_z, msa_ankh_z, pad_mask, pad_mask)  # each [B, L, d]
 
         # Use masked mean pooling (exclude BOS/EOS tokens)
-        seq_pool = masked_mean_pooling(seq_z, msa_encoder_mask)  # [B, d] - ESM-C + ProtT5 stream
-        msa_ankh_pool = masked_mean_pooling(msa_ankh_z, msa_encoder_mask)  # [B, d] - PGLM + Ankh stream
+        seq_pool = masked_mean_pooling(seq_z, pool_mask)  # [B, d] - ESM-C + ProtT5 stream
+        msa_ankh_pool = masked_mean_pooling(msa_ankh_z, pool_mask)  # [B, d] - PGLM + Ankh stream
 
         # Use AttentionFusion between the two streams
         fused = self.fusion(seq_pool, msa_ankh_pool)    # [B, d]
@@ -649,75 +487,7 @@ class ProteinLitModule(LightningModule):
         
         return logits, batch["labels"]
 
-    # ------------------------------------------------------------------
-    #  Simple MSA embedding computation without streams
-    # ------------------------------------------------------------------
-    @torch.inference_mode()
-    def _compute_msa_embeddings(
-        self,
-        msa_tok_list: List[torch.Tensor],
-        target_len: int,
-    ) -> Tuple[torch.Tensor, float]:
-        """Compute MSA embeddings sequentially (one sample at a time).
-
-        This avoids the huge memory spike that occurs when feeding the whole
-        batch to ESM-MSA at once.  After all representations are computed we
-        zero-pad them to a common shape so downstream code can keep treating
-        the result as a single 4-D tensor: [B, N_seq_max, L_max, d_msa].
-        """
-        import time
-        start = time.perf_counter()
-
-        reps: List[torch.Tensor] = []
-        max_n_seq = 0
-        max_L     = 0
-
-        for tok in msa_tok_list:
-            # Move single sample to device and add batch dim expected by ESM-MSA
-            tok = tok.unsqueeze(0)  # [1, N_seq, L]
-
-            rep = self.msa_model(tok, repr_layers=[12])["representations"][12]
-
-            rep = rep.squeeze(0)      # [N_seq, L, d_msa]
-            reps.append(rep)
-
-            # Track largest shapes for padding later
-            max_n_seq = max(max_n_seq, rep.shape[0])
-
-        # Ensure horizontal padding matches desired target_len
-        max_L = target_len
-
-        # ---------------------------------------------------------
-        # Pad each representation to [max_n_seq, max_L, d_msa]
-        # ---------------------------------------------------------
-        padded_reps: List[torch.Tensor] = []
-        for rep in reps:
-            n_seq, L, D = rep.shape
-            if n_seq < max_n_seq or L < max_L:
-                padded = rep.new_zeros(max_n_seq, max_L, D) #TODO: CONSIDER PADDING TOKEN
-                padded[:n_seq, :L] = rep
-                rep = padded
-            padded_reps.append(rep)
-
-        msa_emb = torch.stack(padded_reps, dim=0)  # [B, N_seq_max, L_max, d_msa]
-
-        return msa_emb, time.perf_counter() - start
-
-    def _load_msa_model(self):
-        """Try esm.pretrained first, fall back to torch.hub if needed."""
-        try:
-            import esm  # type: ignore
-            if hasattr(esm, "pretrained"):
-                model, _ = esm.pretrained.esm_msa1b_t12_100M_UR50S()  # type: ignore[attr-defined]
-                return model
-        except Exception as e:
-            print(f"[WARN] esm.pretrained unavailable: {e}. Falling back to torch.hub...")
-        import torch
-        try:
-            model = torch.hub.load('facebookresearch/esm', 'esm_msa1b_t12_100M_UR50S')
-            return model
-        except Exception as e:
-            raise RuntimeError(f"Failed to load ESM-MSA model via esm or torch.hub: {e}")
+    # All MSA-related utilities removed
 
 
 

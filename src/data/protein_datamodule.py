@@ -1,39 +1,34 @@
-from typing import Any, Dict, Optional, Tuple, List
-import os
+from typing import Any, Dict, Optional, List
 import torch
 from lightning import LightningDataModule
 from torch.utils.data import DataLoader, Dataset
-import pandas as pd
 from pathlib import Path
 import torch.nn.functional as F
 import pickle as pkl
 from .go_utils import load_go_dict
-import random  # For MSA subsampling
 
 
 class ProteinDataset(Dataset):
-    """Custom Dataset for multi-modal protein function prediction."""
-    
-    # class-level cache for MSA batch converter only
-    _msa_batch_conv = None
-    
+    """Dataset for multi-modal protein function prediction (no MSA).
+
+    Loads per-residue embeddings for four modalities: ESM-C, ProtT5-BFD, Ankh3-Large, and XTrimoPGLM,
+    along with GO multi-labels.
+    """
+
     # class-level cache so every worker only builds it once
     _go_dicts = {}
-    
-    def __init__(self, data_dir: str, protein_ids: List[str], task_type: str = "mf", split: str = "train", msa_sample_size: Optional[int] = None):
+
+    def __init__(self, data_dir: str, protein_ids: List[str], task_type: str = "mf", split: str = "train"):
         """
         :param data_dir: Path to protein data directory (base PDBCH directory)
         :param protein_ids: List of protein IDs to include
         :param task_type: Which GO task(s) to load labels for ("mf", "bp", "cc")
         :param split: Which data split ("train", "val", "test")
-        :param msa_sample_size: Maximum number of MSA sequences to keep (including query). None ➜ keep all.
         """
         self.data_dir = Path(data_dir)
         self.protein_ids = protein_ids
         self.task_type = task_type
         self.split = split
-        # Maximum number of MSA sequences to keep (including query). None ➜ keep all.
-        self.msa_sample_size = msa_sample_size
         
         # Determine the specific split directory
         self.split_dir = self.data_dir / f"{split}_pdbch"
@@ -41,39 +36,7 @@ class ProteinDataset(Dataset):
     def __len__(self):
         return len(self.protein_ids)
 
-    @classmethod
-    def _get_msa_batch_converter(cls):
-        """Return a cached ESM-MSA batch-converter **without** loading the
-        large model.
-        """
-        if cls._msa_batch_conv is not None:
-            return cls._msa_batch_conv
-
-        import esm  # local import to keep global namespace clean
-        from esm.data import Alphabet  # type: ignore
-        alphabet = Alphabet.from_architecture("msa_transformer")
-        cls._msa_batch_conv = alphabet.get_batch_converter()
-        return cls._msa_batch_conv
-
-    def _parse_a3m(self, path: Path) -> List[str]:
-        """Parse A3M file - first sequence is query, max 256 total sequences."""
-        seqs, seq = [], []
-        with open(path, "r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.rstrip("\r\n")
-                if not line:
-                    continue
-                if line[0] == ">":                     # header
-                    if seq:
-                        seqs.append("".join(seq))
-                    seq = []                           # reset
-                else:
-                    seq.append(line)
-            if seq:  # add final sequence
-                seqs.append("".join(seq))
-        
-        assert 1 <= len(seqs) <= 256, f"Expected 1-256 sequences, got {len(seqs)} from {path}"
-        return seqs
+    # MSA parsing utilities removed
 
     def _parse_go_labels(self, go_file_path: Path) -> torch.Tensor:
         """
@@ -121,8 +84,6 @@ class ProteinDataset(Dataset):
         assert esmc_data.dim() == 3, "ESM-C data should be a 3D tensor"
         esmc_emb = esmc_data.squeeze(0)
         
-        # NOTE: protein embeddings (prot_emb.pt) are no longer used
-        
         # Load pre-computed Ankh3-Large embeddings (required file)
         ankh_file = protein_dir / "ankh_emb.pt"
         ankh_data = torch.load(ankh_file)
@@ -143,8 +104,6 @@ class ProteinDataset(Dataset):
         assert prot_data.dim() == 3, "ProtT5 data should be a 3D tensor"
         prot_emb = prot_data.squeeze(0)
 
-        # NOTE: Ankh-XL embeddings are no longer used
-        
         # Ensure all embeddings have the same sequence length
         assert esmc_emb.size(0) == ankh_emb.size(0) == pglm_emb.size(0) == prot_emb.size(0), \
             f"Embeddings have different lengths: ESM-C={esmc_emb.size(0)}, Ankh={ankh_emb.size(0)}, PGLM={pglm_emb.size(0)}, ProtT5={prot_emb.size(0)}"
@@ -152,8 +111,6 @@ class ProteinDataset(Dataset):
         # Zero out 0th and L+1th indices for ESM-C embeddings (no BOS/EOS tokens)
         esmc_emb[0] = 0.0  # Zero out BOS position
         esmc_emb[-1] = 0.0  # Zero out EOS position
-        
-        # NOTE: protein embeddings (prot_emb) removed
         
         # Zero out 0th and L+1th indices for Ankh embeddings (no BOS/EOS tokens)
         ankh_emb[0] = 0.0  # Zero out BOS position
@@ -167,30 +124,6 @@ class ProteinDataset(Dataset):
         prot_emb[0] = 0.0
         prot_emb[-1] = 0.0
 
-        # NOTE: Ankh-XL embeddings removed
-        
-        # Prepare MSA tokens (CPU-only, no embedding computation)
-        # Parse A3M file + convert to integer tokens (CPU-only)
-        a3m_file = protein_dir / "final_filtered_256_stripped.a3m"
-        # 1) FAST text parsing on the worker CPU
-        seqs = self._parse_a3m(a3m_file)
-
-        # ----------------------------------------------------
-        # Optional random subsampling of MSA depth
-        # ----------------------------------------------------
-        if self.msa_sample_size is not None and len(seqs) > self.msa_sample_size:
-            # Always keep the query sequence (first entry) and sample the rest.
-            query_seq = seqs[0]
-            # Randomly sample without replacement from the remaining sequences.
-            sampled_rest = random.sample(seqs[1:], k=self.msa_sample_size - 1)
-            seqs = [query_seq] + sampled_rest
-
-        # 2) Batch-converter → integer token tensor (still CPU)
-        msa = [(f"seq{i}", s) for i, s in enumerate(seqs)]
-        batch_converter = self._get_msa_batch_converter()
-        _, _, tok = batch_converter([msa])  # type: ignore[arg-type]
-        msa_tok = tok.squeeze(0)                  # [N_seq, L_tok] – stays on CPU
-        
         # Load labels based on task type from GO text files
         label_file = protein_dir / f"{self.task_type}_go.txt"
         
@@ -201,16 +134,13 @@ class ProteinDataset(Dataset):
         with open(protein_dir / "L.csv", "r") as f:
             protein_length = int(f.readline().strip())
         
-        # assert protein_length == esmc_emb.size(0)-2 == msa_emb.size(1)-1, "Sequence/MSA/Length mismatch"
-        
         sample = {
             "protein_id": protein_id,
             "sequence": sequence,
             "sequence_emb": esmc_emb,  # Shape: (L+2, d_model) 
             "ankh_emb": ankh_emb,      # Shape: (L+2, d_ankh)
             "pglm_emb": pglm_emb,      # Shape: (L+2, d_pglm)
-            "prot_emb": prot_emb,   # Shape: (L+2, d_prot_t5)
-            "msa_tok": msa_tok,
+            "prot_emb": prot_emb,      # Shape: (L+2, d_prot_t5)
             "length": protein_length,
             "labels": labels,
         }
@@ -219,13 +149,10 @@ class ProteinDataset(Dataset):
 
 
 class ProteinDataModule(LightningDataModule):
-    """DataModule for protein function prediction.
-    
-    Handles two input modalities:
-    1. ESM-C embeddings (pre-computed, required as .pt files)
-    2. MSA tokens (prepared on-the-fly, embeddings computed in model)
-    
-    Now supports three predefined splits: train, val, test from separate directories.
+    """DataModule for protein function prediction (no MSA).
+
+    Loads precomputed per-residue embeddings for modalities: ESM-C, ProtT5-BFD, Ankh3-Large, XTrimoPGLM,
+    and corresponding GO labels for splits: train, val, test.
     """
 
     # Help static type checkers recognise dynamically-added Hydra attribute
@@ -233,12 +160,11 @@ class ProteinDataModule(LightningDataModule):
 
     def __init__(
         self,
-        data_dir: str = "data/PDBCH",  # Updated to point to PDBCH base directory
+        data_dir: str = "data/PDBCH",  # PDBCH base directory
         task_type: str = "mf",  # "mf", "bp", or "cc"
-        batch_size: int = 4,    # Updated to 4 as requested
+        batch_size: int = 4,
         num_workers: int = 0,
         pin_memory: bool = True,
-        msa_sample_size: Optional[int] = None,
     ) -> None:
         """Initialize ProteinDataModule.
 
@@ -257,8 +183,6 @@ class ProteinDataModule(LightningDataModule):
         self.data_test: Optional[Dataset] = None
 
         self.batch_size_per_device = batch_size
-        # Expose requested MSA subsampling size in hyperparameters
-        self.hparams.msa_sample_size = msa_sample_size
         
         # Store protein IDs for each split
         self.train_protein_ids: List[str] = []
@@ -318,7 +242,6 @@ class ProteinDataModule(LightningDataModule):
             required_files = [
                 "L.csv",
                 "sequence.txt", 
-                "final_filtered_256_stripped.a3m",
                 "esmc_emb.pt",
                 "ankh_emb.pt",
                 "pglm_emb.pt",
@@ -413,7 +336,6 @@ class ProteinDataModule(LightningDataModule):
                 protein_ids=self.train_protein_ids,
                 task_type=self.hparams.task_type,
                 split="train",
-                msa_sample_size=self.hparams.msa_sample_size,
             )
             
             # ---------------------------------------------------------
@@ -443,7 +365,6 @@ class ProteinDataModule(LightningDataModule):
                 protein_ids=self.val_protein_ids,
                 task_type=self.hparams.task_type,
                 split="val",
-                msa_sample_size=self.hparams.msa_sample_size,
             )
             
             self.data_test = ProteinDataset(
@@ -451,7 +372,6 @@ class ProteinDataModule(LightningDataModule):
                 protein_ids=self.test_protein_ids,
                 task_type=self.hparams.task_type,
                 split="test",
-                msa_sample_size=self.hparams.msa_sample_size,
             )
 
     def train_dataloader(self) -> DataLoader[Any]:
@@ -513,11 +433,8 @@ class ProteinDataModule(LightningDataModule):
 # ======================================================================
 
 def protein_collate(batch):
-    """Collate function for protein data.
-    Pads:
-    1. Pre-computed ESM-C embeddings  → shape [B, L_max_seq, d_model]
-    2. Integer MSA tokens            → shape [B, N_seq_max, L_max_seq]
-    3. Sequence padding mask         → shape [B, N_seq_max]
+    """Collate function for protein embeddings and labels.
+    Pads per-residue embeddings to a common length and builds a boolean pad mask.
     """
     protein_ids = [it["protein_id"] for it in batch]
     sequences   = [it["sequence"]    for it in batch]
@@ -561,28 +478,13 @@ def protein_collate(batch):
         # NOTE: Ankh-XL embeddings removed
 
     # ----------------------------------------------------
-    # 2) Collect integer MSA token matrices *without* padding
-    #    + build per-sample sequence padding masks
-    # ----------------------------------------------------
-    msa_tok_list = [it["msa_tok"] for it in batch]   # no padding here
-
-    # Determine maximum number of sequences across the batch
-    max_n_seq = max(tok.shape[0] for tok in msa_tok_list)
-
-    # Build boolean mask where True means a padding (absent) sequence
-    seq_pad_mask = torch.tensor([
-        [i >= tok.shape[0] for i in range(max_n_seq)] for tok in msa_tok_list
-    ], dtype=torch.bool)
-
-    # ----------------------------------------------------
-    # 3) Stack sequence embeddings + build masks
+    # 2) Stack embeddings + build masks
     # ----------------------------------------------------
     sequence_emb = torch.stack(seq_emb_padded)    # [B, L_max_seq, d_model]
     ankh_emb = torch.stack(ankh_emb_padded)       # [B, L_max_seq, d_ankh]
     pglm_emb = torch.stack(pglm_emb_padded)       # [B, L_max_seq, d_pglm]
     prot_emb = torch.stack(prot_emb_padded) # [B, L_max_seq, d_prot_t5]
 
-    # `msa_tok` left as list for per-sample processing later
     labels = torch.stack([it["labels"] for it in batch])
 
     pad_mask = torch.tensor(
@@ -592,10 +494,6 @@ def protein_collate(batch):
 
     lengths_tensor = torch.tensor(lengths)
 
-    # ----------------------------------------------------
-    # 4) Timing aggregation
-    # ----------------------------------------------------
-
     return {
         "protein_id": protein_ids,
         "sequence": sequences,
@@ -603,8 +501,6 @@ def protein_collate(batch):
         "ankh_emb": ankh_emb,
         "pglm_emb": pglm_emb,
         "prot_emb": prot_emb,
-        "msa_tok": msa_tok_list,  # list[Tensor] – variable shapes
-        "seq_pad_mask": seq_pad_mask,  # [B, N_seq_max] (True → PAD)
         "labels": labels,
         "pad_mask": pad_mask,
         "lengths": lengths_tensor,
