@@ -121,13 +121,7 @@ class ProteinDataset(Dataset):
         assert esmc_data.dim() == 3, "ESM-C data should be a 3D tensor"
         esmc_emb = esmc_data.squeeze(0)
         
-        # Load pre-computed protein embeddings (required file)
-        prot_file = protein_dir / "prot_emb.pt"
-        prot_data = torch.load(prot_file)
-        # Extract embeddings from data structures
-        # Protein: Direct tensor (1, L+2, d_prot) -> squeeze to (L+2, d_prot)
-        assert prot_data.dim() == 3, "Protein data should be a 3D tensor"
-        prot_emb = prot_data.squeeze(0)
+        # NOTE: protein embeddings (prot_emb.pt) are no longer used
         
         # Load pre-computed Ankh3-Large embeddings (required file)
         ankh_file = protein_dir / "ankh_emb.pt"
@@ -143,23 +137,23 @@ class ProteinDataset(Dataset):
         assert pglm_data.dim() == 3, "PGLM data should be a 3D tensor"
         pglm_emb = pglm_data.squeeze(0)
 
-        # Load pre-computed ProGen2 embeddings (required file)
-        progen2_file = protein_dir / "progen2_emb.pt"
-        progen2_data = torch.load(progen2_file)
-        assert progen2_data.dim() == 3, "ProGen2 data should be a 3D tensor"
-        progen2_emb = progen2_data.squeeze(0)
+        # Load pre-computed ProtT5 embeddings (required file)
+        prot_file = protein_dir / "prot_emb.pt"
+        prot_data = torch.load(prot_file)
+        assert prot_data.dim() == 3, "ProtT5 data should be a 3D tensor"
+        prot_emb = prot_data.squeeze(0)
+
+        # NOTE: Ankh-XL embeddings are no longer used
         
         # Ensure all embeddings have the same sequence length
-        assert esmc_emb.size(0) == prot_emb.size(0) == ankh_emb.size(0) == pglm_emb.size(0) == progen2_emb.size(0), \
-            f"Embeddings have different lengths: ESM-C={esmc_emb.size(0)}, Protein={prot_emb.size(0)}, Ankh={ankh_emb.size(0)}, PGLM={pglm_emb.size(0)}, ProGen2={progen2_emb.size(0)}"
+        assert esmc_emb.size(0) == ankh_emb.size(0) == pglm_emb.size(0) == prot_emb.size(0), \
+            f"Embeddings have different lengths: ESM-C={esmc_emb.size(0)}, Ankh={ankh_emb.size(0)}, PGLM={pglm_emb.size(0)}, ProtT5={prot_emb.size(0)}"
         
         # Zero out 0th and L+1th indices for ESM-C embeddings (no BOS/EOS tokens)
         esmc_emb[0] = 0.0  # Zero out BOS position
         esmc_emb[-1] = 0.0  # Zero out EOS position
         
-        # Zero out 0th and L+1th indices for protein embeddings (no BOS/EOS tokens)
-        prot_emb[0] = 0.0  # Zero out BOS position
-        prot_emb[-1] = 0.0  # Zero out EOS position
+        # NOTE: protein embeddings (prot_emb) removed
         
         # Zero out 0th and L+1th indices for Ankh embeddings (no BOS/EOS tokens)
         ankh_emb[0] = 0.0  # Zero out BOS position
@@ -169,9 +163,11 @@ class ProteinDataset(Dataset):
         pglm_emb[0] = 0.0
         pglm_emb[-1] = 0.0
 
-        # Zero out 0th and L+1th indices for ProGen2 embeddings (no BOS/EOS tokens)
-        progen2_emb[0] = 0.0
-        progen2_emb[-1] = 0.0
+        # Zero out 0th and L+1th indices for ProtT5 embeddings (no BOS/EOS tokens)
+        prot_emb[0] = 0.0
+        prot_emb[-1] = 0.0
+
+        # NOTE: Ankh-XL embeddings removed
         
         # Prepare MSA tokens (CPU-only, no embedding computation)
         # Parse A3M file + convert to integer tokens (CPU-only)
@@ -211,10 +207,9 @@ class ProteinDataset(Dataset):
             "protein_id": protein_id,
             "sequence": sequence,
             "sequence_emb": esmc_emb,  # Shape: (L+2, d_model) 
-            "prot_emb": prot_emb,      # Shape: (L+2, d_prot)
             "ankh_emb": ankh_emb,      # Shape: (L+2, d_ankh)
             "pglm_emb": pglm_emb,      # Shape: (L+2, d_pglm)
-            "progen2_emb": progen2_emb, # Shape: (L+2, d_progen2)
+            "prot_emb": prot_emb,   # Shape: (L+2, d_prot_t5)
             "msa_tok": msa_tok,
             "length": protein_length,
             "labels": labels,
@@ -325,10 +320,9 @@ class ProteinDataModule(LightningDataModule):
                 "sequence.txt", 
                 "final_filtered_256_stripped.a3m",
                 "esmc_emb.pt",
-                "prot_emb.pt",
                 "ankh_emb.pt",
                 "pglm_emb.pt",
-                "progen2_emb.pt",
+                "prot_emb.pt",
                 f"{self.hparams.task_type}_go.txt"
             ]
             
@@ -536,22 +530,15 @@ def protein_collate(batch):
     assert max_len_seq <= 1024, "Sequence too long (>1024)"
 
     seq_emb_padded = []
-    prot_emb_padded = []
     ankh_emb_padded = []
     pglm_emb_padded = []
-    progen2_emb_padded = []
+    prot_emb_padded = []
     for it in batch:
         # Pad ESM-C embeddings
         emb = it["sequence_emb"]  # [L+2, d]
         if emb.size(0) < max_len_seq:
             emb = F.pad(emb, (0, 0, 0, max_len_seq - emb.size(0)), value=0)
         seq_emb_padded.append(emb)
-        
-        # Pad protein embeddings (same padding logic)
-        prot_emb = it["prot_emb"]  # [L+2, d_prot]
-        if prot_emb.size(0) < max_len_seq:
-            prot_emb = F.pad(prot_emb, (0, 0, 0, max_len_seq - prot_emb.size(0)), value=0)
-        prot_emb_padded.append(prot_emb)
         
         # Pad Ankh3-Large embeddings (same padding logic)
         ankh_emb = it["ankh_emb"]  # [L+2, d_ankh]
@@ -565,11 +552,13 @@ def protein_collate(batch):
             pglm_emb = F.pad(pglm_emb, (0, 0, 0, max_len_seq - pglm_emb.size(0)), value=0)
         pglm_emb_padded.append(pglm_emb)
 
-        # Pad ProGen2 embeddings
-        progen2_emb = it["progen2_emb"]  # [L+2, d_progen2]
-        if progen2_emb.size(0) < max_len_seq:
-            progen2_emb = F.pad(progen2_emb, (0, 0, 0, max_len_seq - progen2_emb.size(0)), value=0)
-        progen2_emb_padded.append(progen2_emb)
+        # Pad ProtT5 embeddings
+        prot_emb = it["prot_emb"]  # [L+2, d_prot_t5]
+        if prot_emb.size(0) < max_len_seq:
+            prot_emb = F.pad(prot_emb, (0, 0, 0, max_len_seq - prot_emb.size(0)), value=0)
+        prot_emb_padded.append(prot_emb)
+
+        # NOTE: Ankh-XL embeddings removed
 
     # ----------------------------------------------------
     # 2) Collect integer MSA token matrices *without* padding
@@ -589,10 +578,9 @@ def protein_collate(batch):
     # 3) Stack sequence embeddings + build masks
     # ----------------------------------------------------
     sequence_emb = torch.stack(seq_emb_padded)    # [B, L_max_seq, d_model]
-    prot_emb = torch.stack(prot_emb_padded)       # [B, L_max_seq, d_prot]
     ankh_emb = torch.stack(ankh_emb_padded)       # [B, L_max_seq, d_ankh]
     pglm_emb = torch.stack(pglm_emb_padded)       # [B, L_max_seq, d_pglm]
-    progen2_emb = torch.stack(progen2_emb_padded) # [B, L_max_seq, d_progen2]
+    prot_emb = torch.stack(prot_emb_padded) # [B, L_max_seq, d_prot_t5]
 
     # `msa_tok` left as list for per-sample processing later
     labels = torch.stack([it["labels"] for it in batch])
@@ -612,10 +600,9 @@ def protein_collate(batch):
         "protein_id": protein_ids,
         "sequence": sequences,
         "sequence_emb": sequence_emb,
-        "prot_emb": prot_emb,
         "ankh_emb": ankh_emb,
         "pglm_emb": pglm_emb,
-        "progen2_emb": progen2_emb,
+        "prot_emb": prot_emb,
         "msa_tok": msa_tok_list,  # list[Tensor] – variable shapes
         "seq_pad_mask": seq_pad_mask,  # [B, N_seq_max] (True → PAD)
         "labels": labels,

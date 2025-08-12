@@ -8,8 +8,10 @@ dropout: 0.15           # General dropout rate for model components
 task_type: ${data.task_type}         # Task type: "mf", "bp", or "cc" - automatically from data config
 d_prot: 1024                    # Protein embedding dimension
 d_ankh: 1536                    # Ankh3-Large embedding dimension
-d_pglm: 2560                     # PGLM embedding dimension
-d_progen2: 1536                  # ProGen2 embedding dimension
+d_msa: 2560                     # PGLM embedding dimension
+# d_progen2: 1536                  # ProGen2 embedding dimension
+# d_prot_t5: 1024                  # ProtT5-BFD embedding dimension
+# d_ankh_xl: 2560                  # Ankh-XL embedding dimension
 # Training parameters  
 warmup_ratio: 0.01     # Warmup ratio for cosine schedule (5% of total training steps)
 

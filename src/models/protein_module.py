@@ -233,93 +233,6 @@ class CrossAttentionFusionTwoModalities(nn.Module):
         
         return self.norm(mixed)
 
-class GenericTrimodalCrossAttention(nn.Module):
-    """Generic trimodal cross-attention with per-token softmax gating.
-    Accepts three tensors of shape [B, L, d] and returns fused [B, L, d].
-    """
-    def __init__(self, d_model: int, dropout: float = 0.1, n_heads: int = 8):
-        super().__init__()
-        self.d_model = d_model
-        self.n_heads = n_heads
-
-        self.a_to_bc = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
-        self.b_to_ac = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
-        self.c_to_ab = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
-
-        self.gate = nn.Sequential(
-            nn.LayerNorm(d_model * 3),
-            nn.Dropout(0.1),
-            nn.Linear(d_model * 3, d_model // 2),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(d_model // 2, 3)
-        )
-
-        self.norm = nn.LayerNorm(d_model)
-
-    def forward(self, a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, pad_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # Build concatenated K/V for each query stream
-        others_a = torch.cat([b, c], dim=1)
-        others_b = torch.cat([a, c], dim=1)
-        others_c = torch.cat([a, b], dim=1)
-
-        if pad_mask is not None:
-            a = a.masked_fill(pad_mask.unsqueeze(-1), 0.0)
-            b = b.masked_fill(pad_mask.unsqueeze(-1), 0.0)
-            c = c.masked_fill(pad_mask.unsqueeze(-1), 0.0)
-            others_a_mask = torch.cat([pad_mask, pad_mask], dim=1)
-            others_b_mask = torch.cat([pad_mask, pad_mask], dim=1)
-            others_c_mask = torch.cat([pad_mask, pad_mask], dim=1)
-        else:
-            others_a_mask = others_b_mask = others_c_mask = None
-
-        a_att, _ = self.a_to_bc(a, others_a, others_a, key_padding_mask=others_a_mask)
-        b_att, _ = self.b_to_ac(b, others_b, others_b, key_padding_mask=others_b_mask)
-        c_att, _ = self.c_to_ab(c, others_c, others_c, key_padding_mask=others_c_mask)
-
-        gate_in = torch.cat([a_att, b_att, c_att], dim=-1)
-        w = self.gate(gate_in).softmax(dim=-1)
-        mixed = w[..., 0:1] * a_att + w[..., 1:2] * b_att + w[..., 2:3] * c_att
-        if pad_mask is not None:
-            mixed = mixed.masked_fill(pad_mask.unsqueeze(-1), 0.0)
-        return self.norm(mixed)
-
-class TrimodalProjectAndFuse(nn.Module):
-    """Normalize, project three modalities to a shared dim, then apply trimodal cross-attention.
-    Assumes input dimensions are provided at construction time.
-    """
-    def __init__(self,
-                 d_a: int,
-                 d_b: int,
-                 d_c: int,
-                 d_out: int = 768,
-                 dropout: float = 0.1,
-                 n_heads: int = 8):
-        super().__init__()
-        self.d_out = d_out
-
-        # Fixed-dimension normalization and projection layers
-        self.ln = nn.ModuleList([
-            nn.LayerNorm(d_a),
-            nn.LayerNorm(d_b),
-            nn.LayerNorm(d_c),
-        ])
-        self.proj = nn.ModuleList([
-            nn.Linear(d_a, d_out),
-            nn.Linear(d_b, d_out),
-            nn.Linear(d_c, d_out),
-        ])
-
-        self.fusion = GenericTrimodalCrossAttention(d_out, dropout, n_heads)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, pad_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        a_proj = self.proj[0](self.ln[0](a))
-        b_proj = self.proj[1](self.ln[1](b))
-        c_proj = self.proj[2](self.ln[2](c))
-        fused = self.fusion(a_proj, b_proj, c_proj, pad_mask)
-        return self.dropout(fused)
-
 class CrossAttentionMultiModalFusion(nn.Module):
     """
     Cross-attention fusion for two protein modalities:
@@ -381,13 +294,13 @@ class CrossAttentionSequenceEncoder(nn.Module):
         return self.fusion(x, prot_emb, pad_mask)
 
 
-class MSAAnkhCrossModalFusion(nn.Module):
+class PGLMAnkhCrossModalFusion(nn.Module):
     """
-    Cross-attention fusion for MSA representation and Ankh embeddings
+    Cross-attention fusion for PGLM embeddings and Ankh embeddings.
     """
-    
+
     def __init__(self,
-                 d_msa: int = 768,
+                 d_pglm: int = 1536,
                  d_ankh: int = 1024,
                  d_out: int = 768,
                  dropout: float = 0.1,
@@ -396,11 +309,11 @@ class MSAAnkhCrossModalFusion(nn.Module):
         self.d_out = d_out
         
         # Normalization layers
-        self.ln_msa = nn.LayerNorm(d_msa)
+        self.ln_pglm = nn.LayerNorm(d_pglm)
         self.ln_ankh = nn.LayerNorm(d_ankh)
         
         # Projection layers
-        self.proj_msa = nn.Linear(d_msa, d_out)
+        self.proj_pglm = nn.Linear(d_pglm, d_out)
         self.proj_ankh = nn.Linear(d_ankh, d_out)
         
         # Cross-attention fusion
@@ -408,13 +321,13 @@ class MSAAnkhCrossModalFusion(nn.Module):
         
         self.dropout = nn.Dropout(dropout)
     
-    def forward(self, msa_emb, ankh_emb, pad_mask=None, lengths=None):
+    def forward(self, pglm_emb, ankh_emb, pad_mask=None, lengths=None):
         # Normalize and project
-        msa_proj = self.proj_msa(self.ln_msa(msa_emb))      # [B, L, d_out]
-        ankh_proj = self.proj_ankh(self.ln_ankh(ankh_emb))  # [B, L, d_out]
+        pglm_proj = self.proj_pglm(self.ln_pglm(pglm_emb))      # [B, L, d_out]
+        ankh_proj = self.proj_ankh(self.ln_ankh(ankh_emb))      # [B, L, d_out]
         
         # Apply cross-attention fusion
-        fused = self.fusion(msa_proj, ankh_proj, pad_mask)
+        fused = self.fusion(pglm_proj, ankh_proj, pad_mask)
         
         return self.dropout(fused).masked_fill(pad_mask.unsqueeze(-1), 0.0)
 
@@ -559,11 +472,9 @@ class ProteinLitModule(LightningModule):
         self,
         task_type: str,                       # Task type: "mf", "bp", or "cc" - required
         d_model: int = 1152,                  # Base model dimension
-        d_prot: int = 128,                    # Protein embedding dimension
+        d_prot: int = 128,                    # Protein embedding dimension (unused; using ProtT5 instead)
         d_ankh: int = 1024,                   # Ankh3-Large embedding dimension
-        d_msa: int = 768,                     # MSA embedding dimension
-        d_pglm: int = 1024,                   # PGLM embedding dimension
-        d_progen2: int = 1024,                # ProGen2 embedding dimension
+        d_msa: int = 1536,                    # PGLM embedding dimension
         n_cross_layers: int = 2,              # Cross-attention layers
         n_heads: int = 8,                     # Attention heads
         dropout: float = 0.1,                 # Dropout rate
@@ -577,9 +488,7 @@ class ProteinLitModule(LightningModule):
         # Store task type for easy access
         self.task_type = task_type
         
-        # Load MSA model - robust to esm API variants
-        self.msa_model = self._load_msa_model()
-        self.msa_model.eval().requires_grad_(False)
+        # NOTE: MSA model removed; MSA tokens may still be passed but are unused
         
         # Individual learnable BOS/EOS tokens for each modality
         # ESM-C tokens (d_model dimension)
@@ -588,9 +497,9 @@ class ProteinLitModule(LightningModule):
         nn.init.normal_(self.esm_bos_token, std=0.02)
         nn.init.normal_(self.esm_eos_token, std=0.02)
         
-        # Protein tokens (d_prot dimension)
-        self.prot_bos_token = nn.Parameter(torch.zeros(1, d_prot))
-        self.prot_eos_token = nn.Parameter(torch.zeros(1, d_prot))
+        # Protein tokens (now used for ProtT5-BFD embeddings)
+        self.prot_bos_token = nn.Parameter(torch.zeros(1, 1024))  # ProtT5-BFD dim
+        self.prot_eos_token = nn.Parameter(torch.zeros(1, 1024))  # ProtT5-BFD dim
         nn.init.normal_(self.prot_bos_token, std=0.02)
         nn.init.normal_(self.prot_eos_token, std=0.02)
         
@@ -600,47 +509,29 @@ class ProteinLitModule(LightningModule):
         nn.init.normal_(self.ankh_bos_token, std=0.02)
         nn.init.normal_(self.ankh_eos_token, std=0.02)
         
-        # PGLM tokens (d_pglm dimension)
-        self.pglm_bos_token = nn.Parameter(torch.zeros(1, d_pglm))
-        self.pglm_eos_token = nn.Parameter(torch.zeros(1, d_pglm))
+        # PGLM tokens (use d_msa argument to represent pglm embedding dim)
+        self.pglm_bos_token = nn.Parameter(torch.zeros(1, d_msa))
+        self.pglm_eos_token = nn.Parameter(torch.zeros(1, d_msa))
         nn.init.normal_(self.pglm_bos_token, std=0.02)
         nn.init.normal_(self.pglm_eos_token, std=0.02)
-
-        # ProGen2 tokens (d_progen2 dimension)
-        self.progen2_bos_token = nn.Parameter(torch.zeros(1, d_progen2))
-        self.progen2_eos_token = nn.Parameter(torch.zeros(1, d_progen2))
-        nn.init.normal_(self.progen2_bos_token, std=0.02)
-        nn.init.normal_(self.progen2_eos_token, std=0.02)
-
-        # MSA tokens (d_msa dimension) - for insertion after MSA encoder
-        self.msa_bos_token = nn.Parameter(torch.zeros(1, d_msa))
-        self.msa_eos_token = nn.Parameter(torch.zeros(1, d_msa))
-        nn.init.normal_(self.msa_bos_token, std=0.02)
-        nn.init.normal_(self.msa_eos_token, std=0.02)
         
         # Encoders
-        self.msa_encoder = MSAEncoder(
-            d_msa=d_msa,
-        )
-
-        # Trimodal fusers
-        # Group A: Ankh (d_ankh), ProtT5 (d_prot), ESM-C (d_model)
-        self.group_a_fuser = TrimodalProjectAndFuse(
-            d_a=d_ankh,
-            d_b=d_prot,
-            d_c=d_model,
+        # Sequence stream: fuse ESM-C with ProtT5
+        self.seq_encoder = CrossAttentionSequenceEncoder(
+            d_model=d_model,
+            d_prot=1024,  # ProtT5-BFD dim
             d_out=768,
             dropout=dropout,
-            n_heads=n_heads,
+            n_heads=n_heads
         )
-        # Group B: MSA (encoder out 768), PGLM (unknown), ProGen2 (unknown)
-        self.group_b_fuser = TrimodalProjectAndFuse(
-            d_a=768,
-            d_b=d_pglm,
-            d_c=d_progen2,
+        # Second stream: PGLM + Ankh fusion (no MSA encoder)
+        self.msa_encoder = None
+        self.msa_ankh_encoder = PGLMAnkhCrossModalFusion(
+            d_pglm=d_msa,  # d_msa arg represents pglm dim
+            d_ankh=d_ankh,
             d_out=768,
             dropout=dropout,
-            n_heads=n_heads,
+            n_heads=n_heads
         )
 
         # Fusion / Cross-attention
@@ -695,23 +586,13 @@ class ProteinLitModule(LightningModule):
         seq_emb = batch["sequence_emb"]  # Pre-computed ESM-C: [B, L, d_model]
         prot_emb = batch["prot_emb"]     # Pre-computed protein: [B, L, d_prot]
         ankh_emb = batch["ankh_emb"]     # Pre-computed Ankh3-Large: [B, L, d_ankh]
-        pglm_emb = batch["pglm_emb"]     # Pre-computed XTrimoPGLM: [B, L, d_pglm]
-        progen2_emb = batch["progen2_emb"] # Pre-computed ProGen2: [B, L, d_progen2]
+        pglm_emb = batch["pglm_emb"]     # Pre-computed PGLM: [B, L, d_pglm]
         msa_tok_list = batch["msa_tok"]   # list[Tensor] – variable [N_seq_i, L_i]
 
         pad_mask = batch["pad_mask"]     # [B, L] - True where padded
         seq_pad    = batch["seq_pad_mask"]  # [B, N_max]
 
-        # Compute MSA embeddings on-the-fly (sequential, per-sample)
-        target_len = seq_emb.shape[1]  # CLS + residues + EOS (same as pad_mask width)
-        msa_emb, msa_compute_time = self._compute_msa_embeddings(msa_tok_list, target_len)  # [B, N_seq_max, target_len, d_msa]
-        
-        # Expose timing so callbacks (e.g., BatchTimer) can log it **after** the forward pass.
-        # Storing it on `self` ensures it is available in hooks such as `on_before_backward`.
-        self._last_msa_compute_time = msa_compute_time
-
-        # Keep original behaviour for potential external use
-        batch["msa_compute_time"] = msa_compute_time
+        # Skip MSA embedding computation; tokens remain unused but are kept in the batch
 
         # Insert individual learnable BOS/EOS tokens for each modality
         B = seq_emb.size(0)
@@ -722,7 +603,8 @@ class ProteinLitModule(LightningModule):
         prot_emb[:, 0] = self.prot_bos_token.to(prot_emb.dtype).expand(B, -1)    # [B, d_prot]
         ankh_emb[:, 0] = self.ankh_bos_token.to(ankh_emb.dtype).expand(B, -1)    # [B, d_ankh]
         pglm_emb[:, 0] = self.pglm_bos_token.to(pglm_emb.dtype).expand(B, -1)    # [B, d_pglm]
-        progen2_emb[:, 0] = self.progen2_bos_token.to(progen2_emb.dtype).expand(B, -1)  # [B, d_progen2]
+        
+
         
         # Insert EOS tokens at position L+1
         for i, length in enumerate(lengths):
@@ -732,13 +614,8 @@ class ProteinLitModule(LightningModule):
                 prot_emb[i, eos_pos] = self.prot_eos_token.to(prot_emb.dtype).squeeze()    # [d_prot]
                 ankh_emb[i, eos_pos] = self.ankh_eos_token.to(ankh_emb.dtype).squeeze()    # [d_ankh]
                 pglm_emb[i, eos_pos] = self.pglm_eos_token.to(pglm_emb.dtype).squeeze()    # [d_pglm]
-                progen2_emb[i, eos_pos] = self.progen2_eos_token.to(progen2_emb.dtype).squeeze()  # [d_progen2]
         
-        # Remove BOS tokens from MSA input for conservation head (zero out position 0)
-        msa_emb = msa_emb.clone()  # Clone to avoid inplace modification of inference tensor
-        msa_emb[:, :, 0] = 0.0  # Zero out BOS position for all sequences in MSA
-        
-        # Create mask for MSA encoder: mask BOS position (0) and ensure EOS positions are masked
+        # Create mask for pooling that masks BOS/EOS positions
         msa_encoder_mask = pad_mask.clone()
         msa_encoder_mask[:, 0] = True  # Mask out BOS position for MSA encoder (padding=True)
         
@@ -748,29 +625,22 @@ class ProteinLitModule(LightningModule):
             if eos_pos < msa_encoder_mask.size(1):  # Safety check
                 msa_encoder_mask[i, eos_pos] = True  # Mask out EOS position for MSA encoder
         
-        # Encode MSA with appropriate masks
-        msa_z = self.msa_encoder(msa_emb, pad_mask=msa_encoder_mask, seq_pad=seq_pad)  # [B, L, d]
-        
-        # After MSA encoder, insert learnable BOS/EOS tokens in the MSA representation
-        # Insert BOS tokens at position 0
-        msa_z[:, 0] = self.msa_bos_token.to(msa_z.dtype).expand(B, -1)  # [B, d_msa]
-        
-        # Insert EOS tokens at position L+1
-        for i, length in enumerate(lengths):
-            eos_pos = length + 1
-            if eos_pos < msa_z.size(1):  # Safety check
-                msa_z[i, eos_pos] = self.msa_eos_token.to(msa_z.dtype).squeeze()  # [d_msa]
+        # Encode each modality with appropriate masks
+        # Sequence stream: ESM-C + ProtT5
+        seq_z = self.seq_encoder(seq_emb, prot_emb, pad_mask=pad_mask)  # [B, L, 768]
+        # Replace MSA stream with PGLM embeddings (BOS/EOS already inserted above)
+        msa_z = pglm_emb
 
-        # Trimodal fusion per group
-        group_a_z = self.group_a_fuser(ankh_emb, prot_emb, seq_emb, pad_mask=pad_mask)  # [B, L, 768]
-        group_b_z = self.group_b_fuser(msa_z, pglm_emb, progen2_emb, pad_mask=pad_mask) # [B, L, 768]
+        # Apply PGLM+Ankh cross-modal fusion
+        msa_ankh_z = self.msa_ankh_encoder(msa_z, ankh_emb, pad_mask=pad_mask)  # [B, L, 768]
 
-        # Cross-modal attention with padding masks between the two fused streams
-        group_a_z, group_b_z = self.cross_attn(group_a_z, group_b_z, pad_mask, pad_mask)  # each [B, L, d]
+        # Cross-modal attention with padding masks between the two streams
+        # seq_z contains ESM-C + ProtT5 fusion, msa_ankh_z contains PGLM + Ankh fusion
+        seq_z, msa_ankh_z = self.cross_attn(seq_z, msa_ankh_z, pad_mask, pad_mask)  # each [B, L, d]
 
         # Use masked mean pooling (exclude BOS/EOS tokens)
-        seq_pool = masked_mean_pooling(group_a_z, msa_encoder_mask)  # [B, d] - Group A
-        msa_ankh_pool = masked_mean_pooling(group_b_z, msa_encoder_mask)  # [B, d] - Group B
+        seq_pool = masked_mean_pooling(seq_z, msa_encoder_mask)  # [B, d] - ESM-C + ProtT5 stream
+        msa_ankh_pool = masked_mean_pooling(msa_ankh_z, msa_encoder_mask)  # [B, d] - PGLM + Ankh stream
 
         # Use AttentionFusion between the two streams
         fused = self.fusion(seq_pool, msa_ankh_pool)    # [B, d]

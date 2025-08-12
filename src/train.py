@@ -11,6 +11,11 @@ from omegaconf import DictConfig
 # import os, pathlib, subprocess
 # cutlass_dir = pathlib.Path.home() / "cutlass"        # ~/.cutlass also fine
 # os.environ["CUTLASS_PATH"] = str(cutlass_dir)        # inherit to all children
+# ── Safe unpickling allowlist for PyTorch >= 2.6 ────────────────────────────────
+from omegaconf import DictConfig as _DC, ListConfig as _LC
+import torch.serialization as _ts
+_ts.add_safe_globals([_DC, _LC])
+
 
 rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 # ------------------------------------------------------------------------------------ #
