@@ -319,7 +319,7 @@ class ProteinLitModule(LightningModule):
         d_model: int = 1152,                  # Base model dimension
         d_prot: int = 128,                    # Protein embedding dimension (unused; using ProtT5 instead)
         d_ankh: int = 1024,                   # Ankh3-Large embedding dimension
-        d_msa: int = 1536,                    # PGLM embedding dimension
+        d_pglm: int = 1536,                    # PGLM embedding dimension
         n_cross_layers: int = 2,              # Cross-attention layers
         n_heads: int = 8,                     # Attention heads
         dropout: float = 0.1,                 # Dropout rate
@@ -355,8 +355,8 @@ class ProteinLitModule(LightningModule):
         nn.init.normal_(self.ankh_eos_token, std=0.02)
         
         # PGLM tokens (use d_msa argument to represent pglm embedding dim)
-        self.pglm_bos_token = nn.Parameter(torch.zeros(1, d_msa))
-        self.pglm_eos_token = nn.Parameter(torch.zeros(1, d_msa))
+        self.pglm_bos_token = nn.Parameter(torch.zeros(1, d_pglm))
+        self.pglm_eos_token = nn.Parameter(torch.zeros(1, d_pglm))
         nn.init.normal_(self.pglm_bos_token, std=0.02)
         nn.init.normal_(self.pglm_eos_token, std=0.02)
         
@@ -371,7 +371,7 @@ class ProteinLitModule(LightningModule):
         )
         # Second stream: PGLM + Ankh fusion
         self.pglm_ankh_encoder = PGLMAnkhCrossModalFusion(
-            d_pglm=d_msa,  # d_msa arg represents pglm dim
+            d_pglm=d_pglm,  # d_msa arg represents pglm dim
             d_ankh=d_ankh,
             d_out=768,
             dropout=dropout,
