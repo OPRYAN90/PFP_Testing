@@ -12,13 +12,14 @@ d_pglm: 1536                    # XTrimoPGLM embedding dimension (matches pglm_e
 
 # Training parameters  
 warmup_ratio: 0.01     # Warmup ratio for cosine schedule (1% of total training steps)
+# Learning rates for parameter groups (used inside module's optimizer setup)
+lr_main: 1e-4          # LR for fusion/head/cross-attn/etc.
+lr_plm: 1e-4           # LR for LoRA params inside PLMs
 
 # Optimizer configuration
 optimizer:
   _target_: torch.optim.AdamW
   _partial_: true
-  lr: 1e-4             # IMPORTANT: Adjust learning rate based on task type
-  weight_decay: 1e-2   # L2 regularization 
   betas: [0.9, 0.999]  # AdamW momentum parameters
   eps: 1e-8            # Numerical stability epsilon
 
@@ -28,3 +29,11 @@ scheduler:
   _partial_: true      # Hydra will provide missing arguments (optimizer, num_training_steps, num_warmup_steps)
   num_cycles: 0.5      # Single half-cosine (default and most common choice)
   last_epoch: -1       # Start from beginning (-1 means start fresh)
+
+# LoRA configuration (matches ProteinLitModule defaults)
+lora_r: 8
+lora_alpha: 16
+lora_dropout: 0.05
+lora_include_out: true     # adapt attention out-proj in ESM++
+lora_include_ffn: true     # adapt FFN up/down in ESM++
+lora_t5_include_o: false   # usually off for ProtT5

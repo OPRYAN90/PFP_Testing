@@ -13,6 +13,7 @@ import torch.nn.functional as F
 
 # swap ESM-C SDK for ESM++ (HF-style, grad-friendly)
 from transformers import AutoTokenizer, T5EncoderModel, AutoModelForMaskedLM
+from peft import LoraConfig, get_peft_model, TaskType
 
 from lightning import LightningModule
 from torchmetrics import MeanMetric
@@ -26,6 +27,42 @@ def get_num_classes_for_task(task_type: str) -> int:
     """Get number of classes for a task type."""
     class_counts = {"mf": 489, "bp": 1943, "cc": 320}
     return class_counts[task_type]
+
+# -----------------------------------------------------------------------------
+# LoRA verification utilities
+# -----------------------------------------------------------------------------
+def count_hits(model: nn.Module, needle: str) -> int:
+    return sum(1 for name, _ in model.named_modules() if needle in name)
+
+def assert_all_layers(
+    esmpp: nn.Module,
+    prott5: nn.Module,
+    n_esm_layers: int = 36,
+    n_t5_layers: int = 24,
+    include_out: bool = True,
+    include_ffn: bool = True,
+    include_o: bool = False,
+) -> None:
+    # ESM++
+    qkv = count_hits(esmpp, "attn.layernorm_qkv.1.lora_A")
+    print("ESM++ QKV LoRA blocks:", qkv, f"(expected {n_esm_layers})")
+    if include_out:
+        outp = count_hits(esmpp, "attn.out_proj.lora_A")
+        print("ESM++ out_proj LoRA blocks:", outp, f"(expected {n_esm_layers})")
+    if include_ffn:
+        up = count_hits(esmpp, "ffn.1.lora_A")
+        dn = count_hits(esmpp, "ffn.3.lora_A")
+        print("ESM++ FFN up LoRA blocks:", up, f"(expected {n_esm_layers})")
+        print("ESM++ FFN dn LoRA blocks:", dn, f"(expected {n_esm_layers})")
+
+    # ProtT5
+    k = count_hits(prott5, ".SelfAttention.k.lora_A")
+    v = count_hits(prott5, ".SelfAttention.v.lora_A")
+    print("ProtT5 K LoRA blocks:", k, f"(expected {n_t5_layers})")
+    print("ProtT5 V LoRA blocks:", v, f"(expected {n_t5_layers})")
+    if include_o:
+        o = count_hits(prott5, ".SelfAttention.o.lora_A")
+        print("ProtT5 O LoRA blocks:", o, f"(expected {n_t5_layers})")
 
 class SwiGLU(nn.Module):
     def __init__(self, d_in, d_hidden):
@@ -284,7 +321,7 @@ class ProteinLitModule(LightningModule):
         self,
         task_type: str,                       # Task type: "mf", "bp", or "cc" - required
         d_model: int = 1152,                  # Base model dimension
-        d_prot: int = 128,                    # Protein embedding dimension (unused; using ProtT5 instead)
+        d_prot: int = 1024,                   # ProtT5 hidden size (XL UniRef50 = 1024)
         d_ankh: int = 1024,                   # Ankh3-Large embedding dimension
         d_pglm: int = 1536,                    # PGLM embedding dimension
         n_cross_layers: int = 2,              # Cross-attention layers
@@ -293,8 +330,15 @@ class ProteinLitModule(LightningModule):
         optimizer: Optional[Any] = None,      # Hydra optimizer config
         scheduler: Optional[Any] = None,      # Hydra scheduler config  
         warmup_ratio: float = 0.05,           # Warmup ratio for cosine schedule (5% of total training steps)
-        lr_main: float = 1e-4,                # LR for non-PLM params (fusion, heads, etc.)
-        lr_plm: float = 1e-5,                 # LR for PLM params (ESM-C, ProtT5)
+        lr_main: float = 1e-4,                # LR for fusion/head params (LoRA pairs well with higher LR here)
+        lr_plm: float = 1e-4,                 # LR for LoRA params inside PLMs
+        # --- LoRA knobs (best-practice defaults) ---
+        lora_r: int = 8,
+        lora_alpha: int = 16,
+        lora_dropout: float = 0.05,
+        lora_include_out: bool = True,        # adapt attention out-proj too
+        lora_include_ffn: bool = True,        # adapt FFN up/down projections
+        lora_t5_include_o: bool = False,      # usually keep T5 'o' off; turn on if you want
     ) -> None:
         super().__init__()
         self.save_hyperparameters(logger=True)
@@ -309,7 +353,38 @@ class ProteinLitModule(LightningModule):
         )
         self.prot_tokenizer = AutoTokenizer.from_pretrained("Rostlab/prot_t5_xl_uniref50", do_lower_case=False, use_fast=False)
         self.prot_model = T5EncoderModel.from_pretrained("Rostlab/prot_t5_xl_uniref50")
-        # PLMs are trainable (fine-tuning implementation)
+        # --- Attach LoRA adapters to *all* encoder layers (validated names) ---
+        self.esmpp_model = self._attach_lora_exact(
+            self.esmpp_model,
+            targets=(["attn.layernorm_qkv.1"] +
+                     (["attn.out_proj"] if self.hparams.lora_include_out else []) +
+                     (["ffn.1", "ffn.3"] if self.hparams.lora_include_ffn else [])),
+            r=self.hparams.lora_r,
+            alpha=self.hparams.lora_alpha,
+            dropout=self.hparams.lora_dropout,
+        )
+        self.prot_model = self._attach_lora_exact(
+            self.prot_model,
+            targets=(["k", "v"] + (["o"] if self.hparams.lora_t5_include_o else [])),
+            r=self.hparams.lora_r,
+            alpha=self.hparams.lora_alpha,
+            dropout=self.hparams.lora_dropout,
+        )
+
+        # Verify LoRA attachments across all targeted layers
+        try:
+            assert_all_layers(
+                self.esmpp_model,
+                self.prot_model,
+                n_esm_layers=36,
+                n_t5_layers=24,
+                include_out=self.hparams.lora_include_out,
+                include_ffn=self.hparams.lora_include_ffn,
+                include_o=self.hparams.lora_t5_include_o,
+            )
+        except Exception as e:
+            print(f"LoRA verification failed with error: {e}")
+ 
         
         # NOTE: MSA model removed; MSA tokens may still be passed but are unused
         
@@ -636,11 +711,31 @@ class ProteinLitModule(LightningModule):
             if len(param_groups) >= 2:
                 self.log("lr_initial/plm", float(param_groups[0]["lr"]), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
                 self.log("lr_initial/main", float(param_groups[1]["lr"]), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
+    
+    # --- NEW: LoRA attachment helper with exact target substrings ---
+    def _attach_lora_exact(self, model: nn.Module, targets: List[str], r: int, alpha: int, dropout: float) -> nn.Module:
+        # Freeze base weights; only LoRA layers train
+        for p in model.parameters():
+            p.requires_grad = False
+        cfg = LoraConfig(
+            r=r,
+            lora_alpha=alpha,
+            lora_dropout=dropout,
+            bias="none",
+            target_modules=targets,
+            task_type=TaskType.FEATURE_EXTRACTION,
+        )
+        wrapped = get_peft_model(model, cfg)
+        try:
+            wrapped.print_trainable_parameters()
+        except Exception:
+            print("Failed to print trainable parameters")
+        return wrapped
        
     def configure_optimizers(self):
         if self.hparams.optimizer is None:
             raise ValueError("Optimizer must be provided in hparams")
-        # Two-LR param groups: PLMs vs main
+        # Two groups: (0) LoRA params inside PLMs, (1) fusion/head/etc.
         plm_params, main_params = [], []
         for name, p in self.named_parameters():
             if not p.requires_grad:
@@ -650,8 +745,8 @@ class ProteinLitModule(LightningModule):
             else:
                 main_params.append(p)
         param_groups = [
-            {"params": plm_params, "lr": float(self.hparams.lr_plm)},
-            {"params": main_params, "lr": float(self.hparams.lr_main)},
+            {"params": plm_params, "lr": float(self.hparams.lr_plm),  "weight_decay": 0.0},
+            {"params": main_params, "lr": float(self.hparams.lr_main), "weight_decay": 0.01},
         ]
         optimizer = self.hparams.optimizer(params=param_groups)
 
