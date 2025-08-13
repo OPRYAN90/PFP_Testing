@@ -11,6 +11,8 @@ import torch.nn.functional as F
 # from utils.flash_control import maybe_enable_flash_attention  
 # maybe_enable_flash_attention(True)
 
+# swap ESM-C SDK for ESM++ (HF-style, grad-friendly)
+from transformers import AutoTokenizer, T5EncoderModel, AutoModelForMaskedLM
 
 from lightning import LightningModule
 from torchmetrics import MeanMetric
@@ -162,16 +164,15 @@ class CrossAttentionFusionTwoModalities(nn.Module):
         
         return self.norm(mixed)
 
-class CrossAttentionMultiModalFusion(nn.Module):
+class CrossAttentionTwoStreamFusion(nn.Module):
     """
-    Cross-attention fusion for two modalities in the sequence stream:
-    - ESM-C sequence embeddings
-    - ProtT5-BFD residue embeddings
+    Generic cross-attention fusion for two token-aligned streams.
+    Inputs can be any pair of modalities (e.g., ESM↔Ankh, ProtT5↔PGLM).
     """
     
     def __init__(self,
-                 d_esm: int = 1152,
-                 d_prot: int = 128,
+                 d_in1: int = 1152,
+                 d_in2: int = 1024,
                  d_out: int = 768,
                  dropout: float = 0.1,
                  n_heads: int = 8):
@@ -179,86 +180,52 @@ class CrossAttentionMultiModalFusion(nn.Module):
         self.d_out = d_out
         
         # Normalization layers
-        self.ln_esm = nn.LayerNorm(d_esm)
-        self.ln_prot = nn.LayerNorm(d_prot)
+        self.ln_in1 = nn.LayerNorm(d_in1)
+        self.ln_in2 = nn.LayerNorm(d_in2)
         
         # Projection layers
-        self.proj_esm = nn.Linear(d_esm, d_out)
-        self.proj_prot = nn.Linear(d_prot, d_out)
+        self.proj_in1 = nn.Linear(d_in1, d_out)
+        self.proj_in2 = nn.Linear(d_in2, d_out)
         
-        # Cross-attention fusion (modified to handle 2 modalities)
+        # Cross-attention fusion (two-way with gating)
         self.fusion = CrossAttentionFusionTwoModalities(d_out, dropout, n_heads)
         
         self.dropout = nn.Dropout(dropout)
     
-    def forward(self, esm_emb, prot_emb, pad_mask=None, lengths=None):
+    def forward(self, emb1, emb2, pad_mask=None, lengths=None):
         # Normalize and project
-        esm_proj = self.proj_esm(self.ln_esm(esm_emb))      # [B, L, d_out]
-        prot_proj = self.proj_prot(self.ln_prot(prot_emb))  # [B, L, d_out]
+        emb1_proj = self.proj_in1(self.ln_in1(emb1))  # [B, L, d_out]
+        emb2_proj = self.proj_in2(self.ln_in2(emb2))  # [B, L, d_out]
         
         # Apply cross-attention fusion
-        fused = self.fusion(esm_proj, prot_proj, pad_mask)
+        fused = self.fusion(emb1_proj, emb2_proj, pad_mask)
         
         return self.dropout(fused).masked_fill(pad_mask.unsqueeze(-1), 0.0)
 
 # Drop-in replacement for your current SequenceEncoder
 class CrossAttentionSequenceEncoder(nn.Module):
     def __init__(self,
-                 d_model: int = 1152,
-                 d_prot: int = 128,
+                 d_in1: int = 1152,
+                 d_in2: int = 1024,
                  d_out: int = 768,
                  dropout: float = 0.1,
                  n_heads: int = 8):
         super().__init__()
         
-        self.fusion = CrossAttentionMultiModalFusion(
-            d_esm=d_model,
-            d_prot=d_prot, 
+        self.fusion = CrossAttentionTwoStreamFusion(
+            d_in1=d_in1,
+            d_in2=d_in2,
             d_out=d_out,
             dropout=dropout,
             n_heads=n_heads
         )
     
-    def forward(self, x, prot_emb, pad_mask=None, lengths=None):
-        return self.fusion(x, prot_emb, pad_mask)
+    def forward(self, emb1, emb2, pad_mask=None, lengths=None):
+        return self.fusion(emb1, emb2, pad_mask)
 
 
-class PGLMAnkhCrossModalFusion(nn.Module):
-    """
-    Cross-attention fusion for PGLM embeddings and Ankh embeddings (auxiliary stream).
-    """
-
-    def __init__(self,
-                 d_pglm: int = 1536,
-                 d_ankh: int = 1024,
-                 d_out: int = 768,
-                 dropout: float = 0.1,
-                 n_heads: int = 8):
-        super().__init__()
-        self.d_out = d_out
-        
-        # Normalization layers
-        self.ln_pglm = nn.LayerNorm(d_pglm)
-        self.ln_ankh = nn.LayerNorm(d_ankh)
-        
-        # Projection layers
-        self.proj_pglm = nn.Linear(d_pglm, d_out)
-        self.proj_ankh = nn.Linear(d_ankh, d_out)
-        
-        # Cross-attention fusion
-        self.fusion = CrossAttentionFusionTwoModalities(d_out, dropout, n_heads)
-        
-        self.dropout = nn.Dropout(dropout)
-    
-    def forward(self, pglm_emb, ankh_emb, pad_mask=None, lengths=None):
-        # Normalize and project
-        pglm_proj = self.proj_pglm(self.ln_pglm(pglm_emb))      # [B, L, d_out]
-        ankh_proj = self.proj_ankh(self.ln_ankh(ankh_emb))      # [B, L, d_out]
-        
-        # Apply cross-attention fusion
-        fused = self.fusion(pglm_proj, ankh_proj, pad_mask)
-        
-        return self.dropout(fused).masked_fill(pad_mask.unsqueeze(-1), 0.0)
+# NOTE: The specialized Prot/PGLM fusion has been unified into the generic
+# CrossAttentionTwoStreamFusion via CrossAttentionSequenceEncoder.
 
 ############################################################
 #  Dual-stream cross-attention fusion
@@ -326,12 +293,23 @@ class ProteinLitModule(LightningModule):
         optimizer: Optional[Any] = None,      # Hydra optimizer config
         scheduler: Optional[Any] = None,      # Hydra scheduler config  
         warmup_ratio: float = 0.05,           # Warmup ratio for cosine schedule (5% of total training steps)
+        lr_main: float = 1e-4,                # LR for non-PLM params (fusion, heads, etc.)
+        lr_plm: float = 1e-5,                 # LR for PLM params (ESM-C, ProtT5)
     ) -> None:
         super().__init__()
         self.save_hyperparameters(logger=True)
 
         # Store task type for easy access
         self.task_type = task_type
+        
+        # Initialize embedding models
+        # Replace ESM-C helpers with ESM++ (HF). Hidden size = 1152 (large).
+        self.esmpp_model = AutoModelForMaskedLM.from_pretrained(
+            "Synthyra/ESMplusplus_large", trust_remote_code=True
+        )
+        self.prot_tokenizer = AutoTokenizer.from_pretrained("Rostlab/prot_t5_xl_uniref50", do_lower_case=False, use_fast=False)
+        self.prot_model = T5EncoderModel.from_pretrained("Rostlab/prot_t5_xl_uniref50")
+        # PLMs are trainable (fine-tuning implementation)
         
         # NOTE: MSA model removed; MSA tokens may still be passed but are unused
         
@@ -342,9 +320,9 @@ class ProteinLitModule(LightningModule):
         nn.init.normal_(self.esm_bos_token, std=0.02)
         nn.init.normal_(self.esm_eos_token, std=0.02)
         
-        # Protein tokens (now used for ProtT5-BFD embeddings)
-        self.prot_bos_token = nn.Parameter(torch.zeros(1, 1024))  # ProtT5-BFD dim
-        self.prot_eos_token = nn.Parameter(torch.zeros(1, 1024))  # ProtT5-BFD dim
+        # Protein tokens (now used for ProtT5-uniref50 embeddings)
+        self.prot_bos_token = nn.Parameter(torch.zeros(1, d_prot))  # ProtT5-uniref50 dim
+        self.prot_eos_token = nn.Parameter(torch.zeros(1, d_prot))  # ProtT5-uniref50 dim
         nn.init.normal_(self.prot_bos_token, std=0.02)
         nn.init.normal_(self.prot_eos_token, std=0.02)
         
@@ -361,18 +339,18 @@ class ProteinLitModule(LightningModule):
         nn.init.normal_(self.pglm_eos_token, std=0.02)
         
         # Encoders
-        # Sequence stream: fuse ESM-C with ProtT5
+        # Sequence stream: fuse ESM-C with Ankh
         self.seq_encoder = CrossAttentionSequenceEncoder(
-            d_model=d_model,
-            d_prot=1024,  # ProtT5-BFD dim
+            d_in1=d_model,
+            d_in2=d_ankh,
             d_out=768,
             dropout=dropout,
             n_heads=n_heads
         )
-        # Second stream: PGLM + Ankh fusion
-        self.pglm_ankh_encoder = PGLMAnkhCrossModalFusion(
-            d_pglm=d_pglm,  # d_msa arg represents pglm dim
-            d_ankh=d_ankh,
+        # Second stream: ProtT5 + PGLM fusion (generic two-stream)
+        self.prot_pglm_encoder = CrossAttentionSequenceEncoder(
+            d_in1=1024,
+            d_in2=d_pglm,
             d_out=768,
             dropout=dropout,
             n_heads=n_heads
@@ -412,6 +390,51 @@ class ProteinLitModule(LightningModule):
         """No-op setup (MSA has been fully removed)."""
         return
 
+    def compute_esmc_embeddings(self, sequences: List[str]) -> torch.Tensor:
+        """Compute ESM++ embeddings for a batch (grad-connected).
+        Shape: [B, L_max, 1152]; we build a [CLS, x1..xL, EOS] frame and pad."""
+        max_len = max(len(s) for s in sequences) + 2  # +2 for CLS/EOS
+        tok = self.esmpp_model.tokenizer(
+            sequences, padding=True, return_tensors="pt"
+        )
+        tok = {k: v.to(self.device) for k, v in tok.items()}
+        out = self.esmpp_model(**tok)
+        hs = out.last_hidden_state  # [B, L_tok, 1152], attached to backbone
+        batch_embeddings: List[torch.Tensor] = []
+        for i, seq in enumerate(sequences):
+            L = len(seq)
+            emb = torch.zeros(L + 2, 1152, dtype=hs.dtype, device=hs.device)
+            emb[1:L+1] = hs[i, 1:L+1]                    # place only residues
+            # EOS slot (L+1) left zeros; learnable EOS gets inserted later
+            if emb.size(0) < max_len:
+                emb = F.pad(emb, (0, 0, 0, max_len - emb.size(0)), value=0.0)
+            batch_embeddings.append(emb)
+        return torch.stack(batch_embeddings)           # [B, L_max, 1152]
+   
+    def compute_prot_embeddings(self, sequences: List[str]) -> torch.Tensor:
+        """Compute ProtT5 embeddings for a batch of sequences.
+        Returns: [B, L_max, 1024] with padding
+        """
+        # Batched tokenization for speed; gradients flow through ProtT5
+        max_len = max(len(seq) for seq in sequences) + 2  # +2 for BOS/EOS slots
+        spaced = [" ".join(s) for s in sequences]
+        enc = self.prot_tokenizer(spaced, return_tensors="pt", padding=True, add_special_tokens=True)
+        enc = {k: v.to(self.device) for k, v in enc.items()}
+        hs = self.prot_model(**enc).last_hidden_state  # [B, L_tok, 1024]; T5 adds EOS at end
+        # Drop the trailing EOS per sample; reserve [0] for BOS and [L+1] for EOS
+        batch_embeddings: List[torch.Tensor] = []
+        for i, seq in enumerate(sequences):
+            L = len(seq)
+            # T5 encoder inputs are [x1..xL, EOS] (no CLS). Keep only residues.
+            body = hs[i, : L]                           # [L, 1024]
+            emb = torch.zeros(L + 2, 1024, dtype=hs.dtype, device=hs.device)
+            emb[1 : L + 1] = body                       # residues at positions 1..L
+            # emb[0] and emb[L+1] remain zeros; learnable BOS/EOS inserted later
+            if emb.size(0) < max_len:
+                emb = F.pad(emb, (0, 0, 0, max_len - emb.size(0)), value=0)
+            batch_embeddings.append(emb)
+        return torch.stack(batch_embeddings)
+
     # ---------------------------------------------------------------------
     #  Forward pass
     # ---------------------------------------------------------------------
@@ -424,10 +447,13 @@ class ProteinLitModule(LightningModule):
         - This allows each modality to learn optimal start/end representations
         """
         # Extract inputs - all embeddings are pre-computed
-        seq_emb = batch["sequence_emb"]  # Pre-computed ESM-C: [B, L, d_model]
-        prot_emb = batch["prot_emb"]     # Pre-computed protein: [B, L, d_prot]
+        sequences = batch["sequence"]    # List of sequences
         ankh_emb = batch["ankh_emb"]     # Pre-computed Ankh3-Large: [B, L, d_ankh]
         pglm_emb = batch["pglm_emb"]     # Pre-computed PGLM: [B, L, d_pglm]
+        
+        # Compute embeddings on-the-fly
+        seq_emb = self.compute_esmc_embeddings(sequences)  # [B, L, 1152]
+        prot_emb = self.compute_prot_embeddings(sequences) # [B, L, 1024]
 
         pad_mask = batch["pad_mask"]     # [B, L] - True where padded
         # no sequence-of-sequences mask needed (no MSA)
@@ -466,22 +492,22 @@ class ProteinLitModule(LightningModule):
                 pool_mask[i, eos_pos] = True  # Mask out EOS position
         
         # Encode each modality with appropriate masks
-        # Sequence stream: ESM-C + ProtT5
-        seq_z = self.seq_encoder(seq_emb, prot_emb, pad_mask=pad_mask)  # [B, L, 768]
+        # Sequence stream: ESM++ + Ankh
+        seq_z = self.seq_encoder(seq_emb, ankh_emb, pad_mask=pad_mask)  # [B, L, 768]
 
-        # Apply PGLM+Ankh cross-modal fusion
-        msa_ankh_z = self.pglm_ankh_encoder(pglm_emb, ankh_emb, pad_mask=pad_mask)  # [B, L, 768]
+        # Apply ProtT5 + PGLM cross-modal fusion
+        prot_pglm_z = self.prot_pglm_encoder(prot_emb, pglm_emb, pad_mask=pad_mask)  # [B, L, 768]
 
         # Cross-modal attention with padding masks between the two streams
-        # seq_z contains ESM-C + ProtT5 fusion, msa_ankh_z contains PGLM + Ankh fusion
-        seq_z, msa_ankh_z = self.cross_attn(seq_z, msa_ankh_z, pad_mask, pad_mask)  # each [B, L, d]
+        # seq_z contains ESM++ + Ankh fusion, prot_pglm_z contains ProtT5 + PGLM fusion
+        seq_z, prot_pglm_z = self.cross_attn(seq_z, prot_pglm_z, pad_mask, pad_mask)  # each [B, L, d]
 
         # Use masked mean pooling (exclude BOS/EOS tokens)
-        seq_pool = masked_mean_pooling(seq_z, pool_mask)  # [B, d] - ESM-C + ProtT5 stream
-        msa_ankh_pool = masked_mean_pooling(msa_ankh_z, pool_mask)  # [B, d] - PGLM + Ankh stream
+        seq_pool = masked_mean_pooling(seq_z, pool_mask)  # [B, d] - ESM++ + Ankh stream
+        aux_pool = masked_mean_pooling(prot_pglm_z, pool_mask)  # [B, d] - ProtT5 + PGLM stream
 
         # Use AttentionFusion between the two streams
-        fused = self.fusion(seq_pool, msa_ankh_pool)    # [B, d]
+        fused = self.fusion(seq_pool, aux_pool)    # [B, d]
         
         logits = self.head(fused)                  # [B, C]
         
@@ -505,6 +531,26 @@ class ProteinLitModule(LightningModule):
         self.log("train/loss_step", loss, on_step=True, prog_bar=True, sync_dist=True)
 
         return loss
+
+    def on_train_batch_end(self, outputs, batch, batch_idx: int) -> None:
+        """Log learning rates for PLM and non-PLM parameter groups every step.
+
+        Group 0: PLM params (e.g., ESM++, ProtT5)
+        Group 1: Main params (fusion layers, heads, etc.)
+        """
+        if not self.trainer.optimizers:
+            return
+        optimizer = self.trainer.optimizers[0]
+        param_groups = getattr(optimizer, "param_groups", [])
+        if len(param_groups) >= 2:
+            plm_lr = float(param_groups[0]["lr"])
+            main_lr = float(param_groups[1]["lr"])
+            self.log("lr/plm", plm_lr, on_step=True, prog_bar=True, sync_dist=True)
+            self.log("lr/main", main_lr, on_step=True, prog_bar=True, sync_dist=True)
+        elif len(param_groups) == 1:
+            # Fallback if only one group exists
+            group0_lr = float(param_groups[0]["lr"])
+            self.log("lr/group0", group0_lr, on_step=True, prog_bar=True, sync_dist=True)
 
     def validation_step(self, batch: Dict[str, Any], batch_idx: int):
         logits, labels = self.forward(batch)
@@ -570,14 +616,44 @@ class ProteinLitModule(LightningModule):
         self.val_loss.reset()
         self._val_logits.clear()
         self._val_labels.clear()
+        # Log parameter group sizes and initial learning rates for verification
+        plm_params, main_params = [], []
+        for name, p in self.named_parameters():
+            if not p.requires_grad:
+                continue
+            if name.startswith("esmpp_model") or name.startswith("prot_model"):
+                plm_params.append(p)
+            else:
+                main_params.append(p)
+        num_plm = sum(p.numel() for p in plm_params)
+        num_main = sum(p.numel() for p in main_params)
+        self.log("params/num_plm_params", float(num_plm), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("params/num_main_params", float(num_main), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
+        # If optimizer is initialized, log initial LRs
+        if self.trainer and self.trainer.optimizers:
+            optimizer = self.trainer.optimizers[0]
+            param_groups = getattr(optimizer, "param_groups", [])
+            if len(param_groups) >= 2:
+                self.log("lr_initial/plm", float(param_groups[0]["lr"]), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
+                self.log("lr_initial/main", float(param_groups[1]["lr"]), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
        
     def configure_optimizers(self):
         if self.hparams.optimizer is None:
             raise ValueError("Optimizer must be provided in hparams")
-
-        trainable_params = [p for p in self.parameters() if p.requires_grad]
-
-        optimizer = self.hparams.optimizer(params=trainable_params)
+        # Two-LR param groups: PLMs vs main
+        plm_params, main_params = [], []
+        for name, p in self.named_parameters():
+            if not p.requires_grad:
+                continue
+            if name.startswith("esmpp_model") or name.startswith("prot_model"):
+                plm_params.append(p)
+            else:
+                main_params.append(p)
+        param_groups = [
+            {"params": plm_params, "lr": float(self.hparams.lr_plm)},
+            {"params": main_params, "lr": float(self.hparams.lr_main)},
+        ]
+        optimizer = self.hparams.optimizer(params=param_groups)
 
         if self.hparams.scheduler is not None:
             # Get total steps

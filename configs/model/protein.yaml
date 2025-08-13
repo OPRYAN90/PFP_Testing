@@ -7,7 +7,7 @@ n_heads: 8             # Attention heads for all transformer layers
 dropout: 0.15          # General dropout rate for model components
 task_type: ${data.task_type}         # Task type: "mf", "bp", or "cc" - automatically from data config
 d_prot: 1024                    # ProtT5-BFD embedding dimension
-d_ankh: 1024                    # Ankh3-Large embedding dimension (matches ankh_emb.pt)
+d_ankh: 2560                    # Ankh3-Large embedding dimension (matches ankh_emb.pt)
 d_pglm: 1536                    # XTrimoPGLM embedding dimension (matches pglm_emb.pt)
 
 # Training parameters  
