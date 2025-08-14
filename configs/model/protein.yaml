@@ -8,7 +8,7 @@ dropout: 0.15          # General dropout rate for model components
 task_type: ${data.task_type}         # Task type: "mf", "bp", or "cc" - automatically from data config
 d_prot: 1024                    # ProtT5-BFD embedding dimension
 d_ankh: 2560                    # Ankh3-Large embedding dimension (matches ankh_emb.pt)
-d_pglm: 1536                    # XTrimoPGLM embedding dimension (matches pglm_emb.pt)
+d_pglm: 2560                    # XTrimoPGLM embedding dimension (matches pglm_emb.pt)
 
 # Training parameters  
 warmup_ratio: 0.01     # Warmup ratio for cosine schedule (1% of total training steps)
@@ -36,4 +36,3 @@ lora_alpha: 16
 lora_dropout: 0.05
 lora_include_out: true     # adapt attention out-proj in ESM++
 lora_include_ffn: true     # adapt FFN up/down in ESM++
-lora_t5_include_o: false   # usually off for ProtT5

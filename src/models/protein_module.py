@@ -12,7 +12,7 @@ import torch.nn.functional as F
 # maybe_enable_flash_attention(True)
 
 # swap ESM-C SDK for ESM++ (HF-style, grad-friendly)
-from transformers import AutoTokenizer, T5EncoderModel, AutoModelForMaskedLM
+from transformers import AutoModelForMaskedLM
 from peft import LoraConfig, get_peft_model, TaskType
 
 from lightning import LightningModule
@@ -33,36 +33,6 @@ def get_num_classes_for_task(task_type: str) -> int:
 # -----------------------------------------------------------------------------
 def count_hits(model: nn.Module, needle: str) -> int:
     return sum(1 for name, _ in model.named_modules() if needle in name)
-
-def assert_all_layers(
-    esmpp: nn.Module,
-    prott5: nn.Module,
-    n_esm_layers: int = 36,
-    n_t5_layers: int = 24,
-    include_out: bool = True,
-    include_ffn: bool = True,
-    include_o: bool = False,
-) -> None:
-    # ESM++
-    qkv = count_hits(esmpp, "attn.layernorm_qkv.1.lora_A")
-    print("ESM++ QKV LoRA blocks:", qkv, f"(expected {n_esm_layers})")
-    if include_out:
-        outp = count_hits(esmpp, "attn.out_proj.lora_A")
-        print("ESM++ out_proj LoRA blocks:", outp, f"(expected {n_esm_layers})")
-    if include_ffn:
-        up = count_hits(esmpp, "ffn.1.lora_A")
-        dn = count_hits(esmpp, "ffn.3.lora_A")
-        print("ESM++ FFN up LoRA blocks:", up, f"(expected {n_esm_layers})")
-        print("ESM++ FFN dn LoRA blocks:", dn, f"(expected {n_esm_layers})")
-
-    # ProtT5
-    k = count_hits(prott5, ".SelfAttention.k.lora_A")
-    v = count_hits(prott5, ".SelfAttention.v.lora_A")
-    print("ProtT5 K LoRA blocks:", k, f"(expected {n_t5_layers})")
-    print("ProtT5 V LoRA blocks:", v, f"(expected {n_t5_layers})")
-    if include_o:
-        o = count_hits(prott5, ".SelfAttention.o.lora_A")
-        print("ProtT5 O LoRA blocks:", o, f"(expected {n_t5_layers})")
 
 class SwiGLU(nn.Module):
     def __init__(self, d_in, d_hidden):
@@ -338,7 +308,6 @@ class ProteinLitModule(LightningModule):
         lora_dropout: float = 0.05,
         lora_include_out: bool = True,        # adapt attention out-proj too
         lora_include_ffn: bool = True,        # adapt FFN up/down projections
-        lora_t5_include_o: bool = False,      # usually keep T5 'o' off; turn on if you want
     ) -> None:
         super().__init__()
         self.save_hyperparameters(logger=True)
@@ -351,8 +320,6 @@ class ProteinLitModule(LightningModule):
         self.esmpp_model = AutoModelForMaskedLM.from_pretrained(
             "Synthyra/ESMplusplus_large", trust_remote_code=True
         )
-        self.prot_tokenizer = AutoTokenizer.from_pretrained("Rostlab/prot_t5_xl_uniref50", do_lower_case=False, use_fast=False)
-        self.prot_model = T5EncoderModel.from_pretrained("Rostlab/prot_t5_xl_uniref50")
         # --- Attach LoRA adapters to *all* encoder layers (validated names) ---
         self.esmpp_model = self._attach_lora_exact(
             self.esmpp_model,
@@ -363,25 +330,20 @@ class ProteinLitModule(LightningModule):
             alpha=self.hparams.lora_alpha,
             dropout=self.hparams.lora_dropout,
         )
-        self.prot_model = self._attach_lora_exact(
-            self.prot_model,
-            targets=(["k", "v"] + (["o"] if self.hparams.lora_t5_include_o else [])),
-            r=self.hparams.lora_r,
-            alpha=self.hparams.lora_alpha,
-            dropout=self.hparams.lora_dropout,
-        )
 
         # Verify LoRA attachments across all targeted layers
         try:
-            assert_all_layers(
-                self.esmpp_model,
-                self.prot_model,
-                n_esm_layers=36,
-                n_t5_layers=24,
-                include_out=self.hparams.lora_include_out,
-                include_ffn=self.hparams.lora_include_ffn,
-                include_o=self.hparams.lora_t5_include_o,
-            )
+            # Only verify ESM++ layers since ProtT5 is now pre-computed
+            qkv = count_hits(self.esmpp_model, "attn.layernorm_qkv.1.lora_A")
+            print("ESM++ QKV LoRA blocks:", qkv, f"(expected 36)")
+            if self.hparams.lora_include_out:
+                outp = count_hits(self.esmpp_model, "attn.out_proj.lora_A")
+                print("ESM++ out_proj LoRA blocks:", outp, f"(expected 36)")
+            if self.hparams.lora_include_ffn:
+                up = count_hits(self.esmpp_model, "ffn.1.lora_A")
+                dn = count_hits(self.esmpp_model, "ffn.3.lora_A")
+                print("ESM++ FFN up LoRA blocks:", up, f"(expected 36)")
+                print("ESM++ FFN dn LoRA blocks:", dn, f"(expected 36)")
         except Exception as e:
             print(f"LoRA verification failed with error: {e}")
  
@@ -395,9 +357,9 @@ class ProteinLitModule(LightningModule):
         nn.init.normal_(self.esm_bos_token, std=0.02)
         nn.init.normal_(self.esm_eos_token, std=0.02)
         
-        # Protein tokens (now used for ProtT5-uniref50 embeddings)
-        self.prot_bos_token = nn.Parameter(torch.zeros(1, d_prot))  # ProtT5-uniref50 dim
-        self.prot_eos_token = nn.Parameter(torch.zeros(1, d_prot))  # ProtT5-uniref50 dim
+        # ProtT5 tokens (d_prot dimension) - for pre-computed embeddings
+        self.prot_bos_token = nn.Parameter(torch.zeros(1, d_prot))  # ProtT5 dim
+        self.prot_eos_token = nn.Parameter(torch.zeros(1, d_prot))  # ProtT5 dim
         nn.init.normal_(self.prot_bos_token, std=0.02)
         nn.init.normal_(self.prot_eos_token, std=0.02)
         
@@ -486,29 +448,7 @@ class ProteinLitModule(LightningModule):
             batch_embeddings.append(emb)
         return torch.stack(batch_embeddings)           # [B, L_max, 1152]
    
-    def compute_prot_embeddings(self, sequences: List[str]) -> torch.Tensor:
-        """Compute ProtT5 embeddings for a batch of sequences.
-        Returns: [B, L_max, 1024] with padding
-        """
-        # Batched tokenization for speed; gradients flow through ProtT5
-        max_len = max(len(seq) for seq in sequences) + 2  # +2 for BOS/EOS slots
-        spaced = [" ".join(s) for s in sequences]
-        enc = self.prot_tokenizer(spaced, return_tensors="pt", padding=True, add_special_tokens=True)
-        enc = {k: v.to(self.device) for k, v in enc.items()}
-        hs = self.prot_model(**enc).last_hidden_state  # [B, L_tok, 1024]; T5 adds EOS at end
-        # Drop the trailing EOS per sample; reserve [0] for BOS and [L+1] for EOS
-        batch_embeddings: List[torch.Tensor] = []
-        for i, seq in enumerate(sequences):
-            L = len(seq)
-            # T5 encoder inputs are [x1..xL, EOS] (no CLS). Keep only residues.
-            body = hs[i, : L]                           # [L, 1024]
-            emb = torch.zeros(L + 2, 1024, dtype=hs.dtype, device=hs.device)
-            emb[1 : L + 1] = body                       # residues at positions 1..L
-            # emb[0] and emb[L+1] remain zeros; learnable BOS/EOS inserted later
-            if emb.size(0) < max_len:
-                emb = F.pad(emb, (0, 0, 0, max_len - emb.size(0)), value=0)
-            batch_embeddings.append(emb)
-        return torch.stack(batch_embeddings)
+
 
     # ---------------------------------------------------------------------
     #  Forward pass
@@ -521,14 +461,14 @@ class ProteinLitModule(LightningModule):
         - BOS tokens are inserted at position 0, EOS tokens at position L+1
         - This allows each modality to learn optimal start/end representations
         """
-        # Extract inputs - all embeddings are pre-computed
+        # Extract inputs - most embeddings are pre-computed
         sequences = batch["sequence"]    # List of sequences
         ankh_emb = batch["ankh_emb"]     # Pre-computed Ankh3-Large: [B, L, d_ankh]
+        prot_emb = batch["prot_emb"]     # Pre-computed ProtT5: [B, L, d_prot]
         pglm_emb = batch["pglm_emb"]     # Pre-computed PGLM: [B, L, d_pglm]
         
-        # Compute embeddings on-the-fly
+        # Compute ESM++ embeddings on-the-fly
         seq_emb = self.compute_esmc_embeddings(sequences)  # [B, L, 1152]
-        prot_emb = self.compute_prot_embeddings(sequences) # [B, L, 1024]
 
         pad_mask = batch["pad_mask"]     # [B, L] - True where padded
         # no sequence-of-sequences mask needed (no MSA)
@@ -610,7 +550,7 @@ class ProteinLitModule(LightningModule):
     def on_train_batch_end(self, outputs, batch, batch_idx: int) -> None:
         """Log learning rates for PLM and non-PLM parameter groups every step.
 
-        Group 0: PLM params (e.g., ESM++, ProtT5)
+        Group 0: PLM params (ESM++ only)
         Group 1: Main params (fusion layers, heads, etc.)
         """
         if not self.trainer.optimizers:
@@ -696,7 +636,7 @@ class ProteinLitModule(LightningModule):
         for name, p in self.named_parameters():
             if not p.requires_grad:
                 continue
-            if name.startswith("esmpp_model") or name.startswith("prot_model"):
+            if name.startswith("esmpp_model"):
                 plm_params.append(p)
             else:
                 main_params.append(p)
@@ -735,12 +675,12 @@ class ProteinLitModule(LightningModule):
     def configure_optimizers(self):
         if self.hparams.optimizer is None:
             raise ValueError("Optimizer must be provided in hparams")
-        # Two groups: (0) LoRA params inside PLMs, (1) fusion/head/etc.
+        # Two groups: (0) LoRA params inside ESM++, (1) fusion/head/etc.
         plm_params, main_params = [], []
         for name, p in self.named_parameters():
             if not p.requires_grad:
                 continue
-            if name.startswith("esmpp_model") or name.startswith("prot_model"):
+            if name.startswith("esmpp_model"):
                 plm_params.append(p)
             else:
                 main_params.append(p)
