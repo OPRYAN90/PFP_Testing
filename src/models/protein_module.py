@@ -642,6 +642,12 @@ class ProteinLitModule(LightningModule):
                 main_params.append(p)
         num_plm = sum(p.numel() for p in plm_params)
         num_main = sum(p.numel() for p in main_params)
+        
+        # Print parameter counts to console
+        print(f"Number of PLM parameters: {num_plm:,}")
+        print(f"Number of main parameters: {num_main:,}")
+        print(f"Total trainable parameters: {num_plm + num_main:,}")
+        
         self.log("params/num_plm_params", float(num_plm), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
         self.log("params/num_main_params", float(num_main), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
         # If optimizer is initialized, log initial LRs
@@ -654,9 +660,6 @@ class ProteinLitModule(LightningModule):
     
     # --- NEW: LoRA attachment helper with exact target substrings ---
     def _attach_lora_exact(self, model: nn.Module, targets: List[str], r: int, alpha: int, dropout: float) -> nn.Module:
-        # Freeze base weights; only LoRA layers train
-        for p in model.parameters():
-            p.requires_grad = False
         cfg = LoraConfig(
             r=r,
             lora_alpha=alpha,
@@ -666,10 +669,7 @@ class ProteinLitModule(LightningModule):
             task_type=TaskType.FEATURE_EXTRACTION,
         )
         wrapped = get_peft_model(model, cfg)
-        try:
-            wrapped.print_trainable_parameters()
-        except Exception:
-            print("Failed to print trainable parameters")
+        wrapped.print_trainable_parameters()
         return wrapped
        
     def configure_optimizers(self):

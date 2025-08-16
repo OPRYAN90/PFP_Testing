@@ -3,7 +3,7 @@ _target_: src.models.protein_module.ProteinLitModule
 # Model architecture parameters
 d_model: 1152          # Base model dimension (ESM-C actual embedding size)
 n_cross_layers: 3      # Cross-modal attention layers between sequence and auxiliary streams
-n_heads: 8             # Attention heads for all transformer layers
+n_heads: 8             # Consider 12 heads 
 dropout: 0.15          # General dropout rate for model components
 task_type: ${data.task_type}         # Task type: "mf", "bp", or "cc" - automatically from data config
 d_prot: 1024                    # ProtT5-BFD embedding dimension
@@ -14,7 +14,7 @@ d_pglm: 2560                    # XTrimoPGLM embedding dimension (matches pglm_e
 warmup_ratio: 0.01     # Warmup ratio for cosine schedule (1% of total training steps)
 # Learning rates for parameter groups (used inside module's optimizer setup)
 lr_main: 1e-4          # LR for fusion/head/cross-attn/etc.
-lr_plm: 1e-4           # LR for LoRA params inside PLMs
+lr_plm: 5e-5           # LR for LoRA params inside PLMs
 
 # Optimizer configuration
 optimizer:
