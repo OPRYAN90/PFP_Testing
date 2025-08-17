@@ -7,12 +7,7 @@ task_type: "mf"
 # MF (489 classes):
 # BP (1943 classes):
 # CC (320 classes): 
-batch_size: 16         # TODO: CHANGE THIS
-
-# # --- Simple stride subsampling (every k-th element) ---
-# stride_train: 1         # Use every 1st element (no subsampling)
-# stride_val: 1           # Use every 1st element (no subsampling)  
-# stride_test: 1          # Use every 1st element (no subsampling)
+batch_size: 48         # TODO: CHANGE THIS
 
 # Data loading parameters
 num_workers: 25         #NOTE CONSIDER CHANING
