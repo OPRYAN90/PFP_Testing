@@ -412,8 +412,13 @@ class ProteinLitModule(LightningModule):
         """No-op setup (MSA has been fully removed)."""
         return
 
-
-   
+    # ---- NEW: helper to select the "shared trunk" params (exclude heads) ----
+    def _shared_params(self):
+        # Keeps it cheap: skip classifier head and SupCon projection head.
+        return tuple(
+            p for n, p in self.named_parameters()
+            if p.requires_grad and not (n.startswith("head.") or n.startswith("supcon_head."))
+        )
 
 
     # ---------------------------------------------------------------------
@@ -507,7 +512,7 @@ class ProteinLitModule(LightningModule):
     #  Lightning hooks
     # ------------------------------------------------------------------
     def training_step(self, batch: Dict[str, Any], batch_idx: int):
-        # ask for fused so we can probe grads
+        # keep want_fused=True to preserve interface; fused no longer used for grad probe
         logits, labels, z, fused = self.forward(batch, want_fused=True)
 
         loss_bce = self.loss_fn(logits, labels)
@@ -515,21 +520,59 @@ class ProteinLitModule(LightningModule):
 
         if self.hparams.supcon_on:
             loss_sup = self._supcon_loss(z, labels)
-            lam = float(self.hparams.supcon_lambda)      # e.g., 0.2
-            loss = loss_bce + lam * loss_sup
             log_dict.update({"train/supcon": loss_sup})
-            # --- NEW: gradient-norm probe on the shared trunk (no optimizer step) ---
-            # grads wrt fused for each loss (do not accumulate into .grad)
-            g_bce = torch.autograd.grad(loss_bce, fused, retain_graph=True, create_graph=False)[0]
-            g_sup = torch.autograd.grad(loss_sup, fused, retain_graph=True, create_graph=False)[0]
-            # global L2 norm (mean over batch is stable; max is also ok)
-            gn_bce = g_bce.norm(dim=-1).mean()
-            gn_sup = g_sup.norm(dim=-1).mean()
-            grad_ratio = (gn_sup / (gn_bce + 1e-12)).detach()
+
+            # ---- PARAMETER-SPACE grad probe on last shared params ----
+            shared = self._shared_params()
+
+            # grads wrt shared params (lightweight; no accumulation to .grad)
+            g_bce_params = torch.autograd.grad(
+                loss_bce, shared, retain_graph=True, allow_unused=True
+            )
+            g_sup_params = torch.autograd.grad(
+                loss_sup, shared, retain_graph=True, allow_unused=True
+            )
+
+            # global L2 norms in fp32
+            def _l2(gs):
+                acc = None
+                for g in gs:
+                    if g is None:
+                        continue
+                    v = g.detach().float().reshape(-1)
+                    acc = v if acc is None else torch.cat([acc, v], dim=0)
+                return (acc.pow(2).sum() + 1e-20).sqrt() if acc is not None else torch.tensor(0.0, device=loss_bce.device)
+
+            gn_bce = _l2(g_bce_params)
+            gn_sup = _l2(g_sup_params)
+
+            # cosine between tasks in PARAM space
+            dot = torch.tensor(0.0, device=loss_bce.device, dtype=torch.float32)
+            for a, b in zip(g_bce_params, g_sup_params):
+                if a is None or b is None:
+                    continue
+                dot = dot + (a.detach().float() * b.detach().float()).sum()
+            cos = dot / (gn_bce * gn_sup + 1e-20)
+
+            # target gradient share r_tgt := supcon_lambda (e.g., 0.20)
+            r_tgt = float(self.hparams.supcon_lambda)
+            scale = (r_tgt * gn_bce / (gn_sup + 1e-12)).clamp(0.0, 5.0).detach()
+
+            # soft conflict gate: suppress when anti-aligned
+            gate = (cos >= 0).to(cos.dtype).detach()  # binary gate: 1 if cos≥0 else 0
+
+            # combined loss with adaptive scaling + gating
+            loss = loss_bce + gate * scale * loss_sup
+
+            # logs (keep old keys stable + add a few new)
             log_dict.update({
                 "train/gn_bce": gn_bce,
                 "train/gn_sup": gn_sup,
-                "train/grad_ratio_sup_over_bce": grad_ratio,
+                "train/grad_ratio_sup_over_bce": (gn_sup / (gn_bce + 1e-12)).detach(),
+                "train/grad_cos_param": cos,
+                "train/scale": scale,
+                "train/gate": gate,
+                "train/grad_ratio_eff": (scale * (gn_sup / (gn_bce + 1e-12))).detach(),
             })
         else:
             loss = loss_bce
