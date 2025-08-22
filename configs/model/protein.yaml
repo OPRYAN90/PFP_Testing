@@ -23,15 +23,6 @@ d_pglm: 2560                    # XTrimoPGLM embedding dimension (matches pglm_e
 # Training parameters  
 warmup_ratio: 0.01     # Warmup ratio for cosine schedule (1% of total training steps)
 learning_rate: 1e-4    # Learning rate for all parameters
-
-# SupCon contrastive learning parameters
-supcon_on: true                    # Enable/disable SupCon contrastive learning
-supcon_lambda: 0.5                # Percentage of BCE loss for SupCon (0.2 = 20% of BCE loss)
-supcon_tau: 0.30                   # Temperature for contrastive learning (try 0.05–0.12)
-supcon_proj_dim: 256               # Contrastive embedding dimension
-supcon_proj_dropout: 0.10          # Dropout for SupCon projection head
-supcon_queue_size: 4096            # Memory queue size (0 disables queue)
-
 # Optimizer configuration
 optimizer:
   _target_: torch.optim.AdamW

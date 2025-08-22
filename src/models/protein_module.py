@@ -6,6 +6,7 @@ import torch.nn.functional as F
 
 from lightning import LightningModule
 from torchmetrics import MeanMetric
+from timm.loss import AsymmetricLossMultiLabel  # ASL (multi-label, logit-based)
 from data.go_utils import (
     propagate_go_preds, propagate_ec_preds,
     function_centric_aupr, cafa_fmax, smin
@@ -292,13 +293,6 @@ class ProteinLitModule(LightningModule):
         scheduler: Optional[Any] = None,      # Hydra scheduler config  
         warmup_ratio: float = 0.05,           # Warmup ratio for cosine schedule (5% of total training steps)
         learning_rate: float = 1e-4,          # Learning rate for all parameters
-        # --- SupCon knobs (single-GPU friendly) ---
-        supcon_on: bool = True,
-        supcon_lambda: float = 0.2,      # strength of SupCon vs BCE (tune 0.1–0.4)
-        supcon_tau: float = 0.12,        # temperature (try 0.05–0.12)
-        supcon_proj_dim: int = 256,      # contrastive embedding dim
-        supcon_proj_dropout: float = 0.10,
-        supcon_queue_size: int = 4096,   # 0 disables memory queue
     ) -> None:
         super().__init__()
         self.save_hyperparameters(logger=True)
@@ -370,32 +364,22 @@ class ProteinLitModule(LightningModule):
         # Replace fusion_proj with AttentionFusion
         self.fusion = AttentionFusion(d_model=d_latent, p_drop=fusion_mlp_dropout)
         
-        # --- NEW: SupCon projection head (single pass) ---
-        self.supcon_head = nn.Sequential(
-            nn.LayerNorm(d_latent),
-            nn.Linear(d_latent, d_latent*2),
-            nn.GELU(),
-            nn.Dropout(self.hparams.supcon_proj_dropout),
-            nn.Linear(d_latent*2, self.hparams.supcon_proj_dim),
-        )
-
-        # --- NEW: XBM-style memory queue (single-GPU) ---
-        Q = int(self.hparams.supcon_queue_size)
-        D = int(self.hparams.supcon_proj_dim)
-        C = get_num_classes_for_task(task_type)
-        if Q > 0:
-            # Store bank in float32 for higher-precision similarity math
-            self.register_buffer("queue_z", torch.zeros(Q, D, dtype=torch.float32))
-            self.register_buffer("queue_y", torch.zeros(Q, C, dtype=torch.uint8))
-            self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
-            self.register_buffer("queue_count", torch.zeros(1, dtype=torch.long))
-
         # Create classifier head
         self.head = MLPHead(d_latent, get_num_classes_for_task(task_type), head_dropout)
 
-        # For multi-label protein prediction, we use standard BCE loss
-        self.loss_fn = nn.BCEWithLogitsLoss()
-        # TODO: For long-tail multi-label, try ASL or logit-adjusted BCE as a drop-in.
+        # For long-tail multi-label, use Asymmetric Loss (ASL)
+        gamma_neg, clip = {
+            "bp": (4.5, 0.06),   # many more labels → more easy negatives
+            "mf": (4.0, 0.05),
+            "cc": (4.0, 0.05),
+        }[task_type]
+        self.loss_fn = AsymmetricLossMultiLabel(
+            gamma_neg=gamma_neg,
+            gamma_pos=0.0,   # keep positives strong (paper recommendation)
+            clip=clip,       # ignore very-easy negatives; helps all-zero rows
+            eps=1e-8,        # numerical safety (timm default)
+            # disable_torch_grad_focal_loss=False  # keep grad path explicit
+        )
 
         # Loss tracking
         self.train_loss = MeanMetric()
@@ -412,19 +396,10 @@ class ProteinLitModule(LightningModule):
         """No-op setup (MSA has been fully removed)."""
         return
 
-    # ---- NEW: helper to select the "shared trunk" params (exclude heads) ----
-    def _shared_params(self):
-        # Keeps it cheap: skip classifier head and SupCon projection head.
-        return tuple(
-            p for n, p in self.named_parameters()
-            if p.requires_grad and not (n.startswith("head.") or n.startswith("supcon_head."))
-        )
-
-
     # ---------------------------------------------------------------------
     #  Forward pass
     # ---------------------------------------------------------------------
-    def forward(self, batch: Dict[str, Any], want_fused: bool = False) -> Union[Tuple[torch.Tensor, torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+    def forward(self, batch: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
         """Forward pass with individual learnable BOS/EOS tokens for each modality.
         
         Key changes:
@@ -434,7 +409,6 @@ class ProteinLitModule(LightningModule):
         
         Args:
             batch: Input batch dictionary
-            want_fused: If True, also return the fused representation for gradient probing
         """
         # Extract inputs - all embeddings are pre-computed
         seq_emb = batch["esmc_emb"]      # Pre-computed ESM-C: [B, L, d_model]
@@ -496,13 +470,8 @@ class ProteinLitModule(LightningModule):
         # Use AttentionFusion between the two streams
         fused = self.fusion(seq_pool, aux_pool)    # [B, d]
 
-        # --- NEW: contrastive embedding (single pass) ---
-        z = F.normalize(self.supcon_head(fused), dim=-1)  # [B, supcon_proj_dim]
-
         logits = self.head(fused)                  # [B, C]
-        if want_fused:
-            return logits, batch["labels"], z, fused
-        return logits, batch["labels"], z
+        return logits, batch["labels"]
 
     # All MSA-related utilities removed
 
@@ -512,77 +481,10 @@ class ProteinLitModule(LightningModule):
     #  Lightning hooks
     # ------------------------------------------------------------------
     def training_step(self, batch: Dict[str, Any], batch_idx: int):
-        # keep want_fused=True to preserve interface; fused no longer used for grad probe
-        logits, labels, z, fused = self.forward(batch, want_fused=True)
-
-        loss_bce = self.loss_fn(logits, labels)
-        log_dict = {"train/bce_loss": loss_bce}
-
-        if self.hparams.supcon_on:
-            loss_sup = self._supcon_loss(z, labels)
-            log_dict.update({"train/supcon": loss_sup})
-
-            # ---- PARAMETER-SPACE grad probe on last shared params ----
-            shared = self._shared_params()
-
-            # grads wrt shared params (lightweight; no accumulation to .grad)
-            g_bce_params = torch.autograd.grad(
-                loss_bce, shared, retain_graph=True, allow_unused=True
-            )
-            g_sup_params = torch.autograd.grad(
-                loss_sup, shared, retain_graph=True, allow_unused=True
-            )
-
-            # global L2 norms in fp32
-            def _l2(gs):
-                acc = None
-                for g in gs:
-                    if g is None:
-                        continue
-                    v = g.detach().float().reshape(-1)
-                    acc = v if acc is None else torch.cat([acc, v], dim=0)
-                return (acc.pow(2).sum() + 1e-20).sqrt() if acc is not None else torch.tensor(0.0, device=loss_bce.device)
-
-            gn_bce = _l2(g_bce_params)
-            gn_sup = _l2(g_sup_params)
-
-            # cosine between tasks in PARAM space
-            dot = torch.tensor(0.0, device=loss_bce.device, dtype=torch.float32)
-            for a, b in zip(g_bce_params, g_sup_params):
-                if a is None or b is None:
-                    continue
-                dot = dot + (a.detach().float() * b.detach().float()).sum()
-            cos = dot / (gn_bce * gn_sup + 1e-20)
-
-            # target gradient share r_tgt := supcon_lambda (e.g., 0.20)
-            r_tgt = float(self.hparams.supcon_lambda)
-            scale = (r_tgt * gn_bce / (gn_sup + 1e-12)).clamp(0.0, 5.0).detach()
-
-            # soft conflict gate: suppress when anti-aligned
-            gate = (cos >= 0).to(cos.dtype).detach()  # binary gate: 1 if cos≥0 else 0
-
-            # combined loss with adaptive scaling + gating
-            loss = loss_bce + gate * scale * loss_sup
-
-            # logs (keep old keys stable + add a few new)
-            log_dict.update({
-                "train/gn_bce": gn_bce,
-                "train/gn_sup": gn_sup,
-                "train/grad_ratio_sup_over_bce": (gn_sup / (gn_bce + 1e-12)).detach(),
-                "train/grad_cos_param": cos,
-                "train/scale": scale,
-                "train/gate": gate,
-                "train/grad_ratio_eff": (scale * (gn_sup / (gn_bce + 1e-12))).detach(),
-            })
-        else:
-            loss = loss_bce
-
-        if self.hparams.supcon_on:
-            with torch.no_grad():
-                self._enqueue(z, labels)
-
+        logits, labels = self.forward(batch)
+        loss = self.loss_fn(logits, labels)
+        
         self.train_loss(loss)
-        self.log_dict(log_dict, on_step=True, prog_bar=True, sync_dist=True)
         self.log("train/loss_step", loss, on_step=True, prog_bar=True, sync_dist=True)
         return loss
 
@@ -597,7 +499,7 @@ class ProteinLitModule(LightningModule):
             self.log("lr", lr, on_step=True, prog_bar=True, sync_dist=True)
 
     def validation_step(self, batch: Dict[str, Any], batch_idx: int):
-        logits, labels, _ = self.forward(batch, want_fused=False)
+        logits, labels = self.forward(batch)
         loss = self.loss_fn(logits, labels)
         
         # Update metrics
@@ -609,7 +511,7 @@ class ProteinLitModule(LightningModule):
         self._val_labels.append(labels.detach().float().cpu())
         
     def test_step(self, batch: Dict[str, Any], batch_idx: int):
-        logits, labels, _ = self.forward(batch, want_fused=False)
+        logits, labels = self.forward(batch)
         loss = self.loss_fn(logits, labels)
         
         # Update metrics
@@ -729,101 +631,3 @@ class ProteinLitModule(LightningModule):
         }, prog_bar=True, sync_dist=True)
 
         self.test_loss.reset(); self._test_logits.clear(); self._test_labels.clear()
-
-    # ------------------------------------------------------------------
-    #  NEW: SupCon helpers (queue + multi-label weighted SupCon)
-    # ------------------------------------------------------------------
-    def _enqueue(self, z: torch.Tensor, y: torch.Tensor):
-        """Push current mini-batch (detached) into the memory queue."""
-        Q = int(self.hparams.supcon_queue_size)
-        if Q <= 0:
-            return
-        # Keep queue precision as float32
-        z = z.detach().to(self.queue_z.dtype)
-        y = (y.detach() > 0).to(torch.uint8)
-
-        B = z.size(0)
-        ptr = int(self.queue_ptr.item())
-        end = ptr + B
-
-        if end <= Q:
-            self.queue_z[ptr:end] = z
-            self.queue_y[ptr:end] = y
-        else:
-            first = Q - ptr
-            self.queue_z[ptr:] = z[:first]
-            self.queue_y[ptr:] = y[:first]
-            remain = B - first
-            if remain > 0:
-                self.queue_z[:remain] = z[first:first+remain]
-                self.queue_y[:remain] = y[first:first+remain]
-
-        self.queue_ptr[0] = (ptr + B) % Q
-        # TODO: assign with Python int for absolute safety (minor): self.queue_count[0] = min(Q, int(self.queue_count.item()) + B)
-        self.queue_count[0] = torch.clamp(self.queue_count + B, max=Q)
-
-    def _supcon_loss(self, z: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
-        """
-        Multi-label SupCon with Jaccard positive weights.
-        z: [B,D] (L2-normalized); Y: [B,C] multi-hot.
-        Uses candidate set = [queue (if any) ; current batch].
-        """
-        tau = float(self.hparams.supcon_tau)
-
-        # --- Force high-precision compute in this block ---
-        ac_dev = "cuda" if z.is_cuda else "cpu"
-        # Disable autocast so matmuls/log-sum-exp run in fp32 reliably.
-        with torch.autocast(device_type=ac_dev, enabled=False):
-            z = z.float()
-            Y = Y.float()
-
-            # Build candidate bank
-            Q = int(self.hparams.supcon_queue_size)
-            if Q > 0 and int(self.queue_count.item()) > 0:
-                k = int(self.queue_count.item())
-                Z_all = torch.cat([self.queue_z[:k].float(), z], dim=0)                 # [N,D] fp32
-                Y_all = torch.cat([self.queue_y[:k].to(torch.uint8), (Y > 0).to(torch.uint8)], dim=0)  # [N,C]
-                offset = Z_all.size(0) - z.size(0)  # start of in-batch region
-            else:
-                Z_all = z
-                Y_all = (Y > 0).to(torch.uint8)
-                offset = 0
-
-            # Cosine similarities / logits (fp32).
-            logits = (z @ Z_all.T) / tau                                          # [B,N]
-            logits = logits - logits.max(dim=1, keepdim=True)[0].detach()
-            # REQUIRED: mask self FIRST (works with or without queue)
-            B = z.size(0)
-            idx = torch.arange(B, device=z.device)
-            self_idx = (offset + idx) if offset > 0 else idx
-            logits[idx, self_idx] = float("-inf")
-            # Numerically safe normalization: guard rows that are all -inf
-            den = torch.logsumexp(logits, dim=1, keepdim=True)                    # [B,1]
-            log_prob = logits - den                                               # [B,N]
-
-            # ---- Positive weights: Jaccard ----
-            Yb = (Y > 0).to(torch.float32)                        # [B,C]
-            Yall = Y_all.to(torch.float32)                        # [N,C]
-            inter = Yb @ Yall.T                                   # [B,N]
-            pos_mask = inter > 0
-            # REQUIRED: exclude the anchor itself from the positive set
-            if Z_all.size(0) >= (offset + B):
-                pos_mask[idx, self_idx] = False
-
-            # Jaccard similarity weights
-            sum_i = Yb.sum(dim=1, keepdim=True)                           # [B,1]
-            sum_j = Yall.sum(dim=1, keepdim=True).T                       # [1,N]
-            union = (sum_i + sum_j - inter).clamp_min(1)
-            W = (inter / union) * pos_mask.float()
-
-            # after W is built and pos_mask excludes self
-            safe_log_prob = log_prob.masked_fill(~pos_mask, 0.0)   # restrict to P(i)
-
-            # Weighted average over positives per anchor
-            Wsum = W.sum(dim=1)                                              # [B]
-            valid = Wsum > 0
-            if valid.any():
-                pos_log_prob = (W[valid] * safe_log_prob[valid]).sum(dim=1) / Wsum[valid].clamp_min(1e-6)
-                return -pos_log_prob.mean()
-            else:
-                return logits.new_zeros(())
