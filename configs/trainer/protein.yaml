@@ -4,7 +4,7 @@ default_root_dir: ${paths.output_dir}
 
 # Protein training typically needs more epochs
 min_epochs: 5
-max_epochs: 40
+max_epochs: 20
 
 # Use GPU if available, fallback to CPU
 accelerator: auto

@@ -85,14 +85,16 @@ def masked_mean_pooling(x: torch.Tensor, pad_mask: torch.Tensor) -> torch.Tensor
 class GatedFusion(nn.Module):
     def __init__(self, d_model=768, p_drop=0.1, favor_seq_bias=0.0):
         super().__init__()
-        self.dropout = nn.Dropout(p_drop)
-        self.gate = nn.Linear(2 * d_model, 2, bias=True)
-        nn.init.constant_(self.gate.bias, favor_seq_bias)
-        nn.init.zeros_(self.gate.weight)
-
+        self.gate = nn.Sequential(
+            nn.LayerNorm(d_model * 2),
+            nn.Linear(d_model * 2, d_model // 2),
+            nn.GELU(),
+            nn.Dropout(p_drop),
+            nn.Linear(d_model // 2, 2)
+        )
     def forward(self, left_feat, right_feat):
         h = torch.cat([left_feat, right_feat], dim=-1)
-        logits = self.gate(self.dropout(h))   # [B, 2]
+        logits = self.gate(h)   # [B, 2]
         w = torch.softmax(logits, dim=-1)               # [B, 2]
         return w[..., 0:1] * left_feat + w[..., 1:2] * right_feat
 
@@ -112,22 +114,25 @@ class CrossAttentionFusionTwoModalities(nn.Module):
         self.mod1_to_mod2 = nn.MultiheadAttention(d_model, n_heads, dropout=attention_dropout, batch_first=True)
         self.mod2_to_mod1 = nn.MultiheadAttention(d_model, n_heads, dropout=attention_dropout, batch_first=True)
         
-        # Simple per-token gate: just a single linear layer
-        self.gate = nn.Linear(d_model * 2, 2, bias=True)
-        self.dropout_gate = nn.Dropout(fusion_mlp_dropout)
-        nn.init.zeros_(self.gate.weight)
-        nn.init.zeros_(self.gate.bias)
+        self.gate = nn.Sequential(
+            nn.LayerNorm(d_model * 2),
+            nn.Linear(d_model * 2, d_model // 2),
+            nn.GELU(),
+            nn.Dropout(fusion_mlp_dropout),
+            nn.Linear(d_model // 2, 2)
+        ) 
         
-    
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        
     def forward(self, mod1, mod2, pad_mask=None):
-        
         # Cross-attention with correct padding masks
-        mod1_attended, _ = self.mod1_to_mod2(mod1, mod2, mod2, key_padding_mask=pad_mask)
-        mod2_attended, _ = self.mod2_to_mod1(mod2, mod1, mod1, key_padding_mask=pad_mask)
+        mod1_attended, _ = self.mod1_to_mod2(self.norm1(mod1), self.norm2(mod2), self.norm2(mod2), key_padding_mask=pad_mask)
+        mod2_attended, _ = self.mod2_to_mod1(self.norm2(mod2), self.norm1(mod1), self.norm1(mod1), key_padding_mask=pad_mask)
         
         # Convex (softmax) gating per token over the two streams
         gate_in = torch.cat([mod1_attended, mod2_attended], dim=-1)   # [B, L, 2*d]
-        gate = self.gate(self.dropout_gate(gate_in)).softmax(dim=-1)                    # [B, L, 2]
+        gate = self.gate(gate_in).softmax(dim=-1)                    # [B, L, 2]
 
         mixed = (
             gate[..., 0:1] * mod1_attended +
@@ -515,16 +520,6 @@ class ProteinLitModule(LightningModule):
         self.val_loss.reset()
         self._val_logits.clear()
         self._val_labels.clear()
-        # Log parameter counts for verification
-        total_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        self.log("params/total_params", float(total_params), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
-        # If optimizer is initialized, log initial LR
-        if self.trainer and self.trainer.optimizers:
-            optimizer = self.trainer.optimizers[0]
-            param_groups = getattr(optimizer, "param_groups", [])
-            if len(param_groups) >= 1:
-                self.log("lr_initial", float(param_groups[0]["lr"]), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
-    
 
        
     def configure_optimizers(self):
