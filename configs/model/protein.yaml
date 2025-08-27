@@ -1,7 +1,7 @@
 _target_: src.models.protein_module.ProteinLitModule
 
 # Model architecture parameters
-d_model: 1152          # Base model dimension (ESM-C actual embedding size)
+d_esm: 1152          # Base model dimension (ESM-C actual embedding size)
 d_latent: 896          # Latent dimension for cross-modal fusion and final representation
 n_cross_layers: 3      # Cross-modal attention layers between sequence and auxiliary streams
 n_heads: 8             # Consider 12 heads 

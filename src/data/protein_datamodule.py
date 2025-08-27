@@ -15,10 +15,10 @@ warnings.filterwarnings(
 
 
 class ProteinDataset(Dataset):
-    """Dataset for multi-modal protein function prediction (no MSA).
+    """Dataset for multi‑modal protein function prediction.
 
-    Loads per-residue embeddings for four modalities: ESM-C, ProtT5, Ankh3-Large, and XTrimoPGLM,
-    along with GO multi-labels.
+    Loads per‑residue embeddings for ESM‑C, ProtT5, Ankh3‑XL, and XTrimoPGLM,
+    and corresponding GO multi‑label targets.
     """
 
     # class-level cache so every worker only builds it once
@@ -42,13 +42,11 @@ class ProteinDataset(Dataset):
     def __len__(self):
         return len(self.protein_ids)
 
-    # MSA parsing utilities removed
 
     def _parse_go_labels(self, go_file_path: Path) -> torch.Tensor:
-        """
-        Convert the GO IDs inside <ontology>_go.txt into a multi-label tensor.
-        Empty file  ➜  all-zero vector (negative example).
-        Unknown ID ➜  ignored but logged once.
+        """Parse GO IDs from ``<ontology>_go.txt`` into a multi‑hot tensor.
+
+        Empty files yield an all‑zero vector. Unknown IDs are ignored with a warning.
         """
         # 1. fetch / cache mapping ------------------------------------------------
         if self.task_type not in self._go_dicts:
@@ -111,19 +109,11 @@ class ProteinDataset(Dataset):
         # Ensure all embeddings have the same sequence length
         assert esmc_emb.size(0) == ankh_emb.size(0) == prot_emb.size(0) == pglm_emb.size(0), \
             f"Embeddings have different lengths: ESM-C={esmc_emb.size(0)}, Ankh={ankh_emb.size(0)}, ProtT5={prot_emb.size(0)}, PGLM={pglm_emb.size(0)}"
-        
-        # Zero out 0th and L+1th indices for all embeddings (no BOS/EOS tokens in precomputed embeddings)
-        esmc_emb[0] = 0.0   # Zero out BOS position
-        esmc_emb[-1] = 0.0  # Zero out EOS position
-        
-        ankh_emb[0] = 0.0   # Zero out BOS position
-        ankh_emb[-1] = 0.0  # Zero out EOS position
-
-        prot_emb[0] = 0.0   # Zero out BOS position
-        prot_emb[-1] = 0.0  # Zero out EOS position
-
-        pglm_emb[0] = 0.0   # Zero out BOS position
-        pglm_emb[-1] = 0.0  # Zero out EOS position
+            
+        # Ensure that BOS/EOS token embeddings (positions 0 and L+1) are zeroed out for all models
+        for emb in (esmc_emb, ankh_emb, prot_emb, pglm_emb):
+            emb[0] = 0.0
+            emb[-1] = 0.0
 
         # Load labels based on task type from GO text files
         label_file = protein_dir / f"{self.task_type}_go.txt"
@@ -152,8 +142,8 @@ class ProteinDataset(Dataset):
 class ProteinDataModule(LightningDataModule):
     """DataModule for protein function prediction (no MSA).
 
-    Loads precomputed per-residue embeddings for modalities: ESM-C, ProtT5, Ankh3-Large, XTrimoPGLM,
-    and corresponding GO labels for splits: train, val, test.
+    Loads precomputed per‑residue embeddings for ESM‑C, ProtT5, Ankh3‑XL, and XTrimoPGLM,
+    and GO labels for ``train``, ``val``, and ``test`` splits.
     """
 
     # Help static type checkers recognise dynamically-added Hydra attribute
@@ -167,14 +157,13 @@ class ProteinDataModule(LightningDataModule):
         num_workers: int = 0,
         pin_memory: bool = True,
     ) -> None:
-        """Initialize ProteinDataModule.
+        """Initialize the data module.
 
-        :param data_dir: Path to PDBCH base directory 
-        :param task_type: Which GO tasks to train on ("mf", "bp", "cc")
-        :param batch_size: Batch size for training
-        :param num_workers: Number of data loading workers
-        :param pin_memory: Whether to pin memory for GPU transfer
-        :param msa_sample_size: Maximum number of MSA sequences to keep (including query). None ➜ keep all.
+        :param data_dir: Path to PDBCH base directory.
+        :param task_type: GO ontology to use ("mf", "bp", "cc").
+        :param batch_size: Batch size per optimization step.
+        :param num_workers: Number of data‑loading workers.
+        :param pin_memory: Whether to pin memory for faster GPU transfer.
         """
         super().__init__()
         self.save_hyperparameters(logger=True)
@@ -191,10 +180,10 @@ class ProteinDataModule(LightningDataModule):
         self.test_protein_ids: List[str] = []
 
     def get_num_classes(self, task_type_: str) -> int:
-        """Get number of classes for a given task type with validation.
-        
-        :param task_type: Task type ("mf", "bp", "cc")
-        :return: Number of classes for the task
+        """Return number of classes for the given ontology with validation.
+
+        :param task_type_: Task type ("mf", "bp", "cc").
+        :return: Number of classes for the task.
         """
         expected_counts = {"mf": 489, "bp": 1943, "cc": 320}
         assert task_type_ in expected_counts, f"Unknown task_type: {task_type_}"
@@ -314,22 +303,20 @@ class ProteinDataModule(LightningDataModule):
                 )
             self.batch_size_per_device = self.hparams.batch_size // self.trainer.world_size
 
-        from src.data.protein_datamodule import load_go_dict
-        
         # Ensure _go_dicts is populated for the current task_type in main process
         if self.hparams.task_type not in ProteinDataset._go_dicts:
-            print(f"🔧 Populating GO mapping for '{self.hparams.task_type}' in main process...")
+            print(f"Populating GO mapping for '{self.hparams.task_type}' in main process...")
             data_base_dir = Path(self.hparams.data_dir).parent
             tsv_path = data_base_dir / "nrPDB-GO_2019.06.18_annot.tsv"
             ProteinDataset._go_dicts[self.hparams.task_type] = load_go_dict(tsv_path, self.hparams.task_type)
-            print(f"✅ GO mapping loaded: {len(ProteinDataset._go_dicts[self.hparams.task_type])} terms")
+            print(f"GO mapping loaded: {len(ProteinDataset._go_dicts[self.hparams.task_type])} terms")
 
         # Load datasets only if not already loaded
         if not self.data_train and not self.data_val and not self.data_test:
             
-            print(f"Training proteins ({len(self.train_protein_ids)}): {self.train_protein_ids[:5]}{'...' if len(self.train_protein_ids) > 5 else ''}")
-            print(f"Validation proteins ({len(self.val_protein_ids)}): {self.val_protein_ids[:5]}{'...' if len(self.val_protein_ids) > 5 else ''}")
-            print(f"Test proteins ({len(self.test_protein_ids)}): {self.test_protein_ids[:5]}{'...' if len(self.test_protein_ids) > 5 else ''}")
+            print(f"Training proteins: {len(self.train_protein_ids)}")
+            print(f"Validation proteins: {len(self.val_protein_ids)}")
+            print(f"Test proteins: {len(self.test_protein_ids)}")
             
             # Create datasets for each split
             self.data_train = ProteinDataset(
@@ -339,23 +326,21 @@ class ProteinDataModule(LightningDataModule):
                 split="train",
             )
             
-            # ---------------------------------------------------------
-            # HEAL information–content vector – loaded from ic_count.pkl
-            # ---------------------------------------------------------
+            # HEAL information–content vector from ic_count.pkl
             if not hasattr(self, "_ic_vector"):
-                # Use the parent directory of data_dir to find ic_count.pkl
+                # Use parent directory of data_dir to find ic_count.pkl
                 data_base_dir = Path(self.hparams.data_dir).parent
                 ic_file = data_base_dir / "ic_count.pkl"
                 if ic_file.exists():
                     with ic_file.open("rb") as f:
-                        ic_count = pkl.load(f)               # dict with keys 'bp','mf','cc'
+                        ic_count = pkl.load(f)  # dict with keys 'bp','mf','cc'
                     counts = torch.tensor(
                         ic_count[self.hparams.task_type], dtype=torch.float
                     )
-                    counts[counts == 0] = 1                  # avoid log(0)
-                    # HEAL constant: 69 709 training proteins
+                    counts[counts == 0] = 1  # avoid log(0)
+                    # Training set size constant used in IC computation
                     self._ic_vector = (-torch.log2(counts / 69_709)).float()
-                    print(f"✅  IC vector loaded from {ic_file}")
+                    print(f"IC vector loaded from {ic_file}")
                 else:
                     raise FileNotFoundError(f"ic_count.pkl not found at {ic_file}")
             # Verify length agreement

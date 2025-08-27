@@ -14,7 +14,7 @@ from data.go_utils import (
 
 # Simple helper to get number of classes without datamodule dependency
 def get_num_classes_for_task(task_type: str) -> int:
-    """Get number of classes for a task type."""
+    """Return number of classes for a task type."""
     class_counts = {"mf": 489, "bp": 1943, "cc": 320}
     return class_counts[task_type]
 
@@ -50,7 +50,6 @@ class ResidualFeedForward(nn.Module):
 
 class MLPHead(nn.Module):
     """Final classification head with layer norm and dropout."""
-    
     def __init__(self, d_in: int, d_out: int, dropout: float = 0.1): 
         super().__init__()
         self.net = nn.Sequential(
@@ -66,15 +65,11 @@ class MLPHead(nn.Module):
 
 
 def masked_mean_pooling(x: torch.Tensor, pad_mask: torch.Tensor) -> torch.Tensor:
-    """
-    Simple masked mean pooling.
-    
-    Args:
-        x: Tensor of shape [B, L, D]
-        pad_mask: Tensor of shape [B, L] - True where padded
-        
-    Returns:
-        Tensor of shape [B, D] - mean pooled representation
+    """Masked mean pooling over the sequence dimension.
+
+    :param x: [B, L, D] embeddings.
+    :param pad_mask: [B, L] boolean mask; True for padding.
+    :return: [B, D] pooled embeddings.
     """
     # Zero out padded positions
     x_masked = x.masked_fill(pad_mask.unsqueeze(-1), 0.0)
@@ -87,21 +82,17 @@ def masked_mean_pooling(x: torch.Tensor, pad_mask: torch.Tensor) -> torch.Tensor
     
     return pooled
     
-class AttentionFusion(nn.Module):
+class GatedFusion(nn.Module):
     def __init__(self, d_model=768, p_drop=0.1, favor_seq_bias=0.0):
         super().__init__()
-        self.pre = nn.LayerNorm(2 * d_model)
         self.dropout = nn.Dropout(p_drop)
-        self.gate = nn.Linear(2 * d_model, 2)
-        # Optional: bias > 0 favors seq at init; 0.0 is neutral (50/50)
+        self.gate = nn.Linear(2 * d_model, 2, bias=True)
         nn.init.constant_(self.gate.bias, favor_seq_bias)
-
-        # (Nice default) zero-init weights so bias controls the initial mix
         nn.init.zeros_(self.gate.weight)
 
     def forward(self, left_feat, right_feat):
         h = torch.cat([left_feat, right_feat], dim=-1)
-        logits = self.gate(self.dropout(self.pre(h)))   # [B, 2]
+        logits = self.gate(self.dropout(h))   # [B, 2]
         w = torch.softmax(logits, dim=-1)               # [B, 2]
         return w[..., 0:1] * left_feat + w[..., 1:2] * right_feat
 
@@ -110,7 +101,7 @@ class AttentionFusion(nn.Module):
 ############################################################
 
 class CrossAttentionFusionTwoModalities(nn.Module):
-    """Cross-attention between two modalities with softmax gating"""
+    """Cross-attention between two modalities with softmax gating."""
     
     def __init__(self, d_model: int, attention_dropout: float = 0.1, n_heads: int = 8, fusion_mlp_dropout: float = 0.1):
         super().__init__()
@@ -121,25 +112,14 @@ class CrossAttentionFusionTwoModalities(nn.Module):
         self.mod1_to_mod2 = nn.MultiheadAttention(d_model, n_heads, dropout=attention_dropout, batch_first=True)
         self.mod2_to_mod1 = nn.MultiheadAttention(d_model, n_heads, dropout=attention_dropout, batch_first=True)
         
-        # Per-token gating over {mod1, mod2}
-        self.gate = nn.Sequential(
-            nn.LayerNorm(d_model * 2),
-            nn.Dropout(fusion_mlp_dropout),
-            nn.Linear(d_model * 2, d_model // 2),
-            nn.GELU(),
-            nn.Dropout(fusion_mlp_dropout),
-            nn.Linear(d_model // 2, 2)  # logits -> softmax outside
-        )
+        # Simple per-token gate: just a single linear layer
+        self.gate = nn.Linear(d_model * 2, 2, bias=True)
+        self.dropout_gate = nn.Dropout(fusion_mlp_dropout)
+        nn.init.zeros_(self.gate.weight)
+        nn.init.zeros_(self.gate.bias)
         
-        # Final combination layer
-        self.norm = nn.LayerNorm(d_model)
     
     def forward(self, mod1, mod2, pad_mask=None):
-        # Apply padding mask to query tensors before cross-attention
-        if pad_mask is not None:
-            # Zero out padded positions in query tensors
-            mod1 = mod1.masked_fill(pad_mask.unsqueeze(-1), 0.0)
-            mod2 = mod2.masked_fill(pad_mask.unsqueeze(-1), 0.0)
         
         # Cross-attention with correct padding masks
         mod1_attended, _ = self.mod1_to_mod2(mod1, mod2, mod2, key_padding_mask=pad_mask)
@@ -147,20 +127,17 @@ class CrossAttentionFusionTwoModalities(nn.Module):
         
         # Convex (softmax) gating per token over the two streams
         gate_in = torch.cat([mod1_attended, mod2_attended], dim=-1)   # [B, L, 2*d]
-        gate = self.gate(gate_in).softmax(dim=-1)                    # [B, L, 2]
+        gate = self.gate(self.dropout_gate(gate_in)).softmax(dim=-1)                    # [B, L, 2]
 
         mixed = (
             gate[..., 0:1] * mod1_attended +
             gate[..., 1:2] * mod2_attended
         )  # [B, L, d_model]
         
-        return self.norm(mixed)
+        return mixed
 
 class CrossAttentionTwoStreamFusion(nn.Module):
-    """
-    Generic cross-attention fusion for two token-aligned streams.
-    Inputs can be any pair of modalities (e.g., ESM↔Ankh, ProtT5↔PGLM).
-    """
+    """Cross‑attention fusion for two token‑aligned streams."""
     
     def __init__(self,
                  d_in1: int = 1152,
@@ -177,15 +154,15 @@ class CrossAttentionTwoStreamFusion(nn.Module):
         self.ln_in2 = nn.LayerNorm(d_in2)
         
         # Projection layers
-        self.proj_in1 = nn.Linear(d_in1, d_out)
-        self.proj_in2 = nn.Linear(d_in2, d_out)
+        self.proj_in1 = nn.Linear(d_in1, d_out, bias=False)
+        self.proj_in2 = nn.Linear(d_in2, d_out, bias=False)
         
         # Cross-attention fusion (two-way with gating)
         self.fusion = CrossAttentionFusionTwoModalities(d_out, attention_dropout, n_heads, fusion_mlp_dropout)
         
         self.dropout = nn.Dropout(fusion_mlp_dropout)
     
-    def forward(self, emb1, emb2, pad_mask=None, lengths=None):
+    def forward(self, emb1, emb2, pad_mask=None):
         # Normalize and project
         emb1_proj = self.proj_in1(self.ln_in1(emb1))  # [B, L, d_out]
         emb2_proj = self.proj_in2(self.ln_in2(emb2))  # [B, L, d_out]
@@ -195,7 +172,6 @@ class CrossAttentionTwoStreamFusion(nn.Module):
         
         return self.dropout(fused).masked_fill(pad_mask.unsqueeze(-1), 0.0)
 
-# Drop-in replacement for your current SequenceEncoder
 class CrossAttentionSequenceEncoder(nn.Module):
     def __init__(self,
                  d_in1: int = 1152,
@@ -215,16 +191,9 @@ class CrossAttentionSequenceEncoder(nn.Module):
             n_heads=n_heads
         )
     
-    def forward(self, emb1, emb2, pad_mask=None, lengths=None):
+    def forward(self, emb1, emb2, pad_mask=None):
         return self.fusion(emb1, emb2, pad_mask)
 
-
-# NOTE: The specialized Prot/PGLM fusion has been unified into the generic
-# CrossAttentionTwoStreamFusion via CrossAttentionSequenceEncoder.
-
-############################################################
-#  Dual-stream cross-attention fusion
-############################################################
 
 class DualStreamCrossAttention(nn.Module):
     def __init__(self, d_model: int = 1152, n_heads: int = 8, n_layers: int = 2, attention_dropout: float = 0.1, ffn_dropout: float = 0.1):
@@ -275,10 +244,15 @@ class DualStreamCrossAttention(nn.Module):
 ############################################################
 
 class ProteinLitModule(LightningModule):
+    """LightningModule for multi‑modal protein function prediction.
+
+    Fuses ESM‑C+Ankh and ProtT5+PGLM token features via cross‑attention and
+    sequence‑level AttentionFusion, trained with asymmetric multi‑label loss.
+    """
     def __init__(
         self,
         task_type: str,                       # Task type: "mf", "bp", or "cc" - required
-        d_model: int = 1152,                  # Base model dimension
+        d_esm: int = 1152,                  # Base model dimension
         d_latent: int = 768,                  # Latent dimension for cross-modal fusion and final representation
         d_prot: int = 1024,                   # ProtT5 hidden size (XL UniRef50 = 1024)
         d_ankh: int = 1024,                   # Ankh3-Large embedding dimension
@@ -301,12 +275,11 @@ class ProteinLitModule(LightningModule):
         self.task_type = task_type
  
         
-        # NOTE: MSA model removed; MSA tokens may still be passed but are unused
         
         # Individual learnable BOS/EOS tokens for each modality
-        # ESM-C tokens (d_model dimension) - for pre-computed embeddings
-        self.esm_bos_token = nn.Parameter(torch.zeros(1, d_model))
-        self.esm_eos_token = nn.Parameter(torch.zeros(1, d_model))
+        # ESM-C tokens (d_esm dimension) - for pre-computed embeddings
+        self.esm_bos_token = nn.Parameter(torch.zeros(1, d_esm))
+        self.esm_eos_token = nn.Parameter(torch.zeros(1, d_esm))
         nn.init.normal_(self.esm_bos_token, std=0.02)
         nn.init.normal_(self.esm_eos_token, std=0.02)
         
@@ -328,12 +301,9 @@ class ProteinLitModule(LightningModule):
         nn.init.normal_(self.pglm_bos_token, std=0.02)
         nn.init.normal_(self.pglm_eos_token, std=0.02)
         
-
-
-        # Encoders
         # Sequence stream: fuse ESM-C with Ankh
         self.seq_encoder = CrossAttentionSequenceEncoder(
-            d_in1=d_model,
+            d_in1=d_esm,
             d_in2=d_ankh,
             d_out=d_latent,
             attention_dropout=attention_dropout,
@@ -342,7 +312,7 @@ class ProteinLitModule(LightningModule):
         )
         # Second stream: ProtT5 + PGLM fusion (generic two-stream)
         self.prot_pglm_encoder = CrossAttentionSequenceEncoder(
-            d_in1=1024,
+            d_in1=d_prot,
             d_in2=d_pglm,
             d_out=d_latent,
             attention_dropout=attention_dropout,
@@ -359,26 +329,18 @@ class ProteinLitModule(LightningModule):
             ffn_dropout=ffn_dropout
         )
 
-        # Use masked mean pooling (function called directly in forward)
-        
-        # Replace fusion_proj with AttentionFusion
-        self.fusion = AttentionFusion(d_model=d_latent, p_drop=fusion_mlp_dropout)
+        # GatedFusion over pooled stream features
+        self.fusion = GatedFusion(d_model=d_latent, p_drop=fusion_mlp_dropout)
         
         # Create classifier head
         self.head = MLPHead(d_latent, get_num_classes_for_task(task_type), head_dropout)
 
         # For long-tail multi-label, use Asymmetric Loss (ASL)
-        gamma_neg, clip = {
-            "bp": (4.5, 0.06),   # many more labels → more easy negatives
-            "mf": (4.0, 0.05),
-            "cc": (4.0, 0.05),
-        }[task_type]
         self.loss_fn = AsymmetricLossMultiLabel(
-            gamma_neg=gamma_neg,
+            gamma_neg=4.0,
             gamma_pos=0.0,   # keep positives strong (paper recommendation)
-            clip=clip,       # ignore very-easy negatives; helps all-zero rows
+            clip=0.05,       # ignore very-easy negatives; helps all-zero rows
             eps=1e-8,        # numerical safety (timm default)
-            # disable_torch_grad_focal_loss=False  # keep grad path explicit
         )
 
         # Loss tracking
@@ -393,89 +355,84 @@ class ProteinLitModule(LightningModule):
         self._test_labels = []
 
     def setup(self, stage: str) -> None:
-        """No-op setup (MSA has been fully removed)."""
+        """No-op setup."""
         return
+
+    def _insert_bos_eos_tokens(
+        self,
+        seq_emb: torch.Tensor,
+        ankh_emb: torch.Tensor,
+        prot_emb: torch.Tensor,
+        pglm_emb: torch.Tensor,
+        lengths: torch.Tensor,
+    ) -> None:
+        """Insert per‑modality BOS at position 0 and EOS at position L+1 (in‑place)."""
+        batch_size = seq_emb.size(0)
+
+        # BOS at position 0
+        seq_emb[:, 0] = self.esm_bos_token.to(seq_emb.dtype).expand(batch_size, -1)
+        ankh_emb[:, 0] = self.ankh_bos_token.to(ankh_emb.dtype).expand(batch_size, -1)
+        prot_emb[:, 0] = self.prot_bos_token.to(prot_emb.dtype).expand(batch_size, -1)
+        pglm_emb[:, 0] = self.pglm_bos_token.to(pglm_emb.dtype).expand(batch_size, -1)
+
+        # EOS at position L+1
+        for i, length in enumerate(lengths):
+            eos_pos = length + 1
+            if eos_pos < seq_emb.size(1):
+                seq_emb[i, eos_pos] = self.esm_eos_token.to(seq_emb.dtype).squeeze()
+                ankh_emb[i, eos_pos] = self.ankh_eos_token.to(ankh_emb.dtype).squeeze()
+                prot_emb[i, eos_pos] = self.prot_eos_token.to(prot_emb.dtype).squeeze()
+                pglm_emb[i, eos_pos] = self.pglm_eos_token.to(pglm_emb.dtype).squeeze()
+
+    def _build_pool_mask(self, pad_mask: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+        """Return pooling mask with BOS/EOS positions masked out (True)."""
+        pool_mask = pad_mask.clone()
+        pool_mask[:, 0] = True
+        for i, length in enumerate(lengths):
+            eos_pos = length + 1
+            if eos_pos < pool_mask.size(1):
+                pool_mask[i, eos_pos] = True
+        return pool_mask
 
     # ---------------------------------------------------------------------
     #  Forward pass
     # ---------------------------------------------------------------------
     def forward(self, batch: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass with individual learnable BOS/EOS tokens for each modality.
-        
-        Key changes:
-        - Each modality gets its own learnable BOS/EOS tokens
-        - BOS tokens are inserted at position 0, EOS tokens at position L+1
-        - This allows each modality to learn optimal start/end representations
-        
-        Args:
-            batch: Input batch dictionary
+        """Forward pass with per‑modality learnable BOS/EOS tokens and dual‑stream fusion (L-->L+2).
+
+        :param batch: Input dict containing embeddings, masks, lengths, and labels.
+        :return: Logits and ground‑truth labels.
         """
         # Extract inputs - all embeddings are pre-computed
-        seq_emb = batch["esmc_emb"]      # Pre-computed ESM-C: [B, L, d_model]
-        ankh_emb = batch["ankh_emb"]     # Pre-computed Ankh3-Large: [B, L, d_ankh]
-        prot_emb = batch["prot_emb"]     # Pre-computed ProtT5: [B, L, d_prot]
-        pglm_emb = batch["pglm_emb"]     # Pre-computed PGLM: [B, L, d_pglm]
+        seq_emb = batch["esmc_emb"]      # ESM-C: [B, L, d_esm]
+        ankh_emb = batch["ankh_emb"]     # Ankh3-Large: [B, L, d_ankh]
+        prot_emb = batch["prot_emb"]     # ProtT5: [B, L, d_prot]
+        pglm_emb = batch["pglm_emb"]     # PGLM: [B, L, d_pglm]
+        pad_mask = batch["pad_mask"]     # [B, L] True where padded
+        lengths = batch["lengths"]       # [B]
 
-        pad_mask = batch["pad_mask"]     # [B, L] - True where padded
-        # no sequence-of-sequences mask needed (no MSA)
-
-        # Skip MSA embedding computation; tokens remain unused but are kept in the batch
-
-        # Insert individual learnable BOS/EOS tokens for each modality
-        B = seq_emb.size(0)
-        lengths = batch["lengths"]
+        # Preprocess embeddings and build pooling mask
+        self._insert_bos_eos_tokens(seq_emb, ankh_emb, prot_emb, pglm_emb, lengths)
+        pool_mask = self._build_pool_mask(pad_mask, lengths)
         
-        # Insert BOS tokens at position 0
-        seq_emb[:, 0] = self.esm_bos_token.to(seq_emb.dtype).expand(B, -1)      # [B, d_model]
-        prot_emb[:, 0] = self.prot_bos_token.to(prot_emb.dtype).expand(B, -1)    # [B, d_prot]
-        ankh_emb[:, 0] = self.ankh_bos_token.to(ankh_emb.dtype).expand(B, -1)    # [B, d_ankh]
-        pglm_emb[:, 0] = self.pglm_bos_token.to(pglm_emb.dtype).expand(B, -1)    # [B, d_pglm]
-        
+        # Sequence stream: ESM‑C + Ankh
+        seq_z = self.seq_encoder(seq_emb, ankh_emb, pad_mask=pad_mask)  # [B, L, d]
 
-        
-        # Insert EOS tokens at position L+1
-        for i, length in enumerate(lengths):
-            eos_pos = length + 1
-            if eos_pos < seq_emb.size(1):  # Safety check
-                seq_emb[i, eos_pos] = self.esm_eos_token.to(seq_emb.dtype).squeeze()      # [d_model]
-                prot_emb[i, eos_pos] = self.prot_eos_token.to(prot_emb.dtype).squeeze()    # [d_prot]
-                ankh_emb[i, eos_pos] = self.ankh_eos_token.to(ankh_emb.dtype).squeeze()    # [d_ankh]
-                pglm_emb[i, eos_pos] = self.pglm_eos_token.to(pglm_emb.dtype).squeeze()    # [d_pglm]
-        
-        # Create mask for pooling that masks BOS/EOS positions
-        pool_mask = pad_mask.clone()
-        pool_mask[:, 0] = True  # Mask out BOS position
-        
-        # Also ensure EOS positions (L+1) are masked as True
-        for i, length in enumerate(lengths):
-            eos_pos = length + 1
-            if eos_pos < pool_mask.size(1):  # Safety check
-                pool_mask[i, eos_pos] = True  # Mask out EOS position
-        
-        # Encode each modality with appropriate masks
-        # Sequence stream: ESM++ + Ankh
-        seq_z = self.seq_encoder(seq_emb, ankh_emb, pad_mask=pad_mask)  # [B, L, 768]
+        # ProtT5 + PGLM stream
+        prot_pglm_z = self.prot_pglm_encoder(prot_emb, pglm_emb, pad_mask=pad_mask)  # [B, L, d]
 
-        # Apply ProtT5 + PGLM cross-modal fusion
-        prot_pglm_z = self.prot_pglm_encoder(prot_emb, pglm_emb, pad_mask=pad_mask)  # [B, L, 768]
+        # Cross‑modal attention between streams
+        seq_z, prot_pglm_z = self.cross_attn(seq_z, prot_pglm_z, pad_mask, pad_mask)
 
-        # Cross-modal attention with padding masks between the two streams
-        # seq_z contains ESM++ + Ankh fusion, prot_pglm_z contains ProtT5 + PGLM fusion
-        seq_z, prot_pglm_z = self.cross_attn(seq_z, prot_pglm_z, pad_mask, pad_mask)  # each [B, L, d]
+        # Masked mean pooling (exclude BOS/EOS)
+        seq_pool = masked_mean_pooling(seq_z, pool_mask)
+        aux_pool = masked_mean_pooling(prot_pglm_z, pool_mask)
 
-        # Use masked mean pooling (exclude BOS/EOS tokens)
-        seq_pool = masked_mean_pooling(seq_z, pool_mask)  # [B, d] - ESM++ + Ankh stream
-        aux_pool = masked_mean_pooling(prot_pglm_z, pool_mask)  # [B, d] - ProtT5 + PGLM stream
-
-        # Use AttentionFusion between the two streams
-        fused = self.fusion(seq_pool, aux_pool)    # [B, d]
+        # GatedFusion between streams
+        fused = self.fusion(seq_pool, aux_pool)
 
         logits = self.head(fused)                  # [B, C]
         return logits, batch["labels"]
-
-    # All MSA-related utilities removed
-
-
 
     # ------------------------------------------------------------------
     #  Lightning hooks
@@ -504,9 +461,7 @@ class ProteinLitModule(LightningModule):
         
         # Update metrics
         self.val_loss(loss)
-
-        # Store for epoch-wise CAFA metrics computation
-        # Convert to fp32 before CPU transfer to avoid bf16 → numpy issues
+        # Store for epoch‑wise CAFA metrics computation (convert to fp32 for numpy)
         self._val_logits.append(logits.detach().float().cpu())   # keep raw, no sigmoid
         self._val_labels.append(labels.detach().float().cpu())
         
@@ -517,12 +472,11 @@ class ProteinLitModule(LightningModule):
         # Update metrics
         self.test_loss(loss)
  
-        # Store for epoch-wise CAFA metrics computation
-        # Convert to fp32 before CPU transfer to avoid bf16 → numpy issues
+        # Store for epoch‑wise CAFA metrics computation (convert to fp32 for numpy)
         self._test_logits.append(logits.detach().float().cpu())   # keep raw, no sigmoid
         self._test_labels.append(labels.detach().float().cpu())
 
-    def _heal_metrics(self, logits, labels): 
+    def _heal_metrics(self, logits, labels, compute_smin=True): 
         probs = torch.sigmoid(logits).numpy()
         labels = labels.numpy().astype(int)
         goterms = list(self.trainer.datamodule._go_dicts[self.task_type].keys())
@@ -536,14 +490,14 @@ class ProteinLitModule(LightningModule):
 
         macro, micro = function_centric_aupr(labels, probs)
         fmax, _      = cafa_fmax(labels, probs, goterms, self.task_type)
-        s_min        = smin(labels, probs, self.trainer.datamodule.ic_vector.numpy())
+        s_min        = smin(labels, probs, self.trainer.datamodule.ic_vector.numpy()) if compute_smin else 0.0
 
         return macro, micro, fmax, s_min
 
     def on_validation_epoch_end(self):
         logits = torch.cat(self._val_logits)
         labels = torch.cat(self._val_labels)
-        macro, micro, fmax, s_min = self._heal_metrics(logits, labels)
+        macro, micro, fmax, _ = self._heal_metrics(logits, labels, compute_smin=False)  # Skip smin for validation
 
         # Convert numpy scalars to Python floats for logging
         self.log_dict({
@@ -551,7 +505,6 @@ class ProteinLitModule(LightningModule):
             "val/AUPR_macro": float(macro),
             "val/AUPR_micro": float(micro), 
             "val/Fmax": float(fmax),
-            "val/Smin": float(s_min),
         }, prog_bar=True, sync_dist=True)
 
         self.val_loss.reset(); self._val_logits.clear(); self._val_labels.clear()
@@ -564,10 +517,6 @@ class ProteinLitModule(LightningModule):
         self._val_labels.clear()
         # Log parameter counts for verification
         total_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        
-        # Print parameter counts to console
-        print(f"Total trainable parameters: {total_params:,}")
-        
         self.log("params/total_params", float(total_params), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
         # If optimizer is initialized, log initial LR
         if self.trainer and self.trainer.optimizers:
