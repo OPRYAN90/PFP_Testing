@@ -107,9 +107,6 @@ class CrossAttentionFusionTwoModalities(nn.Module):
     
     def __init__(self, d_model: int, attention_dropout: float = 0.1, n_heads: int = 8, fusion_mlp_dropout: float = 0.1):
         super().__init__()
-        self.d_model = d_model
-        self.n_heads = n_heads
-        
         # Multi-head attention for each modality pair
         self.mod1_to_mod2 = nn.MultiheadAttention(d_model, n_heads, dropout=attention_dropout, batch_first=True)
         self.mod2_to_mod1 = nn.MultiheadAttention(d_model, n_heads, dropout=attention_dropout, batch_first=True)
@@ -152,8 +149,6 @@ class CrossAttentionTwoStreamFusion(nn.Module):
                  fusion_mlp_dropout: float = 0.1,
                  n_heads: int = 8):
         super().__init__()
-        self.d_out = d_out
-        
         # Normalization layers
         self.ln_in1 = nn.LayerNorm(d_in1)
         self.ln_in2 = nn.LayerNorm(d_in2)
