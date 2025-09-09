@@ -406,7 +406,7 @@ def protein_collate(batch):
     # ----------------------------------------------------
     max_len_seq = max(lengths) + 2   # CLS + residues + EOS
     # assert max_len_seq <= 1024, "Sequence too long (>1024)"
-
+    #WARNING NOTE: LENGTH OF SEQUENCE IS NOT LIMITED TO 1024
     esmc_emb_padded = []
     ankh_emb_padded = []
     prot_emb_padded = []

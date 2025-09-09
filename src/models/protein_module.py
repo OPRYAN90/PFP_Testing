@@ -498,7 +498,7 @@ class ProteinLitModule(LightningModule):
         goid_idx = self.trainer.datamodule._go_dicts[self.task_type]
         idx_goid = {idx: go_id for go_id, idx in goid_idx.items()}
         df = self._assemble_deepgoplus_df(logits, labels, idx_goid, with_pids=self._val_pids if len(self._val_pids) == labels.size(0) else None)
-        go_file = "../../data/go.obo"
+        go_file = "/teamspace/studios/this_studio/PFP_Testing/data/go.obo"
         fmax, aupr, tmax = new_compute_performance_deepgoplus(df, go_file, self.task_type)
 
         self.log_dict({
@@ -563,7 +563,7 @@ class ProteinLitModule(LightningModule):
         goid_idx = self.trainer.datamodule._go_dicts[self.task_type]
         idx_goid = {idx: go_id for go_id, idx in goid_idx.items()}
         df = self._assemble_deepgoplus_df(logits, labels, idx_goid, with_pids=self._test_pids if len(self._test_pids) == labels.size(0) else None)
-        go_file = str(Path(self.trainer.logger.log_dir).parent / "go.obo") if hasattr(self.trainer, "logger") and hasattr(self.trainer.logger, "log_dir") else "go.obo"
+        go_file = "/teamspace/studios/this_studio/PFP_Testing/data/go.obo"
         fmax, aupr, tmax = new_compute_performance_deepgoplus(df, go_file, self.task_type)
 
         self.log_dict({
@@ -575,7 +575,7 @@ class ProteinLitModule(LightningModule):
 
         # Save assembled predictions DataFrame and GO mapping after testing
         try:
-            save_dir = Path(self.trainer.logger.log_dir) if hasattr(self.trainer, "logger") and hasattr(self.trainer.logger, "log_dir") else Path.cwd()
+            save_dir = Path(self.trainer.logger.log_dir) if (getattr(self.trainer, "logger", None) and getattr(self.trainer.logger, "log_dir", None)) else Path.cwd()
             save_dir.mkdir(parents=True, exist_ok=True)
 
             # Convert non-JSON-serializable objects for saving
