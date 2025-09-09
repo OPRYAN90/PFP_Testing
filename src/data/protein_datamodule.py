@@ -4,8 +4,7 @@ from lightning import LightningDataModule
 from torch.utils.data import DataLoader, Dataset
 from pathlib import Path
 import torch.nn.functional as F
-import pickle as pkl
-from .go_utils import load_go_dict
+from .go_utils import build_go_index_from_dataset
 import warnings
 warnings.filterwarnings(
     "ignore",
@@ -26,7 +25,7 @@ class ProteinDataset(Dataset):
 
     def __init__(self, data_dir: str, protein_ids: List[str], task_type: str = "mf", split: str = "train"):
         """
-        :param data_dir: Path to protein data directory (base PDBCH directory)
+        :param data_dir: Path to protein data directory
         :param protein_ids: List of protein IDs to include
         :param task_type: Which GO task(s) to load labels for ("mf", "bp", "cc")
         :param split: Which data split ("train", "val", "test")
@@ -35,9 +34,11 @@ class ProteinDataset(Dataset):
         self.protein_ids = protein_ids
         self.task_type = task_type
         self.split = split
+        # Sequences directory is automatically derived from data_dir
+        self.sequences_dir = self.data_dir / "sequences"
         
-        # Determine the specific split directory
-        self.split_dir = self.data_dir / f"{split}_pdbch"
+        # CAFA_Style layout: <root>/<split>/<ontology>/<pid>
+        self.split_dir = self.data_dir / split / task_type
         
     def __len__(self):
         return len(self.protein_ids)
@@ -50,9 +51,8 @@ class ProteinDataset(Dataset):
         """
         # 1. fetch / cache mapping ------------------------------------------------
         if self.task_type not in self._go_dicts:
-            # TSV file is in the parent directory of data_dir (same as in get_num_classes)
-            tsv_path = self.data_dir.parent / "nrPDB-GO_2019.06.18_annot.tsv"
-            self._go_dicts[self.task_type] = load_go_dict(tsv_path, self.task_type)
+            # Build mapping from CAFA_Style training split
+            self._go_dicts[self.task_type] = build_go_index_from_dataset(self.data_dir, self.task_type, split="train")
         go2idx = self._go_dicts[self.task_type]
         num_classes = len(go2idx)
 
@@ -74,56 +74,57 @@ class ProteinDataset(Dataset):
     
     def __getitem__(self, idx):
         protein_id = self.protein_ids[idx]
+        # Directories for labels (by split) and for embeddings/sequences (global sequences dir)
         protein_dir = self.split_dir / protein_id
+        seq_dir = self.sequences_dir / protein_id
         
-        # Load sequence
-        with open(protein_dir / "sequence.txt", "r") as f:
+        # Load sequence (from sequences_dir: seq.txt)
+        with open(seq_dir / "seq.txt", "r") as f:
             sequence = f.read().strip()
             
         # Load pre-computed ESM-C embeddings (required file)
-        esmc_file = protein_dir / "esmc_emb.pt"
+        esmc_file = seq_dir / "esmc_emb.pt"
         esmc_data = torch.load(esmc_file)
         assert esmc_data.dim() == 3, "ESM-C data should be a 3D tensor"
         esmc_emb = esmc_data.squeeze(0)
         
-        # Load pre-computed Ankh3-Large embeddings (required file)
-        ankh_file = protein_dir / "ankh_emb_xl.pt"
+        # Load pre-computed Ankh3-XLarge embeddings (required file)
+        ankh_file = seq_dir / "ankh_emb_xl.pt"
         ankh_data = torch.load(ankh_file)
         # Extract embeddings from data structures
-        # Ankh3-Large: Direct tensor (1, L+2, d_ankh) -> squeeze to (L+2, d_ankh)
-        assert ankh_data.dim() == 3, "Ankh3-Large data should be a 3D tensor"
+        # Ankh3-XLarge: Direct tensor (1, L+2, d_ankh) -> squeeze to (L+2, d_ankh)
+        assert ankh_data.dim() == 3, "Ankh3-XLarge data should be a 3D tensor"
         ankh_emb = ankh_data.squeeze(0)
 
         # Load pre-computed ProtT5 embeddings (required file)
-        prot_file = protein_dir / "prot_emb.pt"
+        prot_file = seq_dir / "prot_t5_emb.pt"
         prot_data = torch.load(prot_file)
         assert prot_data.dim() == 3, "ProtT5 data should be a 3D tensor"
         prot_emb = prot_data.squeeze(0)
 
         # Load pre-computed XTrimoPGLM embeddings (required file)
-        pglm_file = protein_dir / "pglm_emb.pt"
+        pglm_file = seq_dir / "pglm_emb.pt"
         pglm_data = torch.load(pglm_file)
         assert pglm_data.dim() == 3, "PGLM data should be a 3D tensor"
         pglm_emb = pglm_data.squeeze(0)
 
         # Ensure all embeddings have the same sequence length
         assert esmc_emb.size(0) == ankh_emb.size(0) == prot_emb.size(0) == pglm_emb.size(0), \
-            f"Embeddings have different lengths: ESM-C={esmc_emb.size(0)}, Ankh={ankh_emb.size(0)}, ProtT5={prot_emb.size(0)}, PGLM={pglm_emb.size(0)}"
+            f"Embeddings have different lengths: ESM-C={esmc_emb.size(0)}, Ankh-XLarge={ankh_emb.size(0)}, ProtT5={prot_emb.size(0)}, PGLM={pglm_emb.size(0)}"
             
         # Ensure that BOS/EOS token embeddings (positions 0 and L+1) are zeroed out for all models
         for emb in (esmc_emb, ankh_emb, prot_emb, pglm_emb):
             emb[0] = 0.0
             emb[-1] = 0.0
 
-        # Load labels based on task type from GO text files
-        label_file = protein_dir / f"{self.task_type}_go.txt"
+        # Load labels from CAFA_Style go.txt
+        label_file = protein_dir / "go.txt"
         
         # Parse GO labels from text file format
         labels = self._parse_go_labels(label_file)
             
-        # Load protein length info (L.csv just contains a single number on the first line)
-        with open(protein_dir / "L.csv", "r") as f:
-            protein_length = int(f.readline().strip())
+        # Protein length from sequence (no BOS/EOS)
+        protein_length = len(sequence)
         
         sample = {
             "protein_id": protein_id,
@@ -151,7 +152,7 @@ class ProteinDataModule(LightningDataModule):
 
     def __init__(
         self,
-        data_dir: str = "data/PDBCH",  # PDBCH base directory
+        data_dir: str = "data",  
         task_type: str = "mf",  # "mf", "bp", or "cc"
         batch_size: int = 4,
         num_workers: int = 0,
@@ -159,7 +160,7 @@ class ProteinDataModule(LightningDataModule):
     ) -> None:
         """Initialize the data module.
 
-        :param data_dir: Path to PDBCH base directory.
+        :param data_dir: Path to base directory.
         :param task_type: GO ontology to use ("mf", "bp", "cc").
         :param batch_size: Batch size per optimization step.
         :param num_workers: Number of data‑loading workers.
@@ -173,6 +174,8 @@ class ProteinDataModule(LightningDataModule):
         self.data_test: Optional[Dataset] = None
 
         self.batch_size_per_device = batch_size
+        # Sequences directory is automatically derived from data_dir
+        self.sequences_dir = Path(data_dir) / "sequences"
         
         # Store protein IDs for each split
         self.train_protein_ids: List[str] = []
@@ -185,29 +188,15 @@ class ProteinDataModule(LightningDataModule):
         :param task_type_: Task type ("mf", "bp", "cc").
         :return: Number of classes for the task.
         """
-        expected_counts = {"mf": 489, "bp": 1943, "cc": 320}
-        assert task_type_ in expected_counts, f"Unknown task_type: {task_type_}"
-        
-        # Look for TSV file in parent directory of data_dir
-        data_base_dir = Path(self.hparams.data_dir).parent
-        tsv = data_base_dir / "nrPDB-GO_2019.06.18_annot.tsv"
-        go_dict = load_go_dict(tsv, task_type_)
-        actual_count = len(go_dict)
-        
-        assert actual_count == expected_counts[task_type_], \
-            f"Expected {expected_counts[task_type_]} classes for {task_type_}, got {actual_count}"
-        
-        return actual_count
+        # Determine number of classes from CAFA_Style train split
+        go_dict = build_go_index_from_dataset(Path(self.hparams.data_dir), task_type_, split="train")
+        return len(go_dict)
 
     @property
     def num_classes(self) -> int:
         """Get number of classes for current task."""
         return self.get_num_classes(self.hparams.task_type)
 
-    @property
-    def ic_vector(self) -> torch.Tensor:
-        """Get the information content vector for Smin computation."""
-        return self._ic_vector
 
     # ------------------------------------------------------------------
     #  GO-term mapping access (needed by ProteinLitModule._heal_metrics)
@@ -218,10 +207,10 @@ class ProteinDataModule(LightningDataModule):
         return ProteinDataset._go_dicts
 
     def _find_valid_proteins_in_split(self, split_dir: Path) -> List[str]:
-        """Scan a split directory to find proteins with non-empty GO label files."""
+        """Scan a split directory to find proteins with required files."""
         valid_proteins = []
         
-        print(f"Scanning {split_dir} for proteins with non-empty {self.hparams.task_type} labels...")
+        print(f"Scanning {split_dir} for proteins with required files...")
         
         for protein_dir in split_dir.iterdir():
             if not protein_dir.is_dir():
@@ -230,16 +219,24 @@ class ProteinDataModule(LightningDataModule):
             protein_id = protein_dir.name
             # Check that all required files exist
             required_files = [
-                "L.csv",
-                "sequence.txt", 
+                "seq.txt",
                 "esmc_emb.pt",
                 "ankh_emb_xl.pt",
-                "prot_emb.pt",
+                "prot_t5_emb.pt",
                 "pglm_emb.pt",
-                f"{self.hparams.task_type}_go.txt"
+                "go.txt"
             ]
             
-            missing_files = [f for f in required_files if not (protein_dir / f).exists()]
+            # Labels must be in split_dir; embeddings and seq are in sequences_dir
+            seq_dir = self.sequences_dir / protein_id
+            missing_files = []
+            for f in required_files:
+                if f == "go.txt":
+                    if not (protein_dir / f).exists():
+                        missing_files.append(f)
+                else:
+                    if not (seq_dir / f).exists():
+                        missing_files.append(f)
             
             if missing_files:
                 # This should not happen - all valid proteins must have these files
@@ -247,7 +244,7 @@ class ProteinDataModule(LightningDataModule):
             
             valid_proteins.append(protein_id)
         
-        print(f"Found {len(valid_proteins)} valid proteins with {self.hparams.task_type} labels in {split_dir.name}")
+        print(f"Found {len(valid_proteins)} valid proteins in {split_dir}")
         return valid_proteins
 
     def prepare_data(self) -> None:
@@ -265,18 +262,18 @@ class ProteinDataModule(LightningDataModule):
         if not data_dir.exists():
             raise ValueError(f"Data directory not found: {data_dir}")
         
-        # Check for all three split directories
-        train_dir = data_dir / "train_pdbch"
-        val_dir = data_dir / "val_pdbch"
-        test_dir = data_dir / "test_pdbch"
+        # CAFA_Style split directories
+        train_dir = data_dir / "train" / self.hparams.task_type
+        val_dir = data_dir / "val" / self.hparams.task_type
+        test_dir = data_dir / "test" / self.hparams.task_type
         
         missing_dirs = []
         if not train_dir.exists():
-            missing_dirs.append("train_pdbch")
+            missing_dirs.append(str(train_dir))
         if not val_dir.exists():
-            missing_dirs.append("val_pdbch")
+            missing_dirs.append(str(val_dir))
         if not test_dir.exists():
-            missing_dirs.append("test_pdbch")
+            missing_dirs.append(str(test_dir))
         
         if missing_dirs:
             raise ValueError(f"Missing split directories in {data_dir}: {missing_dirs}")
@@ -306,9 +303,7 @@ class ProteinDataModule(LightningDataModule):
         # Ensure _go_dicts is populated for the current task_type in main process
         if self.hparams.task_type not in ProteinDataset._go_dicts:
             print(f"Populating GO mapping for '{self.hparams.task_type}' in main process...")
-            data_base_dir = Path(self.hparams.data_dir).parent
-            tsv_path = data_base_dir / "nrPDB-GO_2019.06.18_annot.tsv"
-            ProteinDataset._go_dicts[self.hparams.task_type] = load_go_dict(tsv_path, self.hparams.task_type)
+            ProteinDataset._go_dicts[self.hparams.task_type] = build_go_index_from_dataset(Path(self.hparams.data_dir), self.hparams.task_type, split="train")
             print(f"GO mapping loaded: {len(ProteinDataset._go_dicts[self.hparams.task_type])} terms")
 
         # Load datasets only if not already loaded
@@ -325,26 +320,6 @@ class ProteinDataModule(LightningDataModule):
                 task_type=self.hparams.task_type,
                 split="train",
             )
-            
-            # HEAL information–content vector from ic_count.pkl
-            if not hasattr(self, "_ic_vector"):
-                # Use parent directory of data_dir to find ic_count.pkl
-                data_base_dir = Path(self.hparams.data_dir).parent
-                ic_file = data_base_dir / "ic_count.pkl"
-                if ic_file.exists():
-                    with ic_file.open("rb") as f:
-                        ic_count = pkl.load(f)  # dict with keys 'bp','mf','cc'
-                    counts = torch.tensor(
-                        ic_count[self.hparams.task_type], dtype=torch.float
-                    )
-                    counts[counts == 0] = 1  # avoid log(0)
-                    # Training set size constant used in IC computation
-                    self._ic_vector = (-torch.log2(counts / 69_709)).float()
-                    print(f"IC vector loaded from {ic_file}")
-                else:
-                    raise FileNotFoundError(f"ic_count.pkl not found at {ic_file}")
-            # Verify length agreement
-            assert len(self._ic_vector) == self.get_num_classes(self.hparams.task_type)
             
             self.data_val = ProteinDataset(
                 data_dir=self.hparams.data_dir,
@@ -430,7 +405,7 @@ def protein_collate(batch):
     # 1) Pad sequence embeddings (float tensors)
     # ----------------------------------------------------
     max_len_seq = max(lengths) + 2   # CLS + residues + EOS
-    assert max_len_seq <= 1024, "Sequence too long (>1024)"
+    # assert max_len_seq <= 1024, "Sequence too long (>1024)"
 
     esmc_emb_padded = []
     ankh_emb_padded = []
@@ -443,7 +418,7 @@ def protein_collate(batch):
             esmc_emb = F.pad(esmc_emb, (0, 0, 0, max_len_seq - esmc_emb.size(0)), value=0)
         esmc_emb_padded.append(esmc_emb)
         
-        # Pad Ankh3-Large embeddings (same padding logic)
+        # Pad Ankh3-XLarge embeddings (same padding logic)
         ankh_emb = it["ankh_emb"]  # [L+2, d_ankh]
         if ankh_emb.size(0) < max_len_seq:
             ankh_emb = F.pad(ankh_emb, (0, 0, 0, max_len_seq - ankh_emb.size(0)), value=0)

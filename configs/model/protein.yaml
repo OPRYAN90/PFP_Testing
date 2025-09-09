@@ -4,24 +4,20 @@ _target_: src.models.protein_module.ProteinLitModule
 d_esm: 1152          # Base model dimension (ESM-C actual embedding size)
 d_latent: 896          # Latent dimension for cross-modal fusion and final representation
 n_cross_layers: 3      # Cross-modal attention layers between sequence and auxiliary streams
-n_heads: 8             # Consider 12 heads 
+n_heads: 8             # Number of attention heads
 
 # Independent dropout hyperparameters
-# Attention dropout: 0.12–0.15
 attention_dropout: 0.10
-# FFN dropout: 0.18–0.22 (FFN dominates params)
 ffn_dropout: 0.18
-# Gate/fusion MLP dropout: ~0.05
 fusion_mlp_dropout: 0.10
-# Head dropout: 0.30 (biggest bang for buck)
 head_dropout: 0.25
 task_type: ${data.task_type}         # Task type: "mf", "bp", or "cc" - automatically from data config
-d_prot: 1024                    # ProtT5-BFD embedding dimension
-d_ankh: 2560                    # Ankh3-Large embedding dimension (matches ankh_emb.pt)
+d_prot: 1024                    # ProtT5 embedding dimension
+d_ankh: 2560                    # Ankh3-XLarge embedding dimension (matches ankh_emb.pt)
 d_pglm: 2560                    # XTrimoPGLM embedding dimension (matches pglm_emb.pt)
 
 # Training parameters  
-warmup_ratio: 0.05     # Warmup ratio for cosine schedule (1% of total training steps)
+warmup_ratio: 0.05     # Warmup ratio for cosine schedule
 learning_rate: 1e-4    # Learning rate for all parameters
 # Optimizer configuration
 optimizer:
@@ -31,7 +27,6 @@ optimizer:
   weight_decay: 0.01
   betas: [0.9, 0.999]   # AdamW momentum parameters
   eps: 1e-8             # Numerical stability epsilon
-#CONSIDER REDUCE LR ON PLATEAU
 # Learning rate scheduler configuration  
 scheduler:
   _target_: src.utils.lr_schedulers.get_cosine_schedule_with_warmup

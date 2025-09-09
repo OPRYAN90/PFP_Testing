@@ -1,15 +1,12 @@
 _target_: src.data.protein_datamodule.ProteinDataModule
-data_dir: ${paths.data_dir}/PDBCH
+data_dir: /teamspace/studios/this_studio/CAFA_Style
 
 # Task configuration - choose one: "mf", "bp", "cc"
 task_type: "mf"       
 
-# MF (489 classes):
-# BP (1943 classes):
-# CC (320 classes): 
-batch_size: 48         # TODO: CHANGE THIS
+batch_size: 12       
 
 # Data loading parameters
-num_workers: 25         #NOTE CONSIDER CHANING
-pin_memory: true       # Pin memory for faster GPU transfer
+num_workers: 25         
+pin_memory: true       
 

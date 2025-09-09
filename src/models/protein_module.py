@@ -1,4 +1,5 @@
 from typing import Any, Dict, Optional, Tuple, List, Union
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -7,17 +8,9 @@ import torch.nn.functional as F
 from lightning import LightningModule
 from torchmetrics import MeanMetric
 from timm.loss import AsymmetricLossMultiLabel  # ASL (multi-label, logit-based)
-from data.go_utils import (
-    propagate_go_preds, propagate_ec_preds,
-    function_centric_aupr, cafa_fmax, smin
-)
-
-# Simple helper to get number of classes without datamodule dependency
-def get_num_classes_for_task(task_type: str) -> int:
-    """Return number of classes for a task type."""
-    class_counts = {"mf": 489, "bp": 1943, "cc": 320}
-    return class_counts[task_type]
-
+from data.go_utils import new_compute_performance_deepgoplus
+import pandas as pd
+import json
 
 
 class SwiGLU(nn.Module):
@@ -255,7 +248,7 @@ class ProteinLitModule(LightningModule):
         d_esm: int = 1152,                  # Base model dimension
         d_latent: int = 768,                  # Latent dimension for cross-modal fusion and final representation
         d_prot: int = 1024,                   # ProtT5 hidden size (XL UniRef50 = 1024)
-        d_ankh: int = 1024,                   # Ankh3-Large embedding dimension
+        d_ankh: int = 1024,                   # Ankh3-XLarge embedding dimension
         d_pglm: int = 1536,                    # PGLM embedding dimension
         n_cross_layers: int = 2,              # Cross-attention layers
         n_heads: int = 8,                     # Attention heads
@@ -332,8 +325,8 @@ class ProteinLitModule(LightningModule):
         # GatedFusion over pooled stream features
         self.fusion = GatedFusion(d_model=d_latent, p_drop=fusion_mlp_dropout)
         
-        # Create classifier head
-        self.head = MLPHead(d_latent, get_num_classes_for_task(task_type), head_dropout)
+        # Classifier head will be set in setup() from datamodule.num_classes
+        self.head = None
 
         # For long-tail multi-label, use Asymmetric Loss (ASL)
         self.loss_fn = AsymmetricLossMultiLabel(
@@ -353,9 +346,13 @@ class ProteinLitModule(LightningModule):
         self._val_labels = []
         self._test_logits = []
         self._test_labels = []
+        self._val_pids: List[str] = []
+        self._test_pids: List[str] = []
 
     def setup(self, stage: str) -> None:
-        """No-op setup."""
+        """Create classifier head from datamodule.num_classes (simple assumption)."""
+        self.head = MLPHead(self.hparams.d_latent, self.trainer.datamodule.num_classes, self.hparams.head_dropout)
+        print(f"Head created with {self.trainer.datamodule.num_classes} classes")
         return
 
     def _insert_bos_eos_tokens(
@@ -405,7 +402,7 @@ class ProteinLitModule(LightningModule):
         """
         # Extract inputs - all embeddings are pre-computed
         seq_emb = batch["esmc_emb"]      # ESM-C: [B, L, d_esm]
-        ankh_emb = batch["ankh_emb"]     # Ankh3-Large: [B, L, d_ankh]
+        ankh_emb = batch["ankh_emb"]     # Ankh3-XLarge: [B, L, d_ankh]
         prot_emb = batch["prot_emb"]     # ProtT5: [B, L, d_prot]
         pglm_emb = batch["pglm_emb"]     # PGLM: [B, L, d_pglm]
         pad_mask = batch["pad_mask"]     # [B, L] True where padded
@@ -464,6 +461,8 @@ class ProteinLitModule(LightningModule):
         # Store for epoch‑wise CAFA metrics computation (convert to fp32 for numpy)
         self._val_logits.append(logits.detach().float().cpu())   # keep raw, no sigmoid
         self._val_labels.append(labels.detach().float().cpu())
+        # Capture protein IDs if present
+        self._val_pids.extend(list(batch["protein_id"]))
         
     def test_step(self, batch: Dict[str, Any], batch_idx: int):
         logits, labels = self.forward(batch)
@@ -475,39 +474,41 @@ class ProteinLitModule(LightningModule):
         # Store for epoch‑wise CAFA metrics computation (convert to fp32 for numpy)
         self._test_logits.append(logits.detach().float().cpu())   # keep raw, no sigmoid
         self._test_labels.append(labels.detach().float().cpu())
+        self._test_pids.extend(list(batch["protein_id"]))
 
-    def _heal_metrics(self, logits, labels, compute_smin=True): 
-        probs = torch.sigmoid(logits).numpy()
-        labels = labels.numpy().astype(int)
-        goterms = list(self.trainer.datamodule._go_dicts[self.task_type].keys())
-
-        # Parent-child propagation
-        if self.task_type == "ec": #NOTE: If ec is enabled update this
-            print("EC task type detected; ENSURE UPDATE")
-            probs = propagate_ec_preds(probs, goterms)
-        else:
-            probs = propagate_go_preds(probs, goterms)
-
-        macro, micro = function_centric_aupr(labels, probs)
-        fmax, _      = cafa_fmax(labels, probs, goterms, self.task_type)
-        s_min        = smin(labels, probs, self.trainer.datamodule.ic_vector.numpy()) if compute_smin else 0.0
-
-        return macro, micro, fmax, s_min
+    def _assemble_deepgoplus_df(self, logits: torch.Tensor, labels: torch.Tensor, idx_goid: Dict[int, str], with_pids: Optional[List[str]] = None) -> pd.DataFrame:
+        """Assemble DPFunc-style DataFrame with columns: protein_id, gos, predictions."""
+        probs = torch.sigmoid(logits).cpu().numpy()
+        labs = labels.cpu().numpy().astype(int)
+        num_samples, num_classes = probs.shape
+        rows = {"protein_id": [], "gos": [], "predictions": []}
+        for i in range(num_samples):
+            true_go_ids = {idx_goid[j] for j in range(num_classes) if labs[i, j] == 1}
+            pred_map = {idx_goid[j]: float(probs[i, j]) for j in range(num_classes)}
+            rows["protein_id"].append(with_pids[i] if with_pids is not None and i < len(with_pids) else f"sample_{i}")
+            rows["gos"].append(true_go_ids)
+            rows["predictions"].append(pred_map)
+        return pd.DataFrame(rows)
 
     def on_validation_epoch_end(self):
         logits = torch.cat(self._val_logits)
         labels = torch.cat(self._val_labels)
-        macro, micro, fmax, _ = self._heal_metrics(logits, labels, compute_smin=False)  # Skip smin for validation
 
-        # Convert numpy scalars to Python floats for logging
+        # DeepGOPlus-style evaluation
+        goid_idx = self.trainer.datamodule._go_dicts[self.task_type]
+        idx_goid = {idx: go_id for go_id, idx in goid_idx.items()}
+        df = self._assemble_deepgoplus_df(logits, labels, idx_goid, with_pids=self._val_pids if len(self._val_pids) == labels.size(0) else None)
+        go_file = "../../data/go.obo"
+        fmax, aupr, tmax = new_compute_performance_deepgoplus(df, go_file, self.task_type)
+
         self.log_dict({
             "val/loss": float(self.val_loss.compute()),
-            "val/AUPR_macro": float(macro),
-            "val/AUPR_micro": float(micro), 
             "val/Fmax": float(fmax),
+            "val/AUPR": float(aupr),
+            "val/Fmax_threshold": float(tmax),
         }, prog_bar=True, sync_dist=True)
 
-        self.val_loss.reset(); self._val_logits.clear(); self._val_labels.clear()
+        self.val_loss.reset(); self._val_logits.clear(); self._val_labels.clear(); self._val_pids.clear()
 
     def on_train_start(self) -> None:
         """Lightning hook that is called when training begins."""
@@ -558,15 +559,39 @@ class ProteinLitModule(LightningModule):
         """Lightning hook that is called when a test epoch ends."""
         logits = torch.cat(self._test_logits)
         labels = torch.cat(self._test_labels)
-        macro, micro, fmax, s_min = self._heal_metrics(logits, labels)
 
-        # Convert numpy scalars to Python floats for logging
+        goid_idx = self.trainer.datamodule._go_dicts[self.task_type]
+        idx_goid = {idx: go_id for go_id, idx in goid_idx.items()}
+        df = self._assemble_deepgoplus_df(logits, labels, idx_goid, with_pids=self._test_pids if len(self._test_pids) == labels.size(0) else None)
+        go_file = str(Path(self.trainer.logger.log_dir).parent / "go.obo") if hasattr(self.trainer, "logger") and hasattr(self.trainer.logger, "log_dir") else "go.obo"
+        fmax, aupr, tmax = new_compute_performance_deepgoplus(df, go_file, self.task_type)
+
         self.log_dict({
             "test/loss": float(self.test_loss.compute()),
-            "test/AUPR_macro": float(macro),
-            "test/AUPR_micro": float(micro),
             "test/Fmax": float(fmax),
-            "test/Smin": float(s_min),
+            "test/AUPR": float(aupr),
+            "test/Fmax_threshold": float(tmax),
         }, prog_bar=True, sync_dist=True)
 
-        self.test_loss.reset(); self._test_logits.clear(); self._test_labels.clear()
+        # Save assembled predictions DataFrame and GO mapping after testing
+        try:
+            save_dir = Path(self.trainer.logger.log_dir) if hasattr(self.trainer, "logger") and hasattr(self.trainer.logger, "log_dir") else Path.cwd()
+            save_dir.mkdir(parents=True, exist_ok=True)
+
+            # Convert non-JSON-serializable objects for saving
+            df_to_save = df.copy()
+            if "gos" in df_to_save.columns:
+                df_to_save["gos"] = df_to_save["gos"].apply(lambda x: list(x) if isinstance(x, set) else x)
+
+            df_path = save_dir / f"deepgoplus_test_{self.task_type}.jsonl"
+            df_to_save.to_json(df_path, orient="records", lines=True, force_ascii=False)
+
+            go2idx_path = save_dir / f"go2idx_{self.task_type}.json"
+            with go2idx_path.open("w", encoding="utf-8") as f:
+                json.dump(goid_idx, f, ensure_ascii=False)
+
+            print(f"Saved test DataFrame to {df_path} and GO mapping to {go2idx_path}")
+        except Exception as e:
+            print(f"[WARN] Failed to save test artifacts: {e}")
+
+        self.test_loss.reset(); self._test_logits.clear(); self._test_labels.clear(); self._test_pids.clear()
