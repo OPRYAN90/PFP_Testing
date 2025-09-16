@@ -147,9 +147,6 @@ dmypy.json
 # Lightning-Hydra-Template
 configs/local/default.yaml
 /data/*
-!/data/go-basic.obo
-!/data/ic_count.pkl
-!/data/nrPDB-GO_2019.06.18_annot.tsv
 # !/data/PDBCH.tar.gz
 /logs/
 .env

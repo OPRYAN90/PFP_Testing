@@ -42,12 +42,10 @@ class ProteinDataset(Dataset):
         
     def __len__(self):
         return len(self.protein_ids)
-
-
     def _parse_go_labels(self, go_file_path: Path) -> torch.Tensor:
         """Parse GO IDs from ``<ontology>_go.txt`` into a multi‑hot tensor.
 
-        Empty files yield an all‑zero vector. Unknown IDs are ignored with a warning.
+        Empty files yield an all‑zero vector. Unknown IDs are ignored.
         """
         # 1. fetch / cache mapping ------------------------------------------------
         if self.task_type not in self._go_dicts:
@@ -69,7 +67,7 @@ class ProteinDataset(Dataset):
                     try:
                         labels[go2idx[go_id]] = 1.0
                     except KeyError:
-                        print(f"[WARN] {go_id} not in mapping ({self.task_type})")
+                        pass
         return labels
     
     def __getitem__(self, idx):
@@ -107,10 +105,6 @@ class ProteinDataset(Dataset):
         pglm_data = torch.load(pglm_file)
         assert pglm_data.dim() == 3, "PGLM data should be a 3D tensor"
         pglm_emb = pglm_data.squeeze(0)
-
-        # Ensure all embeddings have the same sequence length
-        assert esmc_emb.size(0) == ankh_emb.size(0) == prot_emb.size(0) == pglm_emb.size(0), \
-            f"Embeddings have different lengths: ESM-C={esmc_emb.size(0)}, Ankh-XLarge={ankh_emb.size(0)}, ProtT5={prot_emb.size(0)}, PGLM={pglm_emb.size(0)}"
             
         # Ensure that BOS/EOS token embeddings (positions 0 and L+1) are zeroed out for all models
         for emb in (esmc_emb, ankh_emb, prot_emb, pglm_emb):
@@ -126,6 +120,9 @@ class ProteinDataset(Dataset):
         # Protein length from sequence (no BOS/EOS)
         protein_length = len(sequence)
         
+        # Ensure all embeddings have the same sequence length
+        assert esmc_emb.size(0) == ankh_emb.size(0) == prot_emb.size(0) == pglm_emb.size(0) == protein_length + 2, \
+            f"Embeddings have different lengths: ESM-C={esmc_emb.size(0)}, Ankh-XLarge={ankh_emb.size(0)}, ProtT5={prot_emb.size(0)}, PGLM={pglm_emb.size(0)}, Protein Length={protein_length}"
         sample = {
             "protein_id": protein_id,
             "sequence": sequence,
@@ -416,25 +413,25 @@ def protein_collate(batch):
         esmc_emb = it["esmc_emb"]  # [L+2, d_esmc]
         if esmc_emb.size(0) < max_len_seq:
             esmc_emb = F.pad(esmc_emb, (0, 0, 0, max_len_seq - esmc_emb.size(0)), value=0)
-        esmc_emb_padded.append(esmc_emb)
+        esmc_emb_padded.append(esmc_emb.float())
         
         # Pad Ankh3-XLarge embeddings (same padding logic)
         ankh_emb = it["ankh_emb"]  # [L+2, d_ankh]
         if ankh_emb.size(0) < max_len_seq:
             ankh_emb = F.pad(ankh_emb, (0, 0, 0, max_len_seq - ankh_emb.size(0)), value=0)
-        ankh_emb_padded.append(ankh_emb)
+        ankh_emb_padded.append(ankh_emb.float())
 
         # Pad ProtT5 embeddings
         prot_emb = it["prot_emb"]  # [L+2, d_prot]
         if prot_emb.size(0) < max_len_seq:
             prot_emb = F.pad(prot_emb, (0, 0, 0, max_len_seq - prot_emb.size(0)), value=0)
-        prot_emb_padded.append(prot_emb)
+        prot_emb_padded.append(prot_emb.float())
 
         # Pad PGLM embeddings
         pglm_emb = it["pglm_emb"]  # [L+2, d_pglm]
         if pglm_emb.size(0) < max_len_seq:
             pglm_emb = F.pad(pglm_emb, (0, 0, 0, max_len_seq - pglm_emb.size(0)), value=0)
-        pglm_emb_padded.append(pglm_emb)
+        pglm_emb_padded.append(pglm_emb.float())
 
     # ----------------------------------------------------
     # 2) Stack embeddings + build masks
