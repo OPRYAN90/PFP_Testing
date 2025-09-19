@@ -4,12 +4,13 @@ defaults:
   - model_summary
   - rich_progress_bar
   - perf
+  - ema
   - _self_
 
 model_checkpoint:
   dirpath: ${paths.output_dir}/checkpoints
-  filename: "epoch_{epoch:03d}_aupr_{val/AUPR:.4f}"
-  monitor: "val/AUPR"  # Monitor AUPR for protein function prediction
+  filename: "epoch_{epoch:03d}_aupr_{val/AUPR_macro:.4f}"
+  monitor: "val/AUPR_macro"  # Monitor AUPR for protein function prediction
   mode: "max"
   save_last: True
   save_top_k: 1  # Save top 1 model for early testing 
@@ -17,7 +18,7 @@ model_checkpoint:
   every_n_epochs: 1
 
 early_stopping:
-  monitor: "val/AUPR"  #NOTE: Monitor AUPR for protein function prediction (higher is better)
+  monitor: "val/AUPR_macro"  #NOTE: Monitor AUPR for protein function prediction (higher is better)
   patience: 3  # More patience for protein training (slower convergence)
   mode: "max"
 

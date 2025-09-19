@@ -1,0 +1,6 @@
+ema:
+    _target_: callbacks.ema.EMAWeightAveraging
+    decay: 0.9985
+    start_step: 693    
+    device: null        
+    use_buffers: true
