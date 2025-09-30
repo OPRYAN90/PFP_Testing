@@ -159,3 +159,7 @@ trained_models/
     
 notebooks/msa_final_covnul
 notebooks/uc30_filtered_seq2id.json
+
+# Ignore everything in notebooks folder except GO_Sliding.ipynb
+notebooks/*
+!notebooks/GO_Sliding.ipynb

@@ -70,6 +70,7 @@ class ProteinDataset(Dataset):
                         labels[go2idx[go_id]] = 1.0
                     except KeyError:
                         print(f"[WARN] {go_id} not in mapping ({self.task_type})")
+        assert labels.sum() > 0, f"All-zero label vector for {go_file_path} (no valid GO terms found)"
         return labels
     
     def __getitem__(self, idx):
@@ -86,12 +87,12 @@ class ProteinDataset(Dataset):
         assert esmc_data.dim() == 3, "ESM-C data should be a 3D tensor"
         esmc_emb = esmc_data.squeeze(0)
         
-        # Load pre-computed Ankh3-Large embeddings (required file)
+        # Load pre-computed Ankh3-XLarge embeddings (required file)
         ankh_file = protein_dir / "ankh_emb_xl.pt"
         ankh_data = torch.load(ankh_file)
         # Extract embeddings from data structures
-        # Ankh3-Large: Direct tensor (1, L+2, d_ankh) -> squeeze to (L+2, d_ankh)
-        assert ankh_data.dim() == 3, "Ankh3-Large data should be a 3D tensor"
+        # Ankh3-XLarge: Direct tensor (1, L+2, d_ankh) -> squeeze to (L+2, d_ankh)
+        assert ankh_data.dim() == 3, "Ankh3-XLarge data should be a 3D tensor"
         ankh_emb = ankh_data.squeeze(0)
 
         # Load pre-computed ProtT5 embeddings (required file)
@@ -142,7 +143,7 @@ class ProteinDataset(Dataset):
 class ProteinDataModule(LightningDataModule):
     """DataModule for protein function prediction (no MSA).
 
-    Loads precomputed per‑residue embeddings for ESM‑C, ProtT5, Ankh3‑XL, and XTrimoPGLM,
+    Loads precomputed per‑residue embeddings for ESM‑C, ProtT5, Ankh3‑XLarge, and XTrimoPGLM,
     and GO labels for ``train``, ``val``, and ``test`` splits.
     """
 
@@ -178,6 +179,9 @@ class ProteinDataModule(LightningDataModule):
         self.train_protein_ids: List[str] = []
         self.val_protein_ids: List[str] = []
         self.test_protein_ids: List[str] = []
+
+        # Track how many proteins are skipped due to empty label files per split
+        self.skipped_empty_label_counts = {"train": 0, "val": 0, "test": 0}
 
     def get_num_classes(self, task_type_: str) -> int:
         """Return number of classes for the given ontology with validation.
@@ -223,6 +227,13 @@ class ProteinDataModule(LightningDataModule):
         
         print(f"Scanning {split_dir} for proteins with non-empty {self.hparams.task_type} labels...")
         
+        # Determine split key from directory name (e.g., train_pdbch -> train)
+        split_key = "train" if split_dir.name.startswith("train") else (
+            "val" if split_dir.name.startswith("val") else (
+                "test" if split_dir.name.startswith("test") else split_dir.name
+            )
+        )
+
         for protein_dir in split_dir.iterdir():
             if not protein_dir.is_dir():
                 continue
@@ -245,9 +256,19 @@ class ProteinDataModule(LightningDataModule):
                 # This should not happen - all valid proteins must have these files
                 raise FileNotFoundError(f"Protein {protein_id} missing required files: {missing_files}")
             
+            # Skip if the GO label file exists but is empty
+            label_path = protein_dir / f"{self.hparams.task_type}_go.txt"
+            if label_path.stat().st_size == 0:
+                self.skipped_empty_label_counts[split_key] = self.skipped_empty_label_counts.get(split_key, 0) + 1
+                continue
+
             valid_proteins.append(protein_id)
         
         print(f"Found {len(valid_proteins)} valid proteins with {self.hparams.task_type} labels in {split_dir.name}")
+        if self.skipped_empty_label_counts.get(split_key, 0) > 0:
+            print(f"Skipped {self.skipped_empty_label_counts[split_key]} proteins in {split_dir.name} due to empty {self.hparams.task_type}_go.txt")
+        else:
+            print(f"No proteins skipped in test set")
         return valid_proteins
 
     def prepare_data(self) -> None:
@@ -441,7 +462,7 @@ def protein_collate(batch):
             esmc_emb = F.pad(esmc_emb, (0, 0, 0, max_len_seq - esmc_emb.size(0)), value=0)
         esmc_emb_padded.append(esmc_emb.float())
         
-        # Pad Ankh3-Large embeddings (same padding logic)
+        # Pad Ankh3-XLarge embeddings (same padding logic)
         ankh_emb = it["ankh_emb"]  # [L+2, d_ankh]
         if ankh_emb.size(0) < max_len_seq:
             ankh_emb = F.pad(ankh_emb, (0, 0, 0, max_len_seq - ankh_emb.size(0)), value=0)

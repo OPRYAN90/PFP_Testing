@@ -7,8 +7,8 @@ task_type: "cc"
 # MF (489 classes):
 # BP (1943 classes):
 # CC (320 classes): 
-batch_size: 48         # TODO: CHANGE THIS
+batch_size: 48         
 
 # Data loading parameters
-num_workers: 25         #NOTE CONSIDER CHANING
+num_workers: 25         
 pin_memory: true       # Pin memory for faster GPU transfer

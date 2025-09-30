@@ -164,13 +164,13 @@ class CrossAttentionTwoStreamFusion(nn.Module):
     
     def forward(self, emb1, emb2, pad_mask=None):
         # Normalize and project
-        emb1_proj = self.proj_in1(self.ln_in1(emb1))  # [B, L, d_out]
-        emb2_proj = self.proj_in2(self.ln_in2(emb2))  # [B, L, d_out]
+        emb1_proj = self.dropout(self.proj_in1(self.ln_in1(emb1)))  # [B, L, d_out]
+        emb2_proj = self.dropout(self.proj_in2(self.ln_in2(emb2)))  # [B, L, d_out]
         
         # Apply cross-attention fusion
         fused = self.fusion(emb1_proj, emb2_proj, pad_mask)
         
-        return self.dropout(fused).masked_fill(pad_mask.unsqueeze(-1), 0.0)
+        return fused.masked_fill(pad_mask.unsqueeze(-1), 0.0)
 
 class CrossAttentionSequenceEncoder(nn.Module):
     def __init__(self,
@@ -255,7 +255,7 @@ class ProteinLitModule(LightningModule):
         d_esm: int = 1152,                  # Base model dimension
         d_latent: int = 768,                  # Latent dimension for cross-modal fusion and final representation
         d_prot: int = 1024,                   # ProtT5 hidden size (XL UniRef50 = 1024)
-        d_ankh: int = 1024,                   # Ankh3-Large embedding dimension
+        d_ankh: int = 1024,                   # Ankh3-XLarge embedding dimension
         d_pglm: int = 1536,                    # PGLM embedding dimension
         n_cross_layers: int = 2,              # Cross-attention layers
         n_heads: int = 8,                     # Attention heads
@@ -406,7 +406,7 @@ class ProteinLitModule(LightningModule):
         """
         # Extract inputs - all embeddings are pre-computed
         seq_emb = batch["esmc_emb"]      # ESM-C: [B, L, d_esm]
-        ankh_emb = batch["ankh_emb"]     # Ankh3-Large: [B, L, d_ankh]
+        ankh_emb = batch["ankh_emb"]     # Ankh3-XLarge: [B, L, d_ankh]
         prot_emb = batch["prot_emb"]     # ProtT5: [B, L, d_prot]
         pglm_emb = batch["pglm_emb"]     # PGLM: [B, L, d_pglm]
         pad_mask = batch["pad_mask"]     # [B, L] True where padded

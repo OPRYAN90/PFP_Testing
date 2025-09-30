@@ -13,17 +13,18 @@ model_checkpoint:
   monitor: "val/AUPR_macro"  # Monitor AUPR for protein function prediction
   mode: "max"
   save_last: True
-  save_top_k: 1  # Save top 1 model for early testing 
+  save_top_k: 1  
   auto_insert_metric_name: False
   every_n_epochs: 1
 
 early_stopping:
-  monitor: "val/AUPR_macro"  #NOTE: Monitor AUPR for protein function prediction (higher is better)
-  patience: 3  # More patience for protein training (slower convergence)
+  monitor: "val/AUPR_macro"  #Use macro or micro 
+  patience: 2  
+  min_delta: 0.003 
   mode: "max"
 
 model_summary:
-  max_depth: 1  # Limit depth for complex protein models
+  max_depth: 1  
 
 rich_progress_bar:
   leave: True
