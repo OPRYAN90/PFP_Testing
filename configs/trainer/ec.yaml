@@ -1,0 +1,35 @@
+_target_: lightning.pytorch.trainer.Trainer
+
+default_root_dir: ${paths.output_dir}
+
+# EC training typically needs more epochs
+min_epochs: 5 
+max_epochs: 30
+
+# Use GPU if available, fallback to CPU
+accelerator: auto
+devices: auto
+
+# Mixed precision for large models
+precision: "bf16-mixed"
+
+# Validate every epoch
+check_val_every_n_epoch: 1
+
+# Disable sanity check to avoid init issues with complex datamodules
+num_sanity_val_steps: 0
+
+# Determinism off for speed unless you need exact reproducibility
+deterministic: False
+
+# Gradient clipping for stability
+gradient_clip_val: 1.0
+gradient_clip_algorithm: "norm"
+
+# Accumulate gradients to simulate larger batch sizes
+accumulate_grad_batches: 2
+
+# Log metrics frequently (set higher if throughput is impacted)
+log_every_n_steps: 1
+
+

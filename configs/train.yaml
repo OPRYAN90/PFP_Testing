@@ -4,11 +4,11 @@
 # order of defaults determines the order in which configs override each other
 defaults:
   - _self_
-  - data: protein
-  - model: protein
-  - callbacks: protein
+  - data: ec
+  - model: ec
+  - callbacks: ec
   - logger: wandb 
-  - trainer: protein
+  - trainer: ec
   - paths: default
   - extras: default
   - hydra: default
@@ -36,13 +36,13 @@ task_name: "train"
 tags: ["dev"]
 
 # set False to skip model training
-train: True
+train: False
 
 # evaluate on test set, using best model weights achieved during training
 # lightning chooses best weights based on the metric specified in checkpoint callback
 test: True
 
 # simply provide checkpoint path to resume training
-ckpt_path: null
+ckpt_path: /teamspace/studios/this_studio/PFP_Testing/logs/best_mf/epoch_009_aupr_0.8699.ckpt
 # seed for random number generators in pytorch, numpy and python.random
 seed: null

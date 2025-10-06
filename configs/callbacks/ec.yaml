@@ -10,21 +10,21 @@ defaults:
 model_checkpoint:
   dirpath: ${paths.output_dir}/checkpoints
   filename: "epoch_{epoch:03d}_aupr_{val/AUPR_micro:.4f}"
-  monitor: "val/AUPR_micro"  # Monitor AUPR for protein function prediction
+  monitor: "val/AUPR_micro"
   mode: "max"
   save_last: True
-  save_top_k: 1  
+  save_top_k: 1
   auto_insert_metric_name: False
   every_n_epochs: 1
 
 early_stopping:
-  monitor: "val/AUPR_micro"  #Use macro or micro 
-  patience: 2  
-  min_delta: 0.003 
+  monitor: "val/AUPR_micro"
+  patience: 2
+  min_delta: 0.003
   mode: "max"
 
 model_summary:
-  max_depth: 1  
+  max_depth: 1
 
 rich_progress_bar:
   leave: True
@@ -38,4 +38,6 @@ rich_progress_bar:
     processing_speed: "grey70"
     metrics: "white"
     metrics_text_delimiter: " • "
-    metrics_format: ".3e" 
+    metrics_format: ".3e"
+
+

@@ -1,0 +1,44 @@
+_target_: src.models.EC_module.ProteinLitModule
+
+# Task and label space
+task_type: "ec"
+num_classes: 5106
+
+# Model architecture parameters (match EC module defaults)
+d_esm: 1152
+d_latent: 896
+n_cross_layers: 3
+n_heads: 8
+
+# Modality embedding sizes
+d_prot: 1024
+d_ankh: 2560
+d_pglm: 2560
+
+# Independent dropout hyperparameters
+attention_dropout: 0.10
+ffn_dropout: 0.18
+fusion_mlp_dropout: 0.10
+head_dropout: 0.25
+
+# Training parameters
+warmup_ratio: 0.05
+learning_rate: 1e-4
+
+# Optimizer configuration
+optimizer:
+  _target_: torch.optim.AdamW
+  _partial_: true
+  lr: ${model.learning_rate}
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  eps: 1e-8
+
+# Learning rate scheduler configuration
+scheduler:
+  _target_: src.utils.lr_schedulers.get_cosine_schedule_with_warmup
+  _partial_: true
+  num_cycles: 0.5
+  last_epoch: -1
+
+

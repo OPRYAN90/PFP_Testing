@@ -51,6 +51,15 @@ class EMAWeightAveraging(WeightAveraging):
             self._copy_average_to_current(pl_module)
 
     def on_load_checkpoint(self, trainer, pl_module, checkpoint: dict):
+        # Restore averaged model + WA state
         super().on_load_checkpoint(trainer, pl_module, checkpoint)
         self._ema_bootstrapped = True
-        print(f"EMA was restored; do NOT re-bootstrap on next step, self._ema_bootstrapped={self._ema_bootstrapped}")
+
+        # # Detect stage ("fit", "validate", "test", "predict", "tune")
+        # stage = getattr(getattr(trainer, "state", None), "fn", None)
+        # print(f"Stage loaded: {stage}")
+        # # ✅ Only force EMA → current for non-fit stages (test/validate/predict)
+        # if stage in ("test", "validate", "predict"):
+        #     if getattr(self, "_average_model", None) is not None:
+        #         self._copy_average_to_current(pl_module)
+        # # For "fit": do nothing → Lightning keeps current = non-EMA (from current_model_state)

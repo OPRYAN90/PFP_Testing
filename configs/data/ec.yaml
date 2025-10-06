@@ -1,0 +1,15 @@
+_target_: src.data.EC_datamodule.ProteinDataModule
+
+# Path to EC_Number dataset root
+data_dir: ${paths.data_dir}/EC_Number
+
+# Split names present under EC_Number
+test_split_name: "Price-149"
+val_split_name: "NEW-392"
+
+# Dataloader parameters
+batch_size: 48
+num_workers: 25
+pin_memory: true
+
+

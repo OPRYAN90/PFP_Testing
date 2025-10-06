@@ -11,6 +11,6 @@ wandb:
   log_model: False
   prefix: "" # a string to put at the beginning of metric keys
   # entity: "" # set to name of your wandb team
-  group: "${data.task_type}"
-  tags: ["${data.task_type}", "protein", "esm-c", "sweep"]
+  group: "protein"
+  tags: ["protein", "esm-c", "sweep"]
   job_type: "sweep"
