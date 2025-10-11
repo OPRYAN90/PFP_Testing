@@ -169,10 +169,10 @@ class ProteinDataModule(LightningDataModule):
                 continue
             # ensure required embedding files exist
             required = [
-                # d / "esmc_emb.pt",
+                d / "esmc_emb.pt",
                 d / "ankh_emb_xl.pt",
                 d / "prot_t5_emb.pt",
-                # d / "pglm_emb.pt",
+                d / "pglm_emb.pt",
             ]
             if not all(p.exists() for p in required):
                 print(f"[WARN] {d.name} missing required embedding files")

@@ -6,15 +6,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from lightning import LightningModule
 
-from torch_geometric.nn import GCNConv, GraphNorm, global_mean_pool
-from torch_geometric.utils import to_undirected
-
 from torchmetrics import MeanMetric
 import numpy as np
 from data.go_utils import (
     propagate_go_preds, propagate_ec_preds,
     function_centric_aupr, cafa_fmax, smin
 )
+
+from egnn_pytorch import EGNN   # NEW
 
 # Simple helper to get number of classes without datamodule dependency
 def get_num_classes_for_task(task_type: str) -> int:
@@ -41,56 +40,41 @@ class MLPHead(nn.Module):
         return self.net(x)
 
 
-# ------------ Simple edge dropout utility -----------------
-def drop_edge(edge_index: torch.Tensor, p: float) -> torch.Tensor:
-    if p <= 0.0: 
-        return edge_index
-    E = edge_index.size(1)
-    keep = torch.rand(E, device=edge_index.device) > p
-    return edge_index[:, keep]
-
-# ------------ One GCN block (conv + norm + relu + residual) ------------
-class GCNBlock(nn.Module):
-    def __init__(self, in_dim: int, out_dim: int, dropout: float):
+# ------------ Minimal EGNN backbone (dense, no PyG) -----------------
+class MinimalEGNN(nn.Module):
+    def __init__(self, d_in: int, d_hidden: int = 256, depth: int = 4,
+                 k_neighbors: int = 16, dropout: float = 0.1):
         super().__init__()
-        self.conv = GCNConv(in_dim, out_dim, cached=False, normalize=True)
-        self.norm = GraphNorm(out_dim)
-        self.dropout = dropout
-
-    def forward(self, x, edge_index, batch):
-        out = self.conv(x, edge_index)
-        out = self.norm(out, batch)
-        out = F.relu(out, inplace=True)
-        out = F.dropout(out, p=self.dropout, training=self.training)
-        # dims are fixed to d_in, so residual always valid
-        out = out + x
-        return out
-
-# ------------ Full network -----------------
-class GCNNet(nn.Module):
-    def __init__(
-        self,
-        d_in: int,
-        num_layers: int,
-        dropout: float = 0.2,
-        edge_drop: float = 0.0,
-    ):
-        super().__init__()
-        self.edge_drop = edge_drop
-
-        dims = [d_in] * num_layers  # keep feature dim constant
+        self.in_proj = nn.Linear(d_in, d_hidden)
         self.layers = nn.ModuleList([
-            GCNBlock(dims[i], dims[i + 1], dropout) for i in range(num_layers - 1)
+            EGNN(
+                dim=d_hidden,
+                edge_dim=0,
+                num_nearest_neighbors=k_neighbors,
+                dropout=dropout,
+                norm_feats=False,
+                norm_coors=True,
+                coor_weights_clamp_value=2.0,
+                update_feats=True,
+                update_coors=True
+            ) for _ in range(depth)
         ])
+        self.out_norm = nn.LayerNorm(d_hidden)
 
-    def forward(self, x, edge_index, batch):
-        edge_index = to_undirected(edge_index, num_nodes=x.size(0))
-        edge_index = drop_edge(edge_index, self.edge_drop)
-
+    def forward(self, x, pos, mask):
+        """
+        x   : [B, N, d_in]   residue features
+        pos : [B, N, 3]      coordinates
+        mask: [B, N]         bool (True=valid)
+        """
+        h = self.in_proj(x)
+        c = pos
         for layer in self.layers:
-            x = layer(x, edge_index, batch)
-
-        g = global_mean_pool(x, batch)      # [B, d_in]
+            h, c = layer(h, c, mask=mask)
+        h = self.out_norm(h)
+        # masked mean pooling over residues
+        denom = mask.sum(dim=1).clamp(min=1).unsqueeze(-1)    # [B,1]
+        g = (h * mask.unsqueeze(-1)).sum(dim=1) / denom       # [B, d_hidden]
         return g
 
 ############################################################
@@ -102,9 +86,10 @@ class ProteinLitModule(LightningModule):
         self,
         task_type: str,
         d_in: int = 1152,
-        num_layers: int = 3,
-        dropout: float = 0.2,
-        edge_drop: float = 0.0,
+        num_layers: int = 4,              # EGNN depth
+        dropout: float = 0.1,
+        k_neighbors: int = 16,            # NEW
+        d_hidden: int = 256,              # NEW
         optimizer: Optional[Any] = None,
         scheduler: Optional[Any] = None,
         warmup_ratio: float = 0.05,
@@ -115,17 +100,18 @@ class ProteinLitModule(LightningModule):
         # Store task type for easy access
         self.task_type = task_type
 
-        # GCN backbone -> pooled graph embedding
-        self.model = GCNNet(
+        # Minimal EGNN backbone -> pooled graph embedding
+        self.model = MinimalEGNN(
             d_in=d_in,
-            num_layers=num_layers,
+            d_hidden=d_hidden,
+            depth=num_layers,
+            k_neighbors=k_neighbors,
             dropout=dropout,
-            edge_drop=edge_drop,
         )
 
         # Final MLP head on graph embedding
         self.head = MLPHead(
-            d_in=d_in,
+            d_in=d_hidden,                         # CHANGED
             d_out=get_num_classes_for_task(task_type),
             dropout=dropout,
         )
@@ -152,8 +138,8 @@ class ProteinLitModule(LightningModule):
     #  Forward pass with EOS token scatter
     # ---------------------------------------------------------------------
     def forward(self, batch: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
-        """GCN forward: pooled graph embedding -> MLP head -> logits."""
-        g = self.model(batch["x"], batch["edge_index"], batch["graph_batch"])
+        """EGNN forward: dense residues -> EGNN -> masked mean -> MLP -> logits."""
+        g = self.model(batch["x"], batch["pos"], batch["mask"])
         logits = self.head(g)
         return logits, batch["labels"]
 
@@ -292,5 +278,4 @@ class ProteinLitModule(LightningModule):
         }, prog_bar=True, sync_dist=True)
 
         self.test_loss.reset(); self._test_logits.clear(); self._test_labels.clear()
-
 

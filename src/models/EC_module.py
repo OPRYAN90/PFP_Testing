@@ -8,9 +8,7 @@ from pathlib import Path
 from lightning import LightningModule
 from torchmetrics import MeanMetric
 from timm.loss import AsymmetricLossMultiLabel  # ASL (multi-label, logit-based)
-from sklearn.metrics import (
-    roc_auc_score, precision_score, recall_score, f1_score, average_precision_score
-)
+from sklearn.metrics import average_precision_score, roc_auc_score
 
 
 
@@ -350,7 +348,6 @@ class ProteinLitModule(LightningModule):
         self._test_logits = []
         self._test_labels = []
         self._test_pids: List[str] = []
-        self._test_threshold: float = 0.5  # will be set from a one-time sweep on val before testing
 
     def setup(self, stage: str) -> None:
         """No-op setup."""
@@ -477,24 +474,14 @@ class ProteinLitModule(LightningModule):
         if "protein_id" in batch:
             self._test_pids.extend(list(batch["protein_id"]))
 
-    def _compute_ec_metrics(self, logits: torch.Tensor, labels: torch.Tensor, threshold: float = 0.5) -> Dict[str, float]:
+    def _compute_ec_metrics(self, logits: torch.Tensor, labels: torch.Tensor) -> Dict[str, float]:
         """
         Compute EC comparison metrics:
-          - AUC (samples-averaged ROC-AUC)
-          - Precision/Recall/F1 at a fixed threshold (samples-averaged)
-        Robust to degenerate batches with all-zero labels.
-        """
+          - AUC (samples-averaged ROC-AUC)"""
         y_true = labels.detach().cpu().numpy().astype(int)
         y_score = torch.sigmoid(logits).detach().cpu().numpy()
-        # Thresholded preds for PR/F1 (protein-centric)
-        y_pred = (y_score >= threshold).astype(int)
-
-        # Some folds can be degenerate => guard AUC
         auc_samples = float(roc_auc_score(y_true, y_score, average="samples"))
-        prec = float(precision_score(y_true, y_pred, average="samples", zero_division=0))
-        rec  = float(recall_score( y_true, y_pred, average="samples", zero_division=0))
-        f1   = float(f1_score(      y_true, y_pred, average="samples", zero_division=0))
-        return {"AUC": auc_samples, "Precision": prec, "Recall": rec, "F1": f1}
+        return {"AUC": auc_samples}
 
     def on_validation_epoch_end(self):
         logits = torch.cat(self._val_logits) 
@@ -556,50 +543,15 @@ class ProteinLitModule(LightningModule):
 
     @torch.no_grad()
     def on_test_epoch_start(self) -> None:
-        """
-        Before running the test loop, sweep the **validation set once**
-        to find a single global threshold that maximizes F1 (samples-averaged).
-        """
-        dm = self.trainer.datamodule
-        if dm is None:
-            return
-        self.eval()
-        val_loader = dm.val_dataloader()
-        all_logits, all_labels = [], []
-        print(f"Val loader length: {len(val_loader)}")
-        print("Validating for threshold...")
-        for batch in val_loader:
-            # move tensors to the same device as module
-            for k, v in list(batch.items()):
-                if isinstance(v, torch.Tensor):
-                    batch[k] = v.to(self.device, non_blocking=True)
-            logits, labels = self.forward(batch)
-            all_logits.append(logits.detach().cpu())
-            all_labels.append(labels.detach().cpu())
-        val_logits = torch.cat(all_logits)
-        val_labels = torch.cat(all_labels)
-
-        # Sweep thresholds and pick the argmax F1 (samples-averaged)
-        print("Finished validating for threshold. Now sweeping thresholds...")
-        y_true  = val_labels.numpy().astype(int)
-        y_score = torch.sigmoid(val_logits).numpy()
-        print(f"AUPR Micro: {float(average_precision_score(y_true, y_score, average='micro'))}")
-        best_t, best_f1 = 0.5, -1.0
-        for t in [i/100 for i in range(1, 100)]:  # 0.01 ... 0.99
-            y_pred = (y_score >= t).astype(int)
-            f1 = f1_score(y_true, y_pred, average="samples", zero_division=0)
-            if f1 > best_f1:
-                best_f1, best_t = f1, t
-        self._test_threshold = float(best_t)
-        # Optional: expose for logs
-        self.log("test/threshold", self._test_threshold, prog_bar=True, sync_dist=True)
+        """No-op before testing when only AUC is reported."""
+        return
 
     def on_test_epoch_end(self) -> None:
         """Lightning hook that is called when a test epoch ends."""
         logits = torch.cat(self._test_logits) 
         labels = torch.cat(self._test_labels) 
         out = {"test/loss": float(self.test_loss.compute())}
-        out |= {f"test/{k}": v for k, v in self._compute_ec_metrics(logits, labels, threshold=self._test_threshold).items()}
+        out |= {f"test/{k}": v for k, v in self._compute_ec_metrics(logits, labels).items()}
         self.log_dict(out, prog_bar=True, sync_dist=True)
 
         # Save lightweight outputs: probabilities, EC terms, and PIDs
@@ -621,7 +573,6 @@ class ProteinLitModule(LightningModule):
                     "ec_terms": ec_terms,
                     "probs": probs,
                     "labels": labels,
-                    "threshold": self._test_threshold,
                 }, out_path)
         except Exception as e:
             # Non-fatal: continue even if saving fails

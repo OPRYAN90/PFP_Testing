@@ -36,13 +36,13 @@ task_name: "train"
 tags: ["dev"]
 
 # set False to skip model training
-train: False
+train: True
 
 # evaluate on test set, using best model weights achieved during training
 # lightning chooses best weights based on the metric specified in checkpoint callback
 test: True
 
 # simply provide checkpoint path to resume training
-ckpt_path: /teamspace/studios/this_studio/PFP_Testing/logs/best_mf/epoch_009_aupr_0.8699.ckpt
+ckpt_path: null
 # seed for random number generators in pytorch, numpy and python.random
 seed: null
