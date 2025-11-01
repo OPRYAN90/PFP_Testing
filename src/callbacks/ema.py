@@ -54,4 +54,4 @@ class EMAWeightAveraging(WeightAveraging):
         # Restore averaged model + WA state
         super().on_load_checkpoint(trainer, pl_module, checkpoint)
         self._ema_bootstrapped = True
-        print(f"IMPORTANT: EMA bootstrapped, switched self._ema_bootstrapped={self._ema_bootstrapped}")
+        print(f"TESTING: EMA bootstrapped, testing time: self._ema_bootstrapped={self._ema_bootstrapped}")

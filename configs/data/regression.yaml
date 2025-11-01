@@ -1,0 +1,13 @@
+_target_: src.data.regression_datamodule.ProteinDataModule
+data_dir: ${paths.data_dir}
+
+# Task configuration - choose one: "stability" or "fluorescence"
+task_type: "stability"
+
+# Batch size per device (adjust based on GPU memory)
+batch_size: 48
+
+# Data loading parameters
+num_workers: 25
+pin_memory: true  # Pin memory for faster GPU transfer
+
