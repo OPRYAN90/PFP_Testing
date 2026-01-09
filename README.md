@@ -4,7 +4,7 @@ Omni-Prot is a machine learning model for protein-level prediction using fused e
 
 The primary task in this repository is Gene Ontology (GO) function prediction, with EC classification and regression included as lightweight variants of the same pipeline.
 
-The core idea employs precompute protein embeddings from multiple PLMs into the Omni-Prot architecture which returns predictions that can be fine-tuned for a variety of specefic protein tasks.
+The core idea employs precompute protein embeddings from multiple PLMs into the Omni-Prot architecture which returns predictions that can be fine-tuned for a variety of specific protein tasks.
 
 ---
 
