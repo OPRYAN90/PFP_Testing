@@ -115,3 +115,6 @@ python src/eval.py data=protein model=protein ckpt_path=/path/to/checkpoint.ckpt
 ```
 
 Hydra controls all task, model, and trainer selection through configuration.
+
+---
+**Updated Web App:** https://omni-prot-web.vercel.app/
