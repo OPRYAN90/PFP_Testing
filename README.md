@@ -118,9 +118,14 @@ Hydra controls all task, model, and trainer selection through configuration.
 
 ---
 **Updated Web App:** https://omni-prot-web.vercel.app/
-**Weight Files**
+**Weight Files:**
+
 MF: https://drive.google.com/file/d/1ECuAQc4rw9sj5-E9k6QLDaZOtcZFb0tp/view?usp=sharing
+
 BP: https://drive.google.com/file/d/1HNrlU8aof7w4YTn72SLTMY52EiSXpMFi/view?usp=sharing
+
 CC: https://drive.google.com/file/d/1XRzKjlYG0lrXYavqmPCTtcW6a4IjHXCn/view?usp=sharing
+
 EC: https://drive.google.com/file/d/1CsGdnkXu2qHlsvuTV6AqFnH4VdyRpn-b/view?usp=sharing
+
 Stability: https://drive.google.com/file/d/1yR0lWydP9JwkyAJKCsO5DOsqPqdnRr3W/view?usp=sharing
